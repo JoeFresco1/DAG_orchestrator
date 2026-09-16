@@ -1,0 +1,17 @@
+node_modules/
+dist/
+
+# run data and runtime artifacts (these belong to each user's project, not here)
+*.run.json
+*.run.json.bak
+*.run.json.lock
+*.d/
+dwt/
+
+# generated at build time from the vis-network dependency
+viewer/vendor/
+
+# logs from local servers/tests
+*.log
+*.err
+.serve*

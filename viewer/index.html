@@ -1,0 +1,1017 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DAG Orchestrator</title>
+<script src="/vendor/vis-network.min.js"></script>
+<style>
+:root {
+  --bg: #04070d;
+  --grid: rgba(0, 229, 255, .035);
+  --panel: rgba(7, 13, 22, .94);
+  --panel2: rgba(4, 9, 16, .96);
+  --line: rgba(0, 229, 255, .14);
+  --line-strong: rgba(0, 229, 255, .38);
+  --text: #d7f5ff;
+  --muted: #6f9db4;
+  --dim: #3d6379;
+  --cyan: #00e5ff;
+  --magenta: #ff2d95;
+  --lime: #00ff9c;
+  --amber: #ffc400;
+  --violet: #a06bff;
+  --slate: #55788c;
+  --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas, "SF Mono", monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; color: var(--text); font: 12.5px/1.5 var(--mono);
+  background:
+    radial-gradient(1200px 620px at 18% -12%, rgba(0, 229, 255, .07), transparent 60%),
+    radial-gradient(900px 520px at 108% 8%, rgba(255, 45, 149, .06), transparent 55%),
+    repeating-linear-gradient(0deg, var(--grid) 0 1px, transparent 1px 44px),
+    repeating-linear-gradient(90deg, var(--grid) 0 1px, transparent 1px 44px),
+    var(--bg);
+  background-attachment: fixed;
+}
+body::after {
+  content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 999;
+  background: repeating-linear-gradient(0deg, rgba(0, 0, 0, .14) 0 1px, transparent 1px 3px);
+  opacity: .35;
+}
+@keyframes blink { 0%, 55% { opacity: 1 } 56%, 100% { opacity: 0 } }
+@keyframes pulse { 0%, 100% { opacity: .55 } 50% { opacity: 1 } }
+@keyframes sweep { from { transform: translateX(-100%) } to { transform: translateX(100%) } }
+button {
+  border: 1px solid var(--line-strong); border-radius: 3px; padding: 5px 10px;
+  font: 600 10.5px/1.2 var(--mono); letter-spacing: .09em; text-transform: uppercase;
+  background: linear-gradient(180deg, rgba(0, 229, 255, .09), rgba(0, 229, 255, .02));
+  color: var(--cyan); cursor: pointer; transition: box-shadow .12s, border-color .12s, color .12s;
+}
+button:hover:not(:disabled) {
+  border-color: var(--cyan); color: #eaffff;
+  box-shadow: 0 0 12px rgba(0, 229, 255, .35), inset 0 0 8px rgba(0, 229, 255, .1);
+}
+button:disabled { opacity: .32; cursor: default; }
+button.primary {
+  background: var(--cyan); border-color: var(--cyan); color: #02131a;
+  box-shadow: 0 0 14px rgba(0, 229, 255, .45);
+}
+button.primary:hover:not(:disabled) { background: #8af4ff; box-shadow: 0 0 20px rgba(0, 229, 255, .65); }
+button.danger {
+  color: var(--magenta); border-color: rgba(255, 45, 149, .5);
+  background: linear-gradient(180deg, rgba(255, 45, 149, .12), rgba(255, 45, 149, .02));
+}
+button.danger:hover:not(:disabled) { border-color: var(--magenta); box-shadow: 0 0 12px rgba(255, 45, 149, .45); }
+button.mini { padding: 3px 7px; font-size: 9.5px; border-radius: 2px; }
+input, select {
+  background: #03070c; color: var(--text); border: 1px solid var(--line);
+  border-radius: 3px; padding: 4px 6px; font: 11px var(--mono);
+}
+input:focus, select:focus {
+  outline: none; border-color: var(--cyan); box-shadow: 0 0 10px rgba(0, 229, 255, .3);
+}
+input[type="number"] { width: 56px; }
+header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 8px 16px; position: sticky; top: 0; z-index: 10;
+  background: linear-gradient(180deg, rgba(5, 11, 19, .98), rgba(5, 11, 19, .86));
+  border-bottom: 1px solid var(--line-strong);
+  box-shadow: 0 0 24px rgba(0, 229, 255, .12), inset 0 -1px 0 rgba(0, 229, 255, .08);
+  backdrop-filter: blur(6px);
+}
+.brand {
+  font-weight: 700; font-size: 13px; letter-spacing: .18em; text-transform: uppercase;
+  color: var(--cyan); text-shadow: 0 0 10px rgba(0, 229, 255, .55);
+}
+.brand::after { content: '\258A'; margin-left: 4px; animation: blink 1.1s steps(1) infinite; }
+.filepath {
+  font: 10.5px var(--mono); color: var(--dim); max-width: 250px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.total { font-size: 10.5px; color: var(--muted); white-space: nowrap; letter-spacing: .1em; text-transform: uppercase; }
+.total strong { font-size: 18px; color: var(--text); font-weight: 700; margin-right: 4px;
+  text-shadow: 0 0 10px rgba(0, 229, 255, .35); }
+.progress {
+  flex: 1 1 150px; min-width: 110px; max-width: 280px; height: 6px; display: flex;
+  background: #050b13; border: 1px solid var(--line); border-radius: 1px; overflow: hidden;
+}
+.progress i { display: block; height: 100%; transition: width .25s ease; }
+.pbar-done { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+.pbar-fail { background: var(--magenta); box-shadow: 0 0 8px var(--magenta); }
+.pbar-skip { background: var(--slate); }
+.pbar-run { background: var(--amber); box-shadow: 0 0 8px var(--amber); animation: pulse 1.6s ease-in-out infinite; }
+.pills { display: flex; gap: 5px; flex-wrap: wrap; }
+.pill {
+  font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase;
+  border: 1px solid var(--line); border-radius: 2px; padding: 2px 7px;
+  color: var(--muted); background: rgba(0, 229, 255, .03);
+  display: inline-flex; gap: 6px; align-items: center; cursor: pointer;
+}
+.pill:hover { border-color: var(--line-strong); color: var(--text); }
+.pill.active { border-color: var(--cyan); color: var(--cyan); box-shadow: 0 0 10px rgba(0, 229, 255, .25); }
+.dot { width: 6px; height: 6px; display: inline-block; border-radius: 1px; box-shadow: 0 0 6px currentColor; }
+.controls { margin-left: auto; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.actions { margin-left: auto; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+button.icon { font-size: 13px; padding: 5px 9px; letter-spacing: 0; }
+#zoomHud {
+  position: absolute; left: 12px; bottom: 12px; display: flex; align-items: center; gap: 8px;
+  padding: 5px 9px; border: 1px solid var(--line-strong); border-radius: 3px;
+  background: rgba(4, 9, 16, .85); backdrop-filter: blur(4px);
+}
+#zoomHud #zoomPct { font: 600 11px var(--mono); color: var(--cyan); min-width: 42px; text-align: right; }
+#canvas { position: relative; }
+.info {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 13px; height: 13px; margin-left: 5px; border-radius: 50%;
+  border: 1px solid var(--line-strong); color: var(--cyan);
+  font: 700 9px var(--mono); cursor: help; position: relative; text-transform: none;
+}
+.info:hover { border-color: var(--cyan); box-shadow: 0 0 8px rgba(0, 229, 255, .35); }
+.info:hover::after {
+  content: attr(data-tip); position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%);
+  width: 280px; padding: 8px 10px; z-index: 60; text-align: left;
+  background: #060d16; border: 1px solid var(--line-strong); border-radius: 3px;
+  color: var(--text); font: 400 11px/1.5 var(--mono); letter-spacing: 0; text-transform: none;
+  box-shadow: 0 0 20px rgba(0, 229, 255, .2);
+}
+#settingsModal { position: fixed; inset: 0; background: rgba(2, 5, 9, .8); display: none;
+  align-items: center; justify-content: center; z-index: 55; backdrop-filter: blur(3px); }
+#settingsModal.open { display: flex; }
+#settingsModal .box {
+  background: var(--panel); border: 1px solid var(--line-strong); border-radius: 4px;
+  width: min(680px, 94vw); max-height: 88vh; display: flex; flex-direction: column;
+  box-shadow: 0 0 40px rgba(0, 229, 255, .18);
+}
+#settingsModal .head { padding: 9px 14px; border-bottom: 1px solid var(--line);
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--cyan); }
+#settingsModal .body { padding: 12px 14px; overflow-y: auto; }
+#settingsModal .hint { margin: 0 0 12px; font-size: 11px; color: var(--muted); }
+#settingsModal .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+#settingsModal .field { display: flex; flex-direction: column; gap: 5px; }
+#settingsModal .field.wide { grid-column: 1 / -1; }
+#settingsModal .flabel { font-size: 11px; color: var(--text); display: flex; align-items: center; }
+#settingsModal input, #settingsModal select { width: 100%; }
+.sec.collapsed .scroll { display: none; }
+.sec.collapsed { flex: 0 0 auto !important; }
+.sec .chev { cursor: pointer; color: var(--cyan); font-size: 10px; user-select: none; }
+.sec .seclabel { cursor: pointer; }
+.sec .sechead { justify-content: flex-start; gap: 7px; }
+.controls label { font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--muted); display: flex; gap: 4px; align-items: center; }
+.jobnote { width: 100%; font-size: 11px; color: var(--muted); letter-spacing: .03em; }
+.jobnote.error { color: var(--magenta); text-shadow: 0 0 8px rgba(255, 45, 149, .4); }
+.jobnote.ok { color: var(--lime); text-shadow: 0 0 8px rgba(0, 255, 156, .35); }
+main { display: flex; height: calc(100vh - 57px); position: relative; }
+#canvas { flex: 1; min-width: 0; }
+aside {
+  width: 384px; display: flex; flex-direction: column; min-height: 0;
+  border-left: 1px solid var(--line-strong); background: linear-gradient(180deg, rgba(6, 12, 21, .96), rgba(4, 8, 15, .96));
+  box-shadow: 0 0 26px rgba(0, 229, 255, .07);
+}
+.sec { display: flex; flex-direction: column; min-height: 0; border-bottom: 1px solid var(--line); }
+.sec.queue { flex: 1.2; } .sec.inspect { flex: 1.2; } .sec.log { flex: .9; border-bottom: none; }
+.sechead {
+  padding: 6px 12px; font-size: 9.5px; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--cyan); display: flex; justify-content: space-between; align-items: center; gap: 6px;
+  background: rgba(0, 229, 255, .05); border-bottom: 1px solid var(--line); flex-wrap: wrap;
+  text-shadow: 0 0 8px rgba(0, 229, 255, .35);
+}
+.sechead .mini { display: flex; gap: 4px; align-items: center; }
+.scroll { overflow-y: auto; min-height: 0; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(0, 229, 255, .16); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0, 229, 255, .34); }
+.row { display: flex; gap: 8px; align-items: center; padding: 5px 12px; cursor: pointer;
+  border-bottom: 1px solid rgba(0, 229, 255, .05); }
+.row:hover { background: rgba(0, 229, 255, .05); }
+.row.inspected { background: rgba(0, 229, 255, .09); box-shadow: inset 2px 0 0 var(--cyan), inset 0 0 14px rgba(0, 229, 255, .06); }
+.row.runnow { box-shadow: inset 2px 0 0 var(--amber); }
+.row.runnow.inspected { box-shadow: inset 2px 0 0 var(--amber), inset 2px 0 0 var(--cyan); }
+.row .t { flex: 1; min-width: 0; }
+.row .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.row .id { font-size: 10px; color: var(--dim); }
+.status {
+  font-size: 9px; letter-spacing: .1em; text-transform: uppercase; border-radius: 2px;
+  padding: 2px 6px; white-space: nowrap; border: 1px solid transparent;
+}
+.st-pending { color: var(--muted); border-color: var(--slate); }
+.st-ready { color: #02130c; background: var(--lime); border-color: var(--lime); font-weight: 700;
+  box-shadow: 0 0 10px rgba(0, 255, 156, .45); }
+.st-running { color: #1a1000; background: var(--amber); border-color: var(--amber); font-weight: 700;
+  box-shadow: 0 0 10px rgba(255, 196, 0, .45); }
+.st-completed { color: var(--cyan); border-color: rgba(0, 229, 255, .5); }
+.st-failed { color: #fff; background: var(--magenta); border-color: var(--magenta); font-weight: 700;
+  box-shadow: 0 0 10px rgba(255, 45, 149, .5); }
+.st-skipped { color: var(--slate); border-color: var(--slate); border-style: dashed; }
+.st-blocked { color: var(--magenta); border-color: rgba(255, 45, 149, .6); border-style: dashed; }
+.st-gated { color: var(--violet); border-color: rgba(160, 107, 255, .6); }
+.ev { padding: 3px 12px; font-size: 10.5px; border-bottom: 1px solid rgba(0, 229, 255, .05); color: var(--muted); }
+.ev b { color: var(--dim); font-weight: 600; }
+.ev.fail { color: #ff86c0; } .ev.done { color: #6ef7d0; }
+.ev.start { color: #ffe08a; } .ev.stop { color: #ffb27a; } .ev.skip { color: var(--muted); }
+#inspector { padding: 9px 12px; }
+#inspector h3 { margin: 0 0 4px; font-size: 12.5px; color: var(--text);
+  text-shadow: 0 0 8px rgba(0, 229, 255, .25); }
+#inspector .meta { font-size: 10.5px; color: var(--muted); margin-bottom: 6px; }
+#inspector pre {
+  white-space: pre-wrap; background: #03070c; border: 1px solid var(--line); border-radius: 3px;
+  padding: 7px; font: 10.5px/1.5 var(--mono); color: #b9dcE9; margin: 5px 0; max-height: 150px; overflow-y: auto;
+}
+#inspector .btns { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 6px; }
+.empty { color: var(--dim); font-size: 11px; padding: 9px 12px; letter-spacing: .04em; }
+#modal { position: fixed; inset: 0; background: rgba(2, 5, 9, .8); display: none;
+  align-items: center; justify-content: center; z-index: 50; backdrop-filter: blur(3px); }
+#modal.open { display: flex; }
+#modal .box {
+  background: var(--panel); border: 1px solid var(--line-strong); border-radius: 4px;
+  width: min(900px, 92vw); max-height: 84vh; display: flex; flex-direction: column;
+  box-shadow: 0 0 40px rgba(0, 229, 255, .18);
+}
+#modal .head { padding: 8px 14px; border-bottom: 1px solid var(--line); letter-spacing: .1em;
+  text-transform: uppercase; font-size: 10px; color: var(--cyan);
+  display: flex; justify-content: space-between; align-items: center; }
+#modal pre { margin: 0; padding: 12px 14px; overflow: auto; font: 11px/1.55 var(--mono);
+  white-space: pre-wrap; color: #b9dce9; }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">DAG Orchestrator</span>
+  <span class="filepath" id="filepath" title=""></span>
+  <span class="total"><strong id="total">0</strong>tasks</span>
+  <div class="pills" id="pills"></div>
+  <div class="progress" id="progress"><i id="pbar-done" class="pbar-done"></i><i id="pbar-fail" class="pbar-fail"></i><i id="pbar-skip" class="pbar-skip"></i><i id="pbar-run" class="pbar-run"></i></div>
+  <div class="actions">
+    <button class="primary" id="runBtn" disabled>Run</button>
+    <button class="danger" id="stopBtn" disabled>Stop</button>
+    <button id="retryBtn" disabled>Retry failed</button>
+    <button id="skipBtn">Skip blocked</button>
+    <button id="orphanBtn">Kill orphans</button>
+    <button id="settingsBtn" class="icon" title="Run settings">☰</button>
+  </div>
+  <div class="jobnote" id="jobnote"></div>
+</header>
+<main>
+  <div id="canvas"></div>
+  <div id="zoomHud">
+    <span id="zoomPct" title="click to reset zoom to 100%">100%</span>
+    <button class="mini" id="zoomReset" title="zoom to fit the whole graph">reset</button>
+  </div>
+  <aside>
+    <div class="sec queue" data-sec="queue">
+      <div class="sechead">
+        <span class="chev" title="collapse / expand">▾</span>
+        <span class="seclabel">Queue</span>
+        <span class="mini">
+          <input type="search" id="search" placeholder="filter…" style="width:110px" />
+          <button class="mini" id="allBtn">All</button>
+          <button class="mini" id="noneBtn">None</button>
+          <button class="mini" id="failedBtn">Failed</button>
+        </span>
+      </div>
+      <div class="scroll" id="queue"></div>
+    </div>
+    <div class="sec inspect" data-sec="inspect">
+      <div class="sechead">
+        <span class="chev" title="collapse / expand">▾</span>
+        <span class="seclabel">Inspector</span>
+        <span class="mini" id="inspActions"></span>
+      </div>
+      <div class="scroll" id="inspector"><div class="empty">Select a task.</div></div>
+    </div>
+    <div class="sec log" data-sec="log">
+      <div class="sechead">
+        <span class="chev" title="collapse / expand">▾</span>
+        <span class="seclabel">Log</span>
+        <span class="mini" id="logCount"></span>
+      </div>
+      <div class="scroll" id="log"></div>
+    </div>
+  </aside>
+</main>
+<div id="settingsModal">
+  <div class="box">
+    <div class="head">
+      <span>Run settings</span>
+      <span class="mini"><button class="mini" id="settingsClose">close</button></span>
+    </div>
+    <div class="body">
+      <p class="hint">Applied to the run file when you press <b>Run</b>. Values are remembered per project.</p>
+      <div class="grid">
+        <label class="field">
+          <span class="flabel">Parallel Agent Max:
+            <span class="info" data-tip="How many tasks may run at the same time. Each running task can spawn its own agent process. Maximum 64.">i</span>
+          </span>
+          <input type="number" id="concurrency" min="1" max="64" value="4" />
+        </label>
+        <label class="field">
+          <span class="flabel">Task timeout (seconds):
+            <span class="info" data-tip="Hard limit for one attempt. A task that runs longer is stopped and fails as 'timeout'; its partial work is salvaged to its branch. 0 = no limit.">i</span>
+          </span>
+          <input type="number" id="timeout" min="0" value="3600" />
+        </label>
+        <label class="field">
+          <span class="flabel">Silence alert (seconds):
+            <span class="info" data-tip="If a task prints nothing for this long, raise a warning and notify. Agents legitimately go quiet while a buffered tool call (pytest, mypy, a long model turn) runs. 0 = off.">i</span>
+          </span>
+          <input type="number" id="silence" min="0" value="600" />
+        </label>
+        <label class="field">
+          <span class="flabel">On silence:
+            <span class="info" data-tip="warn = only report the quiet spell; the task keeps running until its timeout (default). kill = treat silence as stalled: stop the task and retry it.">i</span>
+          </span>
+          <select id="silenceAction"><option value="warn">warn</option><option value="kill">kill</option></select>
+        </label>
+        <label class="field">
+          <span class="flabel">Retries per task:
+            <span class="info" data-tip="Extra attempts after a failed attempt (0 = one attempt only). Merge conflicts with the integration branch use their own separate budget.">i</span>
+          </span>
+          <input type="number" id="retries" min="0" value="0" />
+        </label>
+        <label class="field">
+          <span class="flabel">Run deadline (hours):
+            <span class="info" data-tip="Wall-clock budget for the whole run. On expiry, no new tasks start and the run settles with whatever is unfinished. 0 = unlimited.">i</span>
+          </span>
+          <input type="number" id="maxHours" min="0" value="0" />
+        </label>
+        <label class="field">
+          <span class="flabel">On dependency failure:
+            <span class="info" data-tip="block = tasks that depend on a failure stay pending until you fix it; the run pauses (default). skip = mark everything downstream as skipped so an unattended run still converges.">i</span>
+          </span>
+          <select id="onDepFailure"><option value="block">block</option><option value="skip">skip</option></select>
+        </label>
+        <label class="field">
+          <span class="flabel">On unapproved gate:
+            <span class="info" data-tip="wait = hold the gated task until you approve it in the Inspector (default). skip = mark it skipped and continue.">i</span>
+          </span>
+          <select id="onGateBlocked"><option value="wait">wait</option><option value="skip">skip</option></select>
+        </label>
+        <label class="field">
+          <span class="flabel">Worktree isolation:
+            <span class="info" data-tip="task = every task runs in its own git worktree on a per-run integration branch, merged only after the task (and its reviewer) pass. Your checkout is untouched. none = agents edit the project directory directly.">i</span>
+          </span>
+          <select id="worktree"><option value="none">none</option><option value="task">task</option></select>
+        </label>
+        <label class="field">
+          <span class="flabel">Model:
+            <span class="info" data-tip="The agent model every task uses. Commands reference it as {model}, so changing this retargets the whole run. A task can override it in the Inspector. The list comes from your own opencode install.">i</span>
+          </span>
+          <select id="model"><option value="">(run default)</option></select>
+        </label>
+        <label class="field">
+          <span class="flabel">Reasoning effort:
+            <span class="info" data-tip="Provider-specific reasoning effort, passed to the agent CLI as --variant (for example minimal, high, max, xhigh). Free text: only some models accept it. Commands reference it as {variant}.">i</span>
+          </span>
+          <input type="text" id="variant" list="variantOptions" placeholder="e.g. xhigh" />
+          <datalist id="variantOptions">
+            <option value="minimal"></option><option value="low"></option>
+            <option value="medium"></option><option value="high"></option>
+            <option value="max"></option><option value="xhigh"></option>
+          </datalist>
+        </label>
+        <label class="field wide">
+          <span class="flabel">Notify command:
+            <span class="info" data-tip="Command run on task-fail, task-quiet, task-stalled and run-end. It receives DAG_EVENT, DAG_TASK, DAG_MESSAGE, DAG_FILE, DAG_RUN in its environment. Empty = no notifications.">i</span>
+          </span>
+          <input type="text" id="notifyCmd" placeholder="e.g. curl -s -d &quot;$DAG_EVENT $DAG_TASK&quot; https://your-hook" />
+        </label>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="modal"><div class="box">
+  <div class="head">
+    <span id="modalTitle">terminal</span>
+    <span class="mini">
+      <span id="modalAttempts"></span>
+      <label class="mini" title="auto-scroll to the newest output">
+        <input type="checkbox" id="followChk" checked /> follow
+      </label>
+      <button class="mini" id="modalClose">close</button>
+    </span>
+  </div>
+  <pre id="modalBody"></pre>
+</div></div>
+<script>
+const $ = (id) => document.getElementById(id);
+const canvas = $('canvas'), queueEl = $('queue'), inspectorEl = $('inspector'), logEl = $('log');
+
+const nodes = new vis.DataSet([]);
+const edges = new vis.DataSet([]);
+const network = new vis.Network(canvas, { nodes, edges }, {
+  layout: { hierarchical: { enabled: true, direction: 'LR', sortMethod: 'directed', levelSeparation: 330, nodeSpacing: 150, treeSpacing: 200 } },
+  physics: { enabled: false },
+  interaction: { hover: true, dragNodes: false, dragView: true, zoomView: true, selectConnectedEdges: false },
+  edges: { dashes: [3, 5], width: 1.2, color: { color: 'rgba(0,229,255,.38)', highlight: '#00e5ff', hover: '#8af4ff' },
+    arrows: { to: { enabled: true, scaleFactor: .5, type: 'arrow' } },
+    shadow: { enabled: true, color: 'rgba(0,229,255,.3)', size: 8, x: 0, y: 0 },
+    smooth: { enabled: true, type: 'cubicBezier', roundness: .4 } },
+  nodes: { shape: 'box', borderWidth: 1.5, margin: { top: 10, right: 16, bottom: 10, left: 16 },
+    font: { size: 12, face: '"Cascadia Mono", "JetBrains Mono", Consolas, monospace', color: '#d7f5ff', multi: false },
+    widthConstraint: { maximum: 280 }, color: { highlight: { background: '#06222e', border: '#8af4ff' } } },
+  groups: {
+    pending:   { color: { background: '#081420', border: '#3d6379' }, font: { color: '#8fb7cd' } },
+    ready:     { color: { background: '#04180f', border: '#00ff9c' },
+                 shadow: { enabled: true, color: 'rgba(0,255,156,.55)', size: 14, x: 0, y: 0 } },
+    running:   { color: { background: '#1a1206', border: '#ffc400' },
+                 shadow: { enabled: true, color: 'rgba(255,196,0,.6)', size: 16, x: 0, y: 0 } },
+    completed: { color: { background: '#04141c', border: '#00b3cc' }, font: { color: '#9fe8f5' } },
+    failed:    { color: { background: '#1c0410', border: '#ff2d95' },
+                 shadow: { enabled: true, color: 'rgba(255,45,149,.6)', size: 16, x: 0, y: 0 } },
+    skipped:   { color: { background: '#081420', border: '#3d6379' }, font: { color: '#6f8fa3' },
+                 shapeProperties: { borderDashes: [4, 4] } },
+    blocked:   { color: { background: '#1c0410', border: '#ff2d95' }, font: { color: '#ffb3d3' },
+                 shapeProperties: { borderDashes: [6, 4] } },
+    gated:     { color: { background: '#120a24', border: '#a06bff' }, font: { color: '#d9c8ff' },
+                 shadow: { enabled: true, color: 'rgba(160,107,255,.45)', size: 12, x: 0, y: 0 } },
+  },
+});
+network.on('click', (p) => { if (p.nodes.length > 0) select(p.nodes[0]); });
+
+let summary = null, job = null, meta = null, def = null;
+let rev = -1, defRev = -1, latestSeq = 0, initialized = false;
+let inspected = null, detail = null, queueFilter = null, search = '';
+const checked = new Set();
+const nodeSig = new Map();
+const titleById = new Map();
+
+// ---- settings persistence ----
+const NUM_SETTINGS = ['concurrency', 'timeout', 'silence', 'retries', 'maxHours'];
+const TEXT_SETTINGS = ['model', 'variant'];
+const SELECT_SETTINGS = ['onDepFailure', 'onGateBlocked', 'worktree', 'silenceAction'];
+for (const id of [...NUM_SETTINGS, ...SELECT_SETTINGS, ...TEXT_SETTINGS]) {
+  const el = $(id);
+  el.addEventListener('change', () => {
+    localStorage.setItem('dag.' + id, el.value);
+    markDirty();
+  });
+}
+$('notifyCmd').addEventListener('change', () => {
+  localStorage.setItem('dag.notifyCmd', $('notifyCmd').value);
+});
+
+function applySettings(def) {
+  const s = def.settings || {};
+  const fallback = {
+    concurrency: s.concurrency ?? 4, timeout: Math.round((s.timeoutMs ?? 3600000) / 1000),
+    silence: Math.round((s.silenceMs ?? 600000) / 1000), retries: Math.max(0, (s.maxAttempts ?? 1) - 1),
+    maxHours: Math.round((s.maxWallClockMs ?? 0) / 3600000),
+    onDepFailure: s.onDepFailure ?? 'block', onGateBlocked: s.onGateBlocked ?? 'wait',
+    worktree: s.worktree ?? 'none',
+    silenceAction: s.silenceAction ?? 'warn',
+    model: s.model ?? '',
+    variant: s.variant ?? '',
+    notifyCmd: s.notifyCmd ?? '',
+  };
+  for (const id of [...NUM_SETTINGS, ...SELECT_SETTINGS]) {
+    const stored = localStorage.getItem('dag.' + id);
+    $(id).value = stored !== null ? stored : String(fallback[id]);
+  }
+  const notify = localStorage.getItem('dag.notifyCmd');
+  $('notifyCmd').value = notify !== null ? notify : fallback.notifyCmd;
+  for (const id of TEXT_SETTINGS) {
+    const stored = localStorage.getItem('dag.' + id);
+    $(id).value = stored !== null ? stored : String(fallback[id] ?? '');
+  }
+}
+
+function note(msg, cls) {
+  const el = $('jobnote');
+  el.textContent = msg || '';
+  el.className = 'jobnote' + (cls ? ' ' + cls : '');
+}
+
+function sig(t) { return `${t.display}|${t.attempts}|${t.failureKind || ''}|${t.lastOutputAt ? t.lastOutputAt.slice(0, 17) : ''}`; }
+
+// ---- definition / graph ----
+async function loadDefinition() {
+  const r = await fetch('/api/definition');
+  def = await r.json();
+  applySettings(def);
+  nodeSig.clear();
+  nodes.clear(); edges.clear();
+  titleById.clear();
+  nodes.add(def.tasks.map((t) => { titleById.set(t.id, t.title); return { id: t.id, label: `${t.title}\n${t.id}`, group: 'pending' }; }));
+  const edgeList = [];
+  for (const t of def.tasks) for (const d of t.deps || []) edgeList.push({ from: d, to: t.id });
+  edges.add(edgeList);
+  // Fit the whole graph in view; the graph is static otherwise, so this
+  // only runs when the definition changes. Floor the zoom so wide graphs
+  // stay legible, anchored to the top-left so the entry points are in view.
+  network.fit({ animation: false });
+  if (network.getScale() < 0.75) {
+    const positions = network.getPositions();
+    const xs = Object.values(positions).map((p) => p.x);
+    const ys = Object.values(positions).map((p) => p.y);
+    const scale = 0.75;
+    const halfW = (canvas.clientWidth || 900) / (2 * scale);
+    const halfH = (canvas.clientHeight || 600) / (2 * scale);
+    network.moveTo({
+      scale,
+      position: {
+        x: Math.min(...xs) + halfW * 0.7,
+        y: Math.min(...ys) + halfH * 0.7,
+      },
+      animation: false,
+    });
+  }
+  $('filepath').textContent = meta?.file ?? '';
+  $('filepath').title = meta?.file ?? '';
+  document.title = `DAG Orchestrator · ${def.objective || def.id}`;
+}
+
+function applySummary(s) {
+  summary = s;
+  const changed = [];
+  for (const t of s.tasks) {
+    const k = sig(t);
+    if (nodeSig.get(t.id) === k) continue;
+    nodeSig.set(t.id, k);
+    const silent = t.display === 'running' && t.lastOutputAt
+      ? Math.round((Date.now() - Date.parse(t.lastOutputAt)) / 1000) : null;
+    changed.push({
+      id: t.id, group: t.display,
+      label: `${titleOf(t.id)}\n${t.id} · ${t.display}${silent !== null && silent > 60 ? ` · ${silent}s` : ''}`,
+    });
+  }
+  if (changed.length) nodes.update(changed);
+  renderHeader(s);
+  renderQueue();
+}
+function titleOf(id) { return titleById.get(id) ?? id; }
+
+function renderHeader(s) {
+  const c = s.counts || {};
+  $('total').textContent = s.total;
+  const dot = { ready: 'var(--lime)', running: 'var(--amber)', failed: 'var(--magenta)', completed: 'var(--cyan)', blocked: 'var(--magenta)', gated: 'var(--violet)', skipped: 'var(--slate)', pending: 'var(--slate)' };
+  $('pills').innerHTML = ['running', 'ready', 'failed', 'blocked', 'gated', 'completed', 'skipped', 'pending']
+    .filter((k) => c[k])
+    .map((k) => `<span class="pill${queueFilter === k ? ' active' : ''}" data-filter="${k}"><span class="dot" style="background:${dot[k]}"></span>${k} <b>${c[k]}</b></span>`)
+    .join('');
+  $('pills').querySelectorAll('.pill').forEach((el) => {
+    el.onclick = () => { queueFilter = queueFilter === el.dataset.filter ? null : el.dataset.filter; renderQueue(); renderHeader(s); };
+  });
+  const total = s.total || 1;
+  const pct = (n) => `${(100 * (n || 0)) / total}%`;
+  $('pbar-done').style.width = pct(c.completed);
+  $('pbar-fail').style.width = pct(c.failed);
+  $('pbar-skip').style.width = pct(c.skipped);
+  $('pbar-run').style.width = pct((c.running || 0) + (c.ready || 0));
+
+  const running = job.running;
+  const external = job.external;
+  $('runBtn').disabled = running || job.stopping || !!external || checked.size === 0;
+  $('runBtn').textContent = job.stopping ? 'Stopping…' : running ? `Running (${job.current.length})` : 'Run';
+  $('stopBtn').disabled = !running || job.stopping;
+  $('retryBtn').disabled = running || !!external || !c.failed;
+  $('skipBtn').disabled = running || !!external;
+  $('orphanBtn').disabled = running || !!external;
+  for (const id of [...NUM_SETTINGS, ...SELECT_SETTINGS, ...TEXT_SETTINGS]) $(id).disabled = running || !!external;
+
+  if (job.stopping) note('stopping: killing running tasks…');
+  else if (running) note(`running ${job.current.length} of ${job.scope?.length ?? '?'} selected`);
+  else if (external) {
+    const since = external.startedAt ? external.startedAt.slice(11, 19) : '?';
+    note(`external run in progress (pid ${external.pid}, ${external.note}, since ${since}) — started from the CLI or scheduler`, '');
+  } else if (job.result) {
+    const r = job.result;
+    const parts = [`${r.completed.length} completed`, `${r.failed.length} failed`];
+    if (r.skipped.length) parts.push(`${r.skipped.length} skipped`);
+    if (r.unfinished.length) parts.push(`${r.unfinished.length} unfinished`);
+    if (r.budgetReached) parts.push('wall-clock budget reached');
+    note((r.stopped ? 'stopped — ' : '') + parts.join(', '), r.failed.length || r.unfinished.length ? 'error' : 'ok');
+  } else note('');
+}
+
+// ---- queue ----
+queueEl.addEventListener('click', (ev) => {
+  const el = ev.target;
+  const row = el.closest('.row');
+  if (!row) return;
+  const id = row.dataset.id;
+  if (el.tagName === 'INPUT') {
+    if (el.checked) checked.add(id); else checked.delete(id);
+    markDirty();
+    return;
+  }
+  select(id);
+});
+// Double-click a task for its live terminal transcript.
+queueEl.addEventListener('dblclick', (ev) => {
+  const row = ev.target.closest('.row');
+  if (row) void openTerminal(row.dataset.id);
+});
+function markDirty() {
+  if (summary) renderHeader(summary);
+}
+
+function visibleTasks() {
+  let list = summary ? summary.tasks.slice() : [];
+  if (queueFilter) list = list.filter((t) => t.display === queueFilter);
+  if (search) {
+    const q = search.toLowerCase();
+    list = list.filter((t) => t.id.toLowerCase().includes(q) || titleOf(t.id).toLowerCase().includes(q));
+  }
+  return list;
+}
+
+const QUEUE_CAP = 500;
+function renderQueue() {
+  if (!summary) return;
+  const list = visibleTasks();
+  const shown = list.slice(0, QUEUE_CAP);
+  const parts = shown.map((t) => {
+    const cls = [
+      'row',
+      t.id === inspected ? 'inspected' : '',
+      job.current.includes(t.id) ? 'runnow' : '',
+    ].filter(Boolean).join(' ');
+    const meta = `attempts ${t.attempts}/${t.maxAttempts}${t.failureKind ? ` · ${t.failureKind}` : ''}${t.exitCode !== null && t.exitCode !== undefined ? ` · exit ${t.exitCode}` : ''}${t.reviewRounds > 0 ? ` · rev ${t.reviews}/${t.reviewRounds + 1}` : ''}${t.repairRounds > 0 ? ` · fix ${t.repairs}/${t.repairRounds}` : ''}`;
+    return `<div class="${cls}" data-id="${t.id}">
+      <input type="checkbox" ${checked.has(t.id) ? 'checked' : ''} />
+      <div class="t"><div class="title">${esc(titleOf(t.id))}</div><div class="id">${t.id} · ${meta}</div></div>
+      <span class="status st-${t.display}">${t.display}</span>
+    </div>`;
+  });
+  const more = list.length > shown.length
+    ? `<div class="empty">showing ${shown.length} of ${list.length} — filter to narrow</div>` : '';
+  queueEl.innerHTML = parts.join('') + more;
+}
+
+function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]); }
+
+// ---- inspector ----
+function select(id) {
+  inspected = id;
+  detail = null;
+  fetchDetail(id).then(renderInspector);
+  renderQueue();
+}
+
+async function fetchDetail(id) {
+  try {
+    const r = await fetch(`/api/tasks/${id}`);
+    if (r.ok) detail = (await r.json()).task;
+  } catch { /* transient */ }
+}
+
+function renderInspector() {
+  const t = detail && detail.id === inspected ? detail : null;
+  $('inspActions').innerHTML = t
+    ? `<button class="mini" id="logBtn">■ terminal</button>`
+    : '';
+  if (!t) { inspectorEl.innerHTML = '<div class="empty">Select a task.</div>'; return; }
+  const bits = [t.id, detailDisplay(t), `deps: ${t.deps.join(', ') || '(none)'}`, `attempts: ${t.attempts}/${t.maxAttempts}`];
+  if (t.reviewCmd) bits.push(`reviews: ${t.reviews}/${t.reviewRounds + 1}`);
+  if (t.planCmd) bits.push(t.plan ? `plan: ${t.plan.length} chars` : 'plan: pending');
+  if (t.repairRounds > 0) bits.push(`repairs: ${t.repairs}/${t.repairRounds}`);
+  if (t.exitCode !== null) bits.push(`exit: ${t.exitCode}`);
+  if (t.failureKind) bits.push(`failure: ${t.failureKind}`);
+  if (t.branch) bits.push(`branch: ${t.branch}${t.commit ? ` @ ${t.commit.slice(0, 8)}` : ''}`);
+  bits.push('model: ' + (t.model || runModel() || '(none)') + (t.variant ? ' / ' + t.variant : ''));
+  if (t.pid) bits.push(`pid: ${t.pid}`);
+  inspectorEl.innerHTML = `
+    <h3>${esc(t.title)}</h3>
+    <div class="meta">${esc(bits.join(' · '))}</div>
+    <pre>${esc(t.spec || '(no spec)')}</pre>
+    <pre>cmd: ${esc(t.cmd || '(manual — no cmd)')}</pre>
+    ${t.planCmd ? `<pre>plan: ${esc(t.planCmd)}</pre>` : ''}
+    ${t.plan ? `<pre>plan output:\n${esc(t.plan)}</pre>` : ''}
+    ${t.reviewCmd ? `<pre>review: ${esc(t.reviewCmd)}</pre>` : ''}
+    ${t.result ? `<pre>result: ${esc(t.result)}</pre>` : ''}
+    ${t.reviewResult ? `<pre>review result: ${esc(t.reviewResult)}</pre>` : ''}
+    ${t.lastOutput && t.status === 'running' ? `<pre>live output:\n${esc(t.lastOutput)}</pre>` : ''}
+  `;
+  const btns = document.createElement('div');
+  btns.className = 'btns';
+  const busy = !!(job && (job.running || job.external || job.stopping));
+  const mk = (label, fn, cls) => {
+    const b = document.createElement('button');
+    b.className = 'mini' + (cls ? ' ' + cls : '');
+    b.textContent = label;
+    b.disabled = busy;
+    b.onclick = fn;
+    btns.append(b);
+  };
+  if (t.status === 'failed' || t.status === 'skipped') mk('Retry', () => retry([t.id]));
+  mk('Mark done', () => patch(t.id, { status: 'completed' }));
+  mk('Mark failed', () => patch(t.id, { status: 'failed' }));
+  mk('Requeue', () => retry([t.id]));
+  const term = document.createElement('button');
+  term.className = 'mini primary';
+  term.textContent = t.status === 'running' ? '■ terminal (live)' : '■ terminal';
+  term.onclick = () => void openTerminal(t.id);
+  btns.append(term);
+  inspectorEl.append(btns);
+  const modelRow = document.createElement('div');
+  modelRow.className = 'btns';
+  modelRow.style.marginTop = '4px';
+  const modelSel = document.createElement('select');
+  modelSel.className = 'mini';
+  modelSel.title = 'Model for this task (overrides the run default)';
+  modelSel.append(new Option('model: run default', ''));
+  for (const m of modelOptions()) {
+    const opt = new Option(m.length > 40 ? m.slice(0, 38) + '…' : m, m);
+    if (t.model === m) opt.selected = true;
+    modelSel.append(opt);
+  }
+  if (t.model && !modelOptions().includes(t.model)) {
+    const opt = new Option(t.model, t.model);
+    opt.selected = true;
+    modelSel.append(opt);
+  }
+  modelSel.disabled = busy;
+  modelSel.onchange = () => patch(t.id, { model: modelSel.value || null });
+  const variantInput = document.createElement('input');
+  variantInput.className = 'mini';
+  variantInput.style.width = '90px';
+  variantInput.placeholder = 'effort';
+  variantInput.title = 'Reasoning effort for this task (overrides the run default)';
+  variantInput.value = t.variant ?? '';
+  variantInput.disabled = busy;
+  variantInput.onchange = () => patch(t.id, { variant: variantInput.value.trim() || null });
+  modelRow.append(modelSel, variantInput);
+  inspectorEl.append(modelRow);
+  if (t.gate) {
+    const g = document.createElement('div');
+    g.className = 'meta';
+    g.textContent = `Gate: ${t.gate.question} — ${t.gate.approved === null ? 'pending' : t.gate.approved ? 'approved' : 'rejected'}`;
+    const btns2 = document.createElement('div');
+    btns2.className = 'btns';
+    const a = document.createElement('button'); a.className = 'mini'; a.textContent = 'Approve';
+    a.disabled = busy; a.onclick = () => patch(t.id, { approved: true });
+    const rj = document.createElement('button'); rj.className = 'mini'; rj.textContent = 'Reject';
+    rj.disabled = busy; rj.onclick = () => patch(t.id, { approved: false });
+    btns2.append(a, rj);
+    inspectorEl.append(g, btns2);
+  }
+  const lb = $('logBtn');
+  if (lb) lb.onclick = () => void openTerminal(t.id);
+}
+function detailDisplay(t) {
+  const s = summary?.tasks.find((x) => x.id === t.id);
+  return s ? s.display : t.status;
+}
+
+// ---- events ----
+const EV_CLASS = { 'task-fail': 'fail', 'task-stalled': 'fail', 'task-timeout': 'fail', 'task-done': 'done', 'task-start': 'start', 'run-stop': 'stop', 'task-killed': 'stop', 'task-retry': 'start', 'task-skip': 'skip', 'task-interrupted': 'skip' };
+async function fetchEvents() {
+  try {
+    const r = await fetch(`/api/events?since=${latestSeq}`);
+    if (!r.ok) return;
+    const data = await r.json();
+    if (!data.events || data.events.length === 0) return;
+    latestSeq = data.latestSeq;
+    const html = data.events.slice().reverse().map((e) =>
+      `<div class="ev ${EV_CLASS[e.type] || ''}"><b>${e.ts.slice(11, 19)}</b> ${e.type}${e.taskId ? ` ${e.taskId}` : ''} ${esc(e.message)}</div>`).join('');
+    logEl.insertAdjacentHTML('afterbegin', html);
+    while (logEl.childElementCount > 300) logEl.removeChild(logEl.lastChild);
+    $('logCount').textContent = `${latestSeq} total`;
+  } catch { /* transient */ }
+}
+
+// ---- mutations ----
+async function patch(id, body) {
+  const r = await fetch(`/api/tasks/${id}`, { method: 'POST', body: JSON.stringify(body) });
+  if (!r.ok) note(await r.text(), 'error');
+  await poll();
+  await fetchDetail(id);
+  renderInspector();
+}
+async function retry(ids) {
+  const r = await fetch('/api/retry', { method: 'POST', body: JSON.stringify({ ids }) });
+  if (!r.ok) note((await r.json()).error || 'retry failed', 'error');
+  await poll();
+}
+
+$('runBtn').onclick = async () => {
+  note('');
+  const r = await fetch('/api/run/start', {
+    method: 'POST',
+    body: JSON.stringify({
+      ids: [...checked],
+      concurrency: Number($('concurrency').value) || 4,
+      timeoutMs: (Number($('timeout').value) || 0) * 1000,
+      silenceMs: (Number($('silence').value) || 0) * 1000,
+      maxAttempts: (Number($('retries').value) || 0) + 1,
+      maxWallClockMs: (Number($('maxHours').value) || 0) * 3600_000,
+      onDepFailure: $('onDepFailure').value,
+      onGateBlocked: $('onGateBlocked').value,
+      worktree: $('worktree').value,
+      silenceAction: $('silenceAction').value,
+      model: $('model').value.trim(),
+      variant: $('variant').value.trim(),
+      notifyCmd: $('notifyCmd').value.trim(),
+    }),
+  });
+  const data = await r.json();
+  if (!r.ok) note(data.error || 'start failed', 'error');
+  else if (data.skippedManual?.length) note(`skipped manual task(s): ${data.skippedManual.join(', ')}`);
+  await poll();
+};
+$('stopBtn').onclick = async () => { await fetch('/api/run/stop', { method: 'POST' }); await poll(); };
+$('retryBtn').onclick = () => retry(null);
+$('skipBtn').onclick = async () => {
+  const r = await fetch('/api/skip-blocked', { method: 'POST' });
+  const data = await r.json();
+  if (!r.ok) note(data.error || 'skip failed', 'error');
+  else note(`skipped ${data.skipped.length} task(s)`, 'ok');
+  await poll();
+};
+$('orphanBtn').onclick = async () => {
+  const r = await fetch('/api/kill-orphans', { method: 'POST' });
+  const data = await r.json();
+  if (!r.ok) note(data.error || 'kill-orphans failed', 'error');
+  else note(`orphans: ${data.killed.length === 0 ? 'none recorded' : data.killed.map((k) => `${k.pid} ${k.killed ? 'killed' : 'gone'}`).join(', ')}`, 'ok');
+};
+$('allBtn').onclick = () => { visibleTasks().forEach((t) => checked.add(t.id)); renderQueue(); markDirty(); };
+$('noneBtn').onclick = () => { checked.clear(); renderQueue(); markDirty(); };
+$('failedBtn').onclick = () => {
+  checked.clear();
+  (summary?.tasks || []).filter((t) => t.status === 'failed').forEach((t) => checked.add(t.id));
+  renderQueue(); markDirty();
+};
+$('search').addEventListener('input', (e) => { search = e.target.value.trim(); renderQueue(); });
+
+// ---- terminal view ----
+// A task's "terminal" is its per-attempt transcript: full stdout/stderr with
+// the agent's live output while it runs.
+let termTask = null, termAttempt = null, termTimer = null;
+
+function stripAnsi(text) {
+  return text
+    .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+    .replace(/\x1b\][^\x07]*\x07/g, '')
+    .split('\n')
+    .map((line) => { const i = line.lastIndexOf('\r'); return i >= 0 ? line.slice(i + 1) : line; })
+    .join('\n');
+}
+
+async function openTerminal(id, attempt) {
+  termTask = id;
+  termAttempt = attempt ?? null;
+  $('modal').classList.add('open');
+  $('modalBody').textContent = 'loading…';
+  await refreshTerminal(true);
+  if (termTimer) clearInterval(termTimer);
+  termTimer = setInterval(() => void refreshTerminal(false), 2000);
+}
+
+async function refreshTerminal(initial) {
+  if (!termTask) return;
+  try {
+    const q = termAttempt ? `?attempt=${termAttempt}` : '';
+    const r = await fetch(`/api/logs/${termTask}${q}`);
+    const pre = $('modalBody');
+    if (!r.ok) {
+      pre.textContent = `${termTask}: no attempt logs yet (the task may not have started)`;
+      return;
+    }
+    const data = await r.json();
+    termAttempt = data.attempt;
+    const live = summary?.tasks.find((t) => t.id === termTask);
+    $('modalTitle').textContent =
+      `${termTask} · ${live ? live.display : ''} · attempt ${data.attempt}/${data.attempts.length}`;
+    $('modalAttempts').innerHTML = data.attempts
+      .map((a) => `<button class="mini${a === data.attempt ? ' primary' : ''}" data-attempt="${a}">${a}</button>`)
+      .join(' ');
+    $('modalAttempts').querySelectorAll('button').forEach((b) => {
+      b.onclick = () => { termAttempt = Number(b.dataset.attempt); void refreshTerminal(true); };
+    });
+    const follow = $('followChk').checked;
+    const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 60;
+    const text = stripAnsi(data.content || '(empty)');
+    if (pre.textContent !== text) pre.textContent = text;
+    if (initial || (follow && atBottom)) pre.scrollTop = pre.scrollHeight;
+  } catch {
+    // transient; next tick retries
+  }
+}
+
+function closeTerminal() {
+  termTask = null;
+  if (termTimer) clearInterval(termTimer);
+  termTimer = null;
+  $('modal').classList.remove('open');
+}
+
+$('modalClose').onclick = closeTerminal;
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if ($('settingsModal').classList.contains('open')) {
+    $('settingsModal').classList.remove('open');
+    return;
+  }
+  if (termTask) closeTerminal();
+});
+
+function modelOptions() {
+  return [...document.querySelectorAll('#model option')].map((o) => o.value).filter(Boolean);
+}
+function runModel() {
+  return $('model') ? $('model').value : '';
+}
+
+// ---- model list (from the user's own agent CLI) ----
+let modelsLoaded = false;
+async function loadModels() {
+  if (modelsLoaded) return;
+  try {
+    const r = await fetch('/api/models');
+    const data = await r.json();
+    const sel = $('model');
+    for (const m of data.models || []) {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      sel.append(opt);
+    }
+    modelsLoaded = true;
+  } catch {
+    // the picker just stays on "(run default)"
+  }
+}
+
+// ---- settings modal ----
+$('settingsBtn').onclick = () => {
+  $('settingsModal').classList.add('open');
+  void loadModels();
+};
+$('settingsClose').onclick = () => $('settingsModal').classList.remove('open');
+$('settingsModal').onclick = (e) => {
+  if (e.target === $('settingsModal')) $('settingsModal').classList.remove('open');
+};
+
+// ---- zoom HUD (bottom-left) ----
+const setZoomLabel = () => {
+  $('zoomPct').textContent = `${Math.round(network.getScale() * 100)}%`;
+};
+network.on('zoom', setZoomLabel);
+$('zoomReset').onclick = () => {
+  network.fit({ animation: false });
+  setZoomLabel();
+};
+$('zoomPct').onclick = () => {
+  network.moveTo({ scale: 1, animation: false });
+  setZoomLabel();
+};
+
+// ---- collapsible panels ----
+function applyCollapse() {
+  for (const sec of document.querySelectorAll('.sec')) {
+    const key = `dag.collapsed.${sec.dataset.sec}`;
+    const collapsed = localStorage.getItem(key) === '1';
+    sec.classList.toggle('collapsed', collapsed);
+    const chev = sec.querySelector('.chev');
+    if (chev) chev.textContent = collapsed ? '▸' : '▾';
+  }
+}
+for (const sec of document.querySelectorAll('.sec')) {
+  const toggle = () => {
+    const collapsed = !sec.classList.contains('collapsed');
+    localStorage.setItem(`dag.collapsed.${sec.dataset.sec}`, collapsed ? '1' : '0');
+    applyCollapse();
+  };
+  sec.querySelector('.chev')?.addEventListener('click', toggle);
+  sec.querySelector('.seclabel')?.addEventListener('click', toggle);
+}
+applyCollapse();
+$('modal').onclick = (e) => { if (e.target === $('modal')) closeTerminal(); };
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && termTask) closeTerminal(); });
+
+// ---- poll loop ----
+async function poll() {
+  try {
+    const r = await fetch(`/api/summary?since=${rev}`);
+    if (!r.ok) return;
+    const s = await r.json();
+    job = s.job;
+    if (s.file) meta = { file: s.file };
+    if (s.unchanged) { if (summary) renderHeader(summary); return; }
+    rev = s.rev;
+    if (!initialized || s.defRev !== defRev) {
+      defRev = s.defRev;
+      await loadDefinition();
+      initialized = true;
+    }
+    applySummary(s);
+    if (inspected && detail && detail.status === 'running') {
+      await fetchDetail(inspected);
+      renderInspector();
+    }
+  } catch { /* server restarting */ }
+}
+
+(async () => {
+  await poll();
+  await fetchEvents();
+  setInterval(poll, 2000);
+  setInterval(fetchEvents, 2000);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,42 @@
+{
+  "name": "lightweight-dag",
+  "version": "0.1.0",
+  "description": "A file-backed DAG orchestrator for coding agents: dependency graphs, per-task planning and verification, git-worktree isolation, retries and repair, live viewer. No daemon, no database.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "dag": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "viewer",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/vendor-viewer.mjs",
+    "test": "npm run build && node --test dist/**/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dag": "tsx src/cli.ts"
+  },
+  "keywords": [
+    "dag",
+    "orchestrator",
+    "agents",
+    "opencode",
+    "automation",
+    "worktree"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "vis-network": "^10.1.2"
+  }
+}

@@ -1,0 +1,4 @@
+# Keep source LF everywhere so Windows and macOS checkouts stay identical.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

@@ -1,0 +1,1366 @@
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { createWriteStream, existsSync, mkdirSync, statSync, writeFileSync, type WriteStream } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { resolveCommand } from './command-resolution.js';
+import {
+  commitAll,
+  createTaskWorktree,
+  ensureIntegrationWorktree,
+  isDirty,
+  isGitRepo,
+  mergeIntoIntegration,
+  removeWorktree,
+} from './git-worktree.js';
+import { depsMet, describeDeps, gateBlocks, isTerminal, topoSort } from './graph.js';
+import {
+  acquireLock,
+  attemptLogPath,
+  heartbeatPath,
+  lockHeldBy,
+  logEvent,
+  recoverInterrupted,
+  runPaths,
+  skipBlocked,
+  skipGated,
+  type RecoveryResult,
+} from './store.js';
+import {
+  ATTEMPT_LOG_CAP_DEFAULT,
+  DEFAULT_SETTINGS,
+  OUTPUT_TAIL_LIMIT,
+  PLAN_LIMIT,
+  RESULT_LIMIT,
+  type DagEvent,
+  type DepFailurePolicy,
+  type FailureKind,
+  type GatePolicy,
+  type Run,
+  type Task,
+} from './types.js';
+
+// In-process ownership: the lock's pid check treats "same pid" as re-entrant,
+// which is right for a CLI wrapper reusing its own lock but wrong for a second
+// runner in the same process. This set closes that gap.
+const ownedFiles = new Set<string>();
+
+const refuseMessage = (file: string): string =>
+  `run file is locked (${file}) — a run is in progress. ` +
+  'Parallel workers live inside a run: raise --concurrency (up to 64). ' +
+  'Independent graphs need their own run file (dag launch --all).';
+
+export interface ExecContext {
+  onOutput: (chunk: string) => void;
+  registerKill: (fn: () => void) => void;
+  aborted: () => boolean;
+  setPid: (pid: number | null) => void;
+  // Per-task working directory (worktree isolation); falls back to the
+  // executor's default when undefined.
+  cwd?: string;
+  // Path to the current attempt's plan file, for the `{planFile}` token.
+  planFile?: string;
+  // Upstream evidence, for `{deps}` / `{depsAll}` / `{depsFile}`.
+  deps?: string;
+  depsAll?: string;
+  depsFile?: string;
+}
+
+export interface ExecOutcome {
+  output: string;
+  exitCode: number | null;
+}
+
+// `cmdOverride` lets the runner reuse the executor for reviewer commands.
+export type Executor = (task: Task, ctx: ExecContext, cmdOverride?: string) => Promise<ExecOutcome>;
+
+export const sleep = (ms: number): Promise<void> =>
+  new Promise((r) => setTimeout(r, ms));
+
+export const nowIso = (): string => new Date().toISOString();
+
+export function truncate(s: string, n: number): string {
+  return s.length <= n ? s : `${s.slice(0, n)}\n… [truncated ${s.length - n} chars]`;
+}
+
+// Verdicts and summaries live at the END of an agent's output; keeping the
+// head meant losing the very line that decides pass/fail.
+export function truncateTail(s: string, n: number): string {
+  return s.length <= n ? s : `… [truncated ${s.length - n} chars]\n${s.slice(-n)}`;
+}
+
+// A reviewer's verdict must be machine-readable, because a harness exits 0
+// after a successful session no matter what it concluded. Accepted forms:
+//   VERDICT: PASS
+//   VERDICT: FAIL: <reason>
+export function parseVerdict(output: string): { kind: 'pass' | 'fail' | 'none'; reason: string } {
+  const matches = [...output.matchAll(/^[^\S\n]*VERDICT[^\S\n]*:[^\S\n]*(PASS|FAIL)\b[^\S\n]*:?[^\S\n]*(.*)$/gim)];
+  const last = matches[matches.length - 1];
+  if (!last) return { kind: 'none', reason: '' };
+  const kind = last[1].toUpperCase() === 'PASS' ? 'pass' : 'fail';
+  return { kind, reason: (last[2] ?? '').trim() };
+}
+
+// Captured phase output is fed back into later prompts, so terminal chrome
+// (ANSI colors, cursor moves) must not travel with it.
+export function stripAnsi(s: string): string {
+  return s
+    .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+    .replace(/\x1b\][^\x07]*\x07/g, '')
+    .replace(/\r/g, '');
+}
+
+// Kill the whole process tree. Windows: child.kill() only terminates the
+// direct child, so npm.cmd -> node would survive. taskkill /T /F does not.
+export function killTree(child: ChildProcess): void {
+  if (child.pid) {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
+      return;
+    }
+    try {
+      process.kill(-child.pid, 'SIGKILL'); // detached => own process group
+      return;
+    } catch {
+      // fall through to direct kill
+    }
+  }
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    // already gone
+  }
+}
+
+export function shellSplit(cmd: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let quoted = false;
+  let escaped = false;
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (escaped) {
+      cur += c;
+      escaped = false;
+      continue;
+    }
+    // Only `\"` and `\\` are escapes; a lone backslash is a path separator.
+    if (c === '\\' && quoted && (cmd[i + 1] === '"' || cmd[i + 1] === '\\')) {
+      escaped = true;
+      continue;
+    }
+    if (c === '"') {
+      quoted = !quoted;
+      continue;
+    }
+    if (!quoted && /\s/.test(c)) {
+      if (cur) {
+        out.push(cur);
+        cur = '';
+      }
+      continue;
+    }
+    cur += c;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+// Task fields can be injected into a command without any shell quoting:
+// `opencode run --auto {spec}` becomes argv ['opencode','run','--auto','<the spec>'].
+// `{plan}` is the planning phase's output; `{planFile}` is a file holding it.
+// Model and reasoning effort are settings, not text: a command writes
+// `-m {model} --variant {variant}` and the effective values come from the
+// task, falling back to the run. When a value is empty the flag is removed
+// rather than left dangling (an empty argv element would eat the next token).
+export function resolveHarness(
+  cmd: string,
+  task: Pick<Task, 'model' | 'variant'>,
+  settings: { model?: string; variant?: string },
+): string {
+  const model = (task.model ?? settings.model ?? '').trim();
+  const variant = (task.variant ?? settings.variant ?? '').trim();
+  let out = cmd;
+  out = model
+    ? out.replace(/\{model\}/g, model)
+    : out.replace(/(?:-m|--model)\s+\{model\}\s?/g, '');
+  out = variant
+    ? out.replace(/\{variant\}/g, variant)
+    : out.replace(/--variant\s+\{variant\}\s?/g, '');
+  return out;
+}
+
+export function renderTokens(token: string, task: Task, ctx?: ExecContext): string {
+  if (!token.includes('{')) return token;
+  const rendered = token
+    .replace(/\{id\}/g, task.id)
+    .replace(/\{title\}/g, task.title)
+    .replace(/\{spec\}/g, task.spec ?? '')
+    .replace(/\{plan\}/g, task.plan ?? '(no plan)')
+    .replace(/\{planFile\}/g, ctx?.planFile ?? '')
+    .replace(/\{deps\}/g, ctx?.deps ?? '(no dependencies)')
+    .replace(/\{depsAll\}/g, ctx?.depsAll ?? '(no upstream tasks)')
+    .replace(/\{depsFile\}/g, ctx?.depsFile ?? '');
+  // A substituted value that starts with "-" would be read as a CLI flag by
+  // the spawned program (yargs/commander print usage and exit 1). A leading
+  // newline keeps it a positional without changing what the agent reads.
+  if (rendered.startsWith('-') && !token.startsWith('-')) return `\n${rendered}`;
+  return rendered;
+}
+
+// Spawn without a shell: no quoting/injection surprises. Streams output so
+// the runner can treat stdout/stderr activity as a heartbeat.
+// `cwd` matters: without it an agent started from the viewer would work in
+// whatever directory the server happened to be launched from.
+export function shellExecutor(cwd?: string): Executor {
+  return (task, ctx, cmdOverride) =>
+    new Promise((resolve, reject) => {
+      const command = cmdOverride ?? task.cmd;
+      if (!command) {
+        reject(Object.assign(new Error('no cmd'), { kind: 'manual' as FailureKind }));
+        return;
+      }
+      const [file, ...args] = shellSplit(command).map((token) => renderTokens(token, task, ctx));
+      const resolved = resolveCommand(file);
+      let child: ChildProcess;
+      try {
+        child = spawn(resolved.file, [...resolved.args, ...args], {
+          windowsHide: true,
+          detached: process.platform !== 'win32',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          cwd: ctx.cwd ?? cwd,
+        });
+      } catch (err) {
+        reject(Object.assign(err as Error, { kind: 'spawn' as FailureKind }));
+        return;
+      }
+      ctx.setPid(child.pid ?? null);
+      ctx.registerKill(() => killTree(child));
+      let output = '';
+      const onData = (buf: Buffer): void => {
+        const chunk = buf.toString();
+        output = truncate(output + chunk, 64 * 1024);
+        ctx.onOutput(chunk);
+      };
+      child.stdout?.on('data', onData);
+      child.stderr?.on('data', onData);
+      child.on('error', (err) => {
+        ctx.setPid(null);
+        reject(Object.assign(err, { kind: 'spawn' as FailureKind }));
+      });
+      child.on('close', (code, signal) => {
+        ctx.setPid(null);
+        if (ctx.aborted()) {
+          reject(Object.assign(new Error('aborted'), { kind: 'killed' as FailureKind }));
+          return;
+        }
+        if (code !== 0) {
+          // Include the output tail: "exit 1" alone hides why (bad flags,
+          // auth failures, usage text) and costs a debugging round-trip.
+          const tail = output.trim();
+          reject(
+            Object.assign(
+              new Error(`exit ${code ?? signal ?? 'unknown'}${tail ? `\n${truncate(tail, 600)}` : ''}`),
+              {
+                kind: 'exit' as FailureKind,
+                exitCode: code,
+              },
+            ),
+          );
+          return;
+        }
+        resolve({ output, exitCode: code });
+      });
+    });
+}
+
+export interface RunnerOptions {
+  executor?: Executor;
+  persist?: (run: Run) => void;
+  onEvent?: (ev: DagEvent) => void;
+  concurrency?: number;
+  timeoutMs?: number;
+  silenceMs?: number;
+  maxAttempts?: number;
+  onDepFailure?: DepFailurePolicy;
+  onGateBlocked?: GatePolicy;
+  maxWallClockMs?: number;
+  logCapBytes?: number;
+  stopGraceMs?: number;
+  persistThrottleMs?: number;
+  // Run file path; enables per-attempt log files and sets the default cwd.
+  file?: string;
+  // Working directory for spawned commands. Defaults to the run file's dir.
+  cwd?: string;
+}
+
+export interface RunSummary {
+  scope: string[];
+  completed: string[];
+  failed: string[];
+  skipped: string[];
+  unfinished: string[];
+  stopped: boolean;
+  budgetReached: boolean;
+  interrupted: RecoveryResult;
+}
+
+interface AttemptLog {
+  stream: WriteStream;
+  written: number;
+  capped: boolean;
+}
+
+export class DagRunner {
+  private inFlight = new Set<string>();
+  private kills = new Map<string, () => void>();
+  private reasons = new Map<string, FailureKind>();
+  private tokens = new Map<string, number>();
+  private logs = new Map<string, AttemptLog>();
+  private attemptByTask = new Map<string, number>();
+  private stopping = false;
+  private active = false;
+  private dirty = false;
+  private flushTimer: NodeJS.Timeout | null = null;
+  private loopPromise: Promise<void> | null = null;
+  private summary: RunSummary | null = null;
+  // Rejected by stop() to release tasks whose executor ignores the kill.
+  private stopGate: Promise<never> = new Promise<never>(() => {});
+  private rejectStopGate: ((err: Error) => void) | null = null;
+  private budgetReached = false;
+  private recovery: RecoveryResult = { requeued: [], orphanPids: [] };
+  private releaseLock: (() => void) | null = null;
+  private worktrees = new Map<string, string>();
+  private integration: { path: string; branch: string } | null = null;
+  private repoDir: string | null = null;
+  private landChain: Promise<void> = Promise.resolve();
+
+  constructor(
+    readonly state: Run,
+    private readonly opts: RunnerOptions = {},
+  ) {}
+
+  get isRunning(): boolean {
+    return this.active;
+  }
+
+  get isStopping(): boolean {
+    return this.stopping;
+  }
+
+  get current(): string[] {
+    return [...this.inFlight];
+  }
+
+  get result(): RunSummary | null {
+    return this.summary;
+  }
+
+  // Resolves when the run settles or stops. Never rejects.
+  async start(scope: Set<string> | null = null): Promise<void> {
+    if (this.active) return this.loopPromise ?? Promise.resolve();
+
+    // One runner owns the file. If the caller (CLI, server) already holds the
+    // lock we reuse it; otherwise take it here so programmatic use is safe too.
+    if (this.opts.file) {
+      const file = this.opts.file;
+      let refusal: string | null = null;
+      if (ownedFiles.has(file)) {
+        refusal = refuseMessage(file);
+      } else if (!lockHeldBy(file)) {
+        try {
+          this.releaseLock = acquireLock(file, 'runner');
+        } catch (err) {
+          refusal = err instanceof Error ? err.message : String(err);
+        }
+      }
+      if (refusal) {
+        this.log('note', null, `not starting: ${refusal}`);
+        this.summary = {
+          scope: [],
+          completed: [],
+          failed: [],
+          skipped: [],
+          unfinished: [],
+          stopped: true,
+          budgetReached: false,
+          interrupted: { requeued: [], orphanPids: [] },
+        };
+        this.flush();
+        return Promise.resolve();
+      }
+      ownedFiles.add(file);
+    }
+
+    this.active = true;
+    this.stopping = false;
+    this.budgetReached = false;
+    this.summary = null;
+    this.inFlight.clear();
+    this.kills.clear();
+    this.reasons.clear();
+    this.tokens.clear();
+    this.stopGate = new Promise<never>((_, reject) => {
+      this.rejectStopGate = reject;
+    });
+    // Marked handled now: stop() may reject it with no racer attached.
+    this.stopGate.catch(() => undefined);
+
+    this.recovery = recoverInterrupted(this.state);
+    this.log('run-start', null, scope ? `run started for ${scope.size} task(s)` : 'run started (all tasks)');
+    if (this.recovery.requeued.length > 0) {
+      this.log(
+        'note',
+        null,
+        `recovered ${this.recovery.requeued.length} interrupted task(s): ${this.recovery.requeued.join(', ')}`,
+      );
+    }
+    if (this.recovery.orphanPids.length > 0) {
+      this.log(
+        'note',
+        null,
+        `possible orphan process(es) from before the restart: ${this.recovery.orphanPids.join(', ')} (run 'dag kill-orphans' to clean up)`,
+      );
+    }
+    try {
+      await this.setupIsolation();
+    } catch (err) {
+      // Isolation was explicitly requested: refuse to run without it rather
+      // than letting agents loose in the real working tree.
+      const message = err instanceof Error ? err.message : String(err);
+      this.log('note', null, `not starting: ${message}`);
+      this.summary = {
+        scope: [],
+        completed: [],
+        failed: [],
+        skipped: [],
+        unfinished: [],
+        stopped: true,
+        budgetReached: false,
+        interrupted: { requeued: [], orphanPids: [] },
+      };
+      this.flush();
+      this.releaseLock?.();
+      this.releaseLock = null;
+      if (this.opts.file) ownedFiles.delete(this.opts.file);
+      return;
+    }
+    this.flush();
+
+    this.loopPromise = this.loop(scope)
+      .catch((err) => {
+        this.log('note', null, `runner crashed: ${err instanceof Error ? err.message : String(err)}`);
+      })
+      .finally(() => {
+        this.active = false;
+        this.stopping = false;
+        this.flush();
+        this.closeAllLogs();
+        for (const taskId of [...this.worktrees.keys()]) this.dropWorktree(taskId);
+        this.releaseLock?.();
+        this.releaseLock = null;
+        if (this.opts.file) ownedFiles.delete(this.opts.file);
+      });
+    return this.loopPromise;
+  }
+
+  // Kills the whole tree, waits a bounded grace period, then force-settles
+  // anything still "running" so the loop cannot hang.
+  async stop(): Promise<void> {
+    if (!this.active || this.stopping) {
+      await (this.loopPromise ?? Promise.resolve());
+      return;
+    }
+    this.stopping = true;
+    this.log('run-stop', null, 'stop requested; killing running tasks');
+    this.flush();
+    for (const id of [...this.inFlight]) this.killTask(id, 'killed');
+
+    const grace = this.opts.stopGraceMs ?? 5000;
+    const deadline = Date.now() + grace;
+    while (this.inFlight.size > 0 && Date.now() < deadline) await sleep(50);
+
+    // Force-settle stragglers: bumping the token makes late settlements no-ops.
+    for (const id of [...this.inFlight]) {
+      const task = this.state.tasks[id];
+      if (task && task.status === 'running') {
+        task.status = 'pending';
+        task.result = 'stopped by user';
+        task.failureKind = 'killed';
+        task.finishedAt = nowIso();
+        task.pid = null;
+        this.log('task-killed', id, 'force-stopped; requeued as pending');
+      }
+      // Preserve anything the agent had written before the kill.
+      this.salvageWorktree(id, 'stopped');
+      this.tokens.set(id, (this.tokens.get(id) ?? 0) + 1);
+      this.inFlight.delete(id);
+      this.kills.delete(id);
+      this.reasons.delete(id);
+      this.closeLog(id);
+      this.dropWorktree(id);
+    }
+    // Release any executor still parked on a promise it never settles.
+    this.rejectStopGate?.(Object.assign(new Error('stopped by user'), { kind: 'killed' as FailureKind }));
+    this.rejectStopGate = null;
+    await (this.loopPromise ?? Promise.resolve());
+    this.log('note', null, 'run stopped');
+    this.flush();
+  }
+
+  private killTask(id: string, reason: FailureKind): void {
+    this.reasons.set(id, reason);
+    const kill = this.kills.get(id);
+    if (kill) {
+      try {
+        kill();
+      } catch {
+        // already dead
+      }
+    }
+  }
+
+  private log(type: DagEvent['type'], taskId: string | null, message: string): void {
+    const ev = logEvent(this.state, type, taskId, message);
+    this.opts.onEvent?.(ev);
+  }
+
+  // Coalesced persist: bursts of transitions cost one write per window.
+  private persist(): void {
+    this.dirty = true;
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      if (this.dirty) this.flush();
+    }, this.opts.persistThrottleMs ?? 200);
+  }
+
+  private flush(): void {
+    this.dirty = false;
+    this.state.updatedAt = nowIso();
+    this.opts.persist?.(this.state);
+  }
+
+  private async backoff(ms: number): Promise<void> {
+    await Promise.race([sleep(ms), this.stopGate.catch(() => undefined)]);
+  }
+
+  private appendLog(taskId: string, chunk: string): void {
+    const file = this.opts.file;
+    if (!file) return;
+    const attempt = this.attemptByTask.get(taskId) ?? 1;
+    let entry = this.logs.get(taskId);
+    if (!entry) {
+      try {
+        mkdirSync(runPaths(file).logs, { recursive: true });
+        entry = {
+          stream: createWriteStream(attemptLogPath(file, taskId, attempt), { flags: 'a' }),
+          written: 0,
+          capped: false,
+        };
+        entry.stream.on('error', () => {
+          // logging must never break a run
+        });
+        this.logs.set(taskId, entry);
+      } catch {
+        return;
+      }
+    }
+    if (!entry) return;
+    const cap = this.opts.logCapBytes ?? this.state.settings.logCapBytes ?? ATTEMPT_LOG_CAP_DEFAULT;
+    if (entry.written >= cap) {
+      if (!entry.capped) {
+        entry.capped = true;
+        entry.stream.write(`\n… [log capped at ${cap} bytes; full output is in the task result]\n`);
+      }
+      return;
+    }
+    entry.written += Buffer.byteLength(chunk);
+    entry.stream.write(chunk);
+  }
+
+  private closeLog(taskId: string): void {
+    const entry = this.logs.get(taskId);
+    if (!entry) return;
+    this.logs.delete(taskId);
+    try {
+      entry.stream.end();
+    } catch {
+      // best effort
+    }
+  }
+
+  private closeAllLogs(): void {
+    for (const id of [...this.logs.keys()]) this.closeLog(id);
+  }
+
+  private policySkip(scope: Set<string> | null): number {
+    const run = this.state;
+    const dep = this.opts.onDepFailure ?? run.settings.onDepFailure ?? 'block';
+    const gate = this.opts.onGateBlocked ?? run.settings.onGateBlocked ?? 'wait';
+    // Scope-restricted: a scoped run must not skip tasks outside its scope.
+    const only = scope ?? undefined;
+    let skipped = 0;
+    if (dep === 'skip') skipped += skipBlocked(run, 'dependency failed', only).length;
+    if (gate === 'skip') skipped += skipGated(run, only).length;
+    return skipped;
+  }
+
+  private async loop(scope: Set<string> | null): Promise<void> {
+    const run = this.state;
+    // Agents run in the run file's directory unless the caller overrides it,
+    // so a viewer-started run still works in the right project.
+    const cwd = this.opts.cwd ?? (this.opts.file ? dirname(this.opts.file) : undefined);
+    const execute = this.opts.executor ?? shellExecutor(cwd);
+    const concurrency = Math.max(
+      1,
+      this.opts.concurrency ?? run.settings.concurrency ?? DEFAULT_SETTINGS.concurrency,
+    );
+    const budgetMs =
+      this.opts.maxWallClockMs ?? run.settings.maxWallClockMs ?? DEFAULT_SETTINGS.maxWallClockMs;
+    const deadline = budgetMs > 0 ? Date.now() + budgetMs : 0;
+
+    while (true) {
+      if (deadline > 0 && Date.now() > deadline) {
+        this.budgetReached = true;
+        this.log('note', null, 'wall clock budget reached; not launching more tasks');
+        break;
+      }
+      if (this.stopping && this.inFlight.size === 0) break;
+
+      // Apply failure policy before deciding what to launch; skipping may
+      // unlock convergence for this iteration or a later one.
+      if (!this.stopping && this.policySkip(scope) > 0) {
+        this.persist();
+        continue;
+      }
+
+      const batch: Task[] = [];
+      if (!this.stopping) {
+        for (const task of topoSort(run)) {
+          if (batch.length + this.inFlight.size >= concurrency) break;
+          if (scope !== null && !scope.has(task.id)) continue;
+          if (task.status !== 'pending' && task.status !== 'ready') continue;
+          if (this.inFlight.has(task.id)) continue;
+          if (gateBlocks(task) || !depsMet(task, run.tasks)) continue;
+          if (task.deps.some((d) => {
+            const dep = run.tasks[d];
+            return !dep || dep.status === 'failed' || dep.status === 'skipped';
+          })) {
+            continue;
+          }
+          batch.push(task);
+        }
+      }
+
+      if (batch.length === 0) {
+        if (this.inFlight.size === 0) break;
+        await sleep(50);
+        continue;
+      }
+      await Promise.all(batch.map((task) => this.executeTask(task, execute, scope)));
+    }
+
+    const scoped =
+      scope === null
+        ? Object.keys(run.tasks).filter((id) => run.tasks[id])
+        : [...scope].filter((id) => run.tasks[id]);
+    const completed = scoped.filter((id) => run.tasks[id].status === 'completed');
+    const failed = scoped.filter((id) => run.tasks[id].status === 'failed');
+    const skipped = scoped.filter((id) => run.tasks[id].status === 'skipped');
+    const unfinished = scoped.filter((id) => !isTerminal(run.tasks[id].status));
+    this.summary = {
+      scope: scoped,
+      completed,
+      failed,
+      skipped,
+      unfinished,
+      stopped: this.stopping,
+      budgetReached: this.budgetReached,
+      interrupted: this.recovery,
+    };
+    const parts = [`${completed.length} completed`];
+    if (failed.length > 0) parts.push(`${failed.length} failed`);
+    if (skipped.length > 0) parts.push(`${skipped.length} skipped`);
+    if (unfinished.length > 0) parts.push(`${unfinished.length} unfinished`);
+    const line = `settled: ${parts.join(', ')}`;
+    this.log('run-end', null, line);
+    // Always notify on run end: an unattended run finishing cleanly is the
+    // signal the operator is waiting for.
+    this.notify(this.stopping ? 'run-stop' : 'run-end', null, line);
+  }
+
+  // Workers that write files instead of streaming output can still prove
+  // liveness: `dag heartbeat --id X` touches a marker the watchdog stats.
+  private heartbeatMtime(taskId: string): number {
+    const file = this.opts.file;
+    if (!file) return 0;
+    try {
+      const path = heartbeatPath(file, taskId);
+      return existsSync(path) ? statSync(path).mtimeMs : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private notify(event: string, taskId: string | null, message: string): void {
+    const cmd = this.state.settings.notifyCmd;
+    if (!cmd) return;
+    this.log('notify', taskId, `${event}: ${truncate(message, 200)}`);
+    try {
+      const [file, ...args] = shellSplit(cmd);
+      const child = spawn(file, args, {
+        windowsHide: true,
+        detached: true,
+        stdio: 'ignore',
+        env: {
+          ...process.env,
+          DAG_EVENT: event,
+          DAG_TASK: taskId ?? '',
+          DAG_MESSAGE: message,
+          DAG_FILE: this.opts.file ?? '',
+          DAG_RUN: this.state.id,
+        },
+      });
+      // A broken notify command must never take the run down.
+      child.on('error', () => undefined);
+      child.unref();
+    } catch {
+      // notifications must never break a run
+    }
+  }
+
+  // Planning phase: produce the plan the work phase should follow. A plan
+  // command that fails fails the task (retryable) — proceeding unplanned
+  // defeats the point of configuring one.
+  private async plan(
+    task: Task,
+    execute: Executor,
+    worktreePath?: string,
+    planFile?: string,
+    depsContext?: { deps: string; depsAll: string; depsFile?: string },
+  ): Promise<'ok' | 'fail'> {
+    this.log('task-plan', task.id, 'planning phase starting');
+    this.appendLog(task.id, '\n--- plan ---\n');
+    let outcome: ExecOutcome;
+    try {
+      outcome = await this.runPhase(task, execute, task.planCmd, 'plan', worktreePath, planFile, depsContext);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      task.status = 'failed';
+      task.failureKind = 'plan';
+      task.result = `planning failed: ${truncate(message, RESULT_LIMIT)}`;
+      this.log('task-fail', task.id, `failed (plan): ${truncate(message, 200)}`);
+      return 'fail';
+    }
+    task.plan = truncate(stripAnsi(outcome.output).trim(), PLAN_LIMIT) || '(empty plan)';
+    this.log('task-plan', task.id, `plan ready (${task.plan.length} chars)`);
+    return 'ok';
+  }
+
+  private planFilePath(task: Task, attempt: number): string | undefined {
+    const file = this.opts.file;
+    if (!file) return undefined;
+    const dir = join(runPaths(file).dir, 'plans');
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {
+      return undefined;
+    }
+    return join(dir, `${task.id}.${attempt}.md`);
+  }
+
+  private depsFilePath(task: Task, attempt: number): string | undefined {
+    const file = this.opts.file;
+    if (!file) return undefined;
+    const dir = join(runPaths(file).dir, 'deps');
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {
+      return undefined;
+    }
+    return join(dir, `${task.id}.${attempt}.md`);
+  }
+
+  // One phase (main command or reviewer) with its own timeout/silence watchdog.
+  private async runPhase(
+    task: Task,
+    execute: Executor,
+    cmd: string | null,
+    label: 'run' | 'review' | 'plan',
+    worktreePath?: string,
+    planFile?: string,
+    depsContext?: { deps: string; depsAll: string; depsFile?: string },
+  ): Promise<ExecOutcome> {
+    const timeoutMs = task.timeoutMs ?? this.opts.timeoutMs ?? this.state.settings.timeoutMs;
+    const silenceMs = task.silenceMs ?? this.opts.silenceMs ?? this.state.settings.silenceMs;
+    let lastOutputMs = Date.now();
+    let warnCount = 0;
+    let reap: (err: Error) => void = () => {};
+    const reaper = new Promise<never>((_, reject) => {
+      reap = reject;
+    });
+
+    const hardTimer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            this.killTask(task.id, 'timeout');
+            reap(
+              Object.assign(new Error(`timeout after ${Math.round(timeoutMs / 1000)}s`), {
+                kind: 'timeout' as FailureKind,
+              }),
+            );
+          }, timeoutMs)
+        : null;
+
+    const watchTimer =
+      silenceMs > 0
+        ? setInterval(
+            () => {
+              if (task.status !== 'running') return;
+              const beat = this.heartbeatMtime(task.id);
+              if (beat > lastOutputMs) {
+                lastOutputMs = beat;
+                task.lastOutputAt = new Date(beat).toISOString();
+                return;
+              }
+              const elapsed = Date.now() - lastOutputMs;
+              const kill = (this.state.settings.silenceAction ?? 'warn') === 'kill';
+              const role = label === 'review' ? 'reviewer' : label === 'plan' ? 'planner' : 'worker';
+              const report = (): void => {
+                warnCount += 1;
+                const secs = Math.round(elapsed / 1000);
+                this.log(
+                  'task-stall-warning',
+                  task.id,
+                  `${role} quiet for ${secs}s` +
+                    (kill
+                      ? ` (killed at ${Math.round(silenceMs / 1000)}s unless it logs or heartbeats)`
+                      : ` (silenceAction=warn: not killing; timeout at ${Math.round(timeoutMs / 1000)}s)`) +
+                    (warnCount > 1 ? ` [warning ${warnCount}]` : ''),
+                );
+                this.notify('task-quiet', task.id, `${role} quiet for ${secs}s`);
+              };
+
+              // Past the full window: kill, or report again and keep waiting.
+              if (elapsed > silenceMs) {
+                if (!kill) {
+                  report();
+                  lastOutputMs = Date.now();
+                  return;
+                }
+                this.killTask(task.id, 'stalled');
+                reap(
+                  Object.assign(new Error(`no output for ${Math.round(silenceMs / 1000)}s`), {
+                    kind: 'stalled' as FailureKind,
+                  }),
+                );
+                return;
+              }
+              // Half the window: the first heads-up (heartbeats reset this).
+              if (elapsed > silenceMs / 2 && warnCount === 0) report();
+            },
+            Math.max(250, Math.min(silenceMs, 5000)),
+          )
+        : null;
+
+    const ctx: ExecContext = {
+      onOutput: (chunk) => {
+        lastOutputMs = Date.now();
+        task.lastOutputAt = nowIso();
+        const merged = (task.lastOutput ?? '') + chunk;
+        task.lastOutput =
+          merged.length > OUTPUT_TAIL_LIMIT ? merged.slice(-OUTPUT_TAIL_LIMIT) : merged;
+        this.appendLog(task.id, chunk);
+        this.persist();
+      },
+      registerKill: (fn) => this.kills.set(task.id, fn),
+      aborted: () => this.reasons.has(task.id),
+      setPid: (pid) => {
+        task.pid = pid;
+        this.persist();
+      },
+      cwd: worktreePath,
+      planFile,
+      deps: depsContext?.deps,
+      depsAll: depsContext?.depsAll,
+      depsFile: depsContext?.depsFile,
+    };
+
+    try {
+      const resolved = cmd === null ? null : resolveHarness(cmd, task, this.state.settings);
+      const execPromise = execute(task, ctx, resolved ?? undefined);
+      execPromise.catch(() => {
+        // losing branch of the race; the winner reports it
+      });
+      const outcome = await Promise.race([execPromise, reaper, this.stopGate]);
+      const killReason = this.reasons.get(task.id);
+      if (killReason) {
+        throw Object.assign(new Error(`killed: ${killReason}`), { kind: killReason });
+      }
+      return outcome;
+    } finally {
+      if (hardTimer) clearTimeout(hardTimer);
+      if (watchTimer) clearInterval(watchTimer);
+      this.kills.delete(task.id);
+      this.reasons.delete(task.id);
+    }
+  }
+
+  // Reviewer loop: a reviewer that exits non-zero rejects the work, which is
+  // redone up to reviewRounds times. A reviewer that dies (timeout/stall/
+  // spawn) fails the task outright — that is infrastructure, not a verdict.
+  private async review(
+    task: Task,
+    execute: Executor,
+    scope: Set<string> | null,
+    worktreePath?: string,
+    planFile?: string,
+    depsContext?: { deps: string; depsAll: string; depsFile?: string },
+  ): Promise<'pass' | 'requeue' | 'fail'> {
+    const round = task.reviews + 1;
+    const total = task.reviewRounds + 1;
+    this.log('task-review', task.id, `review ${round}/${total} starting`);
+    this.appendLog(task.id, `\n--- review ${round}/${total} ---\n`);
+    try {
+      const outcome = await this.runPhase(task, execute, task.reviewCmd, 'review', worktreePath, planFile, depsContext);
+      task.reviewExitCode = outcome.exitCode;
+      const cleaned = stripAnsi(outcome.output).trim();
+      task.reviewResult = truncateTail(cleaned, RESULT_LIMIT) || '(review produced no output)';
+      const mode = this.state.settings.reviewVerdict ?? 'marker';
+      const verdict = parseVerdict(cleaned);
+      if (mode === 'exit-code' || verdict.kind === 'pass') {
+        this.log('task-review', task.id, `review ${round}/${total} passed${verdict.kind === 'pass' ? ' (VERDICT: PASS)' : ''}`);
+        return 'pass';
+      }
+      if (verdict.kind === 'fail') {
+        task.reviewExitCode = 1;
+        this.log('task-review', task.id, `reviewer returned VERDICT: FAIL — ${truncate(verdict.reason || '(no reason given)', 200)}`);
+        return this.handleRejection(task, verdict.reason || 'reviewer failed the work', scope);
+      }
+      // Fail closed: an unreadable review must never count as approval.
+      task.reviewExitCode = 1;
+      this.log(
+        'task-review',
+        task.id,
+        'reviewer produced no VERDICT line (expected "VERDICT: PASS" or "VERDICT: FAIL: reason"); treating as not reviewed',
+      );
+      return this.handleRejection(task, 'reviewer produced no machine-readable verdict', scope);
+    } catch (err) {
+      const reason: FailureKind =
+        this.reasons.get(task.id) ?? (err as { kind?: FailureKind }).kind ?? 'exit';
+      const message = err instanceof Error ? err.message : String(err);
+      // A stop is not a verdict: requeue without spending a review round.
+      if (this.stopping) {
+        task.status = 'pending';
+        task.failureKind = 'killed';
+        task.result = 'stopped by user';
+        this.log('task-killed', task.id, 'stopped during review; requeued as pending');
+        return 'requeue';
+      }
+      if (reason === 'timeout' || reason === 'stalled' || reason === 'spawn') {
+        task.status = 'failed';
+        task.failureKind = reason;
+        task.result = truncate(message, RESULT_LIMIT);
+        task.reviewResult = truncate(message, RESULT_LIMIT);
+        const type =
+          reason === 'timeout' ? 'task-timeout' : reason === 'stalled' ? 'task-stalled' : 'task-fail';
+        this.log(type, task.id, `reviewer failed (${reason}): ${truncate(message, 200)}`);
+        if (!this.tryRepair(task, scope)) this.notify(type, task.id, `reviewer ${reason}: ${message}`);
+        return 'fail';
+      }
+      task.reviewExitCode = (err as { exitCode?: number | null }).exitCode ?? null;
+      task.reviewResult = truncate(message, RESULT_LIMIT);
+      return this.handleRejection(task, message, scope);
+    }
+  }
+
+  private handleRejection(task: Task, message: string, scope: Set<string> | null): 'requeue' | 'fail' {
+    task.reviews += 1;
+    if (task.reviews <= task.reviewRounds) {
+      this.log(
+        'task-review',
+        task.id,
+        `reviewer rejected the work (${task.reviews}/${task.reviewRounds + 1}): ${truncate(message, 200)} — redoing the task`,
+      );
+      task.status = 'pending';
+      task.failureKind = null;
+      task.result = null;
+      task.exitCode = null;
+      return 'requeue';
+    }
+    task.status = 'failed';
+    task.failureKind = 'review';
+    task.result = `review rejected after ${task.reviews} round(s): ${truncate(message, 500)}`;
+    // An integration node that says "this doesn't mesh" gets its upstream
+    // redone, bounded by repairRounds.
+    if (this.tryRepair(task, scope)) return 'requeue';
+    this.log('task-fail', task.id, `failed (review): reviewer rejected the work ${task.reviews} time(s)`);
+    this.notify('task-fail', task.id, `review rejected: ${truncate(message, 200)}`);
+    return 'fail';
+  }
+
+  // Repair only touches upstream tasks that the current run can actually
+  // relaunch: requeueing an out-of-scope dep would deadlock the scope.
+  private tryRepair(task: Task, scope: Set<string> | null = null): boolean {
+    if (task.repairRounds <= 0 || task.repairs >= task.repairRounds || task.deps.length === 0) {
+      return false;
+    }
+    const requeued: string[] = [];
+    for (const dep of task.deps) {
+      const upstream = this.state.tasks[dep];
+      if (!upstream) continue;
+      if (scope !== null && !scope.has(dep)) continue;
+      if (upstream.status === 'pending' || upstream.status === 'ready' || upstream.status === 'running') {
+        continue;
+      }
+      upstream.status = 'pending';
+      upstream.result = null;
+      upstream.failureKind = null;
+      upstream.exitCode = null;
+      upstream.startedAt = null;
+      upstream.finishedAt = null;
+      upstream.lastOutputAt = null;
+      upstream.lastOutput = null;
+      upstream.pid = null;
+      // Fresh review budget: the repair is what makes a redo possible.
+      upstream.reviews = 0;
+      upstream.reviewResult = null;
+      upstream.reviewExitCode = null;
+      requeued.push(upstream.id);
+    }
+    if (requeued.length === 0) return false;
+    task.repairs += 1;
+    task.status = 'pending';
+    task.failureKind = null;
+    task.result = null;
+    task.exitCode = null;
+    this.log(
+      'task-repair',
+      task.id,
+      `repair round ${task.repairs}/${task.repairRounds}: requeued upstream ${requeued.join(', ')}`,
+    );
+    return true;
+  }
+
+  // --- worktree isolation -------------------------------------------------
+
+  private async setupIsolation(): Promise<void> {
+    const setting = this.state.settings.worktree ?? 'none';
+    if (setting !== 'task') return;
+    const repoDir = this.opts.cwd ?? (this.opts.file ? dirname(this.opts.file) : process.cwd());
+    if (!isGitRepo(repoDir)) {
+      throw new Error(`worktree isolation requested but ${repoDir} is not a git repository`);
+    }
+    try {
+      const integration = ensureIntegrationWorktree(repoDir, this.state.id);
+      this.repoDir = repoDir;
+      this.integration = { path: integration.path, branch: integration.branch };
+      const dirty = isDirty(repoDir);
+      this.log(
+        'note',
+        null,
+        `worktree isolation on: integration branch ${integration.branch}` +
+          `${dirty ? ' (based on a snapshot of the current working tree)' : ''}` +
+          ` at ${integration.path}`,
+      );
+    } catch (err) {
+      // Isolation was explicitly requested: never silently run in place.
+      throw new Error(
+        `worktree isolation could not be established: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Returns the worktree path, or null when isolation is off. Throws when
+  // isolation is on but the worktree cannot be created: running the agent in
+  // the real working tree instead would be the one outcome isolation exists
+  // to prevent.
+  private makeTaskWorktree(task: Task): string | null {
+    if (!this.repoDir || !this.integration) return null;
+    const { path, branch } = createTaskWorktree(
+      this.repoDir,
+      this.state.id,
+      task.id,
+      this.integration.branch,
+    );
+    this.worktrees.set(task.id, path);
+    task.branch = branch;
+    task.commit = null;
+    return path;
+  }
+
+  // Commit the task's work and fold it into the integration branch. A
+  // conflict is a retryable failure: the task is redone on the new base.
+  // Merges are serialized: the integration worktree has one writer.
+  private landWorktree(task: Task): Promise<{ ok: boolean; conflict?: string }> {
+    const run = (): { ok: boolean; conflict?: string } => {
+      const path = this.worktrees.get(task.id);
+      if (!path || !this.integration) return { ok: true };
+      try {
+        const committed = commitAll(path, `dag: ${task.id} ${task.title}`);
+        if (committed.commit) {
+          task.commit = committed.commit;
+          this.log('note', task.id, `committed ${committed.files} file(s) as ${committed.commit.slice(0, 8)}`);
+        }
+        const merge = mergeIntoIntegration(this.integration.path, task.branch ?? '', task.id);
+        if (!merge.merged) {
+          this.log(
+            'note',
+            task.id,
+            merge.conflict
+              ? 'merge conflict with the integration branch; will redo on the merged base'
+              : `merge failed: ${merge.detail}`,
+          );
+          return { ok: false, conflict: merge.detail };
+        }
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, conflict: err instanceof Error ? err.message : String(err) };
+      } finally {
+        this.dropWorktree(task.id);
+      }
+    };
+    const next = this.landChain.then(run, run);
+    this.landChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  // A failed or stopped task may hold real work in its worktree. Commit it to
+  // the task branch (never merged) so it can be inspected or cherry-picked
+  // instead of being deleted with the worktree.
+  private salvageWorktree(taskId: string, why: string): void {
+    const path = this.worktrees.get(taskId);
+    if (!path) return;
+    const task = this.state.tasks[taskId];
+    try {
+      const saved = commitAll(path, `dag: WIP ${taskId} ${task?.title ?? ''} (${why})`);
+      if (saved.commit && task) {
+        task.commit = saved.commit;
+        this.log(
+          'note',
+          taskId,
+          `partial work salvaged to ${task.branch} @ ${saved.commit.slice(0, 8)} (${saved.files} file(s), not merged)`,
+        );
+      }
+    } catch {
+      // best effort: the worktree is still dropped afterwards
+    }
+  }
+
+  private dropWorktree(taskId: string): void {
+    const path = this.worktrees.get(taskId);
+    if (!path || !this.repoDir) return;
+    this.worktrees.delete(taskId);
+    try {
+      removeWorktree(this.repoDir, path);
+    } catch {
+      // best effort; git worktree prune runs inside removeWorktree
+    }
+  }
+
+  private async executeTask(
+    task: Task,
+    execute: Executor,
+    scope: Set<string> | null,
+  ): Promise<void> {
+    if (this.stopping) return;
+
+    const token = (this.tokens.get(task.id) ?? 0) + 1;
+    this.tokens.set(task.id, token);
+    this.inFlight.add(task.id);
+
+    const attempt = task.attempts + 1;
+    task.attempts = attempt;
+    this.attemptByTask.set(task.id, attempt);
+    task.status = 'running';
+    task.startedAt = nowIso();
+    task.finishedAt = null;
+    task.exitCode = null;
+    task.failureKind = null;
+    task.result = null;
+    task.reviewResult = null;
+    task.reviewExitCode = null;
+    task.lastOutputAt = task.startedAt;
+    task.lastOutput = null;
+    task.pid = null;
+    // Header first: every attempt gets a log file even with no output.
+    this.appendLog(
+      task.id,
+      `# attempt ${attempt} started ${task.startedAt}\n# cmd: ${task.cmd ?? '(manual)'}${
+        task.reviewCmd ? `\n# review: ${task.reviewCmd}` : ''
+      }\n`,
+    );
+    this.log('task-start', task.id, `attempt ${attempt}/${task.maxAttempts}: ${task.title}`);
+    this.persist();
+
+    let worktreePath: string | null = null;
+    try {
+      worktreePath = this.makeTaskWorktree(task);
+    } catch (err) {
+      // Isolation is on: refuse to run the agent in the real working tree.
+      task.status = 'failed';
+      task.failureKind = 'worktree';
+      task.result = `worktree create failed: ${err instanceof Error ? err.message : String(err)}`;
+      this.log('task-fail', task.id, `failed (worktree): ${truncate(task.result, 200)}`);
+      this.notify('task-fail', task.id, 'worktree create failed');
+      this.dropWorktree(task.id);
+      this.inFlight.delete(task.id);
+      this.tokens.delete(task.id);
+      this.closeLog(task.id);
+      this.persist();
+      return;
+    }
+    if (worktreePath) {
+      this.log('note', task.id, `worktree ${task.branch} at ${worktreePath}`);
+    }
+    const planFile = task.planCmd ? this.planFilePath(task, attempt) : undefined;
+    // Upstream evidence for {deps} / {depsAll} / {depsFile}: deps are complete
+    // by the time a task runs, so this is the real graph state, not a promise.
+    const depsFile = task.deps.length > 0 ? this.depsFilePath(task, attempt) : undefined;
+    const depsContext = {
+      deps: describeDeps(this.state, task),
+      depsAll: describeDeps(this.state, task, { transitive: true }),
+      depsFile,
+    };
+    if (depsFile) {
+      try {
+        writeFileSync(
+          depsFile,
+          `# Upstream evidence for ${task.id} "${task.title}"\n\n` +
+            `## Direct dependencies\n${depsContext.deps}\n\n` +
+            `## All upstream tasks\n${depsContext.depsAll}\n`,
+          'utf8',
+        );
+      } catch {
+        // the inline tokens still carry the evidence
+      }
+    }
+
+    try {
+      // Planning phase first: the work command follows {plan} / {planFile}.
+      if (task.planCmd) {
+        const planned = await this.plan(task, execute, worktreePath ?? undefined, planFile);
+        if (this.tokens.get(task.id) !== token) return;
+        if (planned !== 'ok') {
+          this.dropWorktree(task.id);
+          this.persist();
+          return;
+        }
+        if (planFile && task.plan) {
+          try {
+            writeFileSync(planFile, task.plan, 'utf8');
+          } catch {
+            // the plan is also in the event log and the task record
+          }
+        }
+      }
+
+      const outcome = await this.runPhase(task, execute, task.cmd, 'run', worktreePath ?? undefined, planFile, depsContext);
+      if (this.tokens.get(task.id) !== token) return;
+
+      if (task.reviewCmd) {
+        const verdict = await this.review(task, execute, scope, worktreePath ?? undefined, planFile, depsContext);
+        if (this.tokens.get(task.id) !== token) return;
+        if (verdict !== 'pass') {
+          this.dropWorktree(task.id);
+          this.persist();
+          return;
+        }
+      }
+
+      // Worktree mode: land the work before declaring success.
+      if (worktreePath) {
+        const landed = await this.landWorktree(task);
+        if (!landed.ok) {
+          const budget = this.state.settings.mergeRounds ?? 2;
+          if (task.mergeRetries < budget) {
+            task.mergeRetries += 1;
+            task.status = 'pending';
+            task.failureKind = null;
+            task.result = `merge conflict with the integration base; redoing on top of it (${task.mergeRetries}/${budget})`;
+            this.log(
+              'task-retry',
+              task.id,
+              `merge conflict; redoing on the merged base (${task.mergeRetries}/${budget})`,
+            );
+          } else {
+            task.status = 'failed';
+            task.failureKind = 'merge';
+            task.result = `merge conflict after ${task.mergeRetries} redo(s): ${landed.conflict ?? ''}`;
+            this.log('task-fail', task.id, `failed (merge): ${truncate(landed.conflict ?? '', 200)}`);
+            if (!this.tryRepair(task, scope)) this.notify('task-fail', task.id, 'merge conflict');
+          }
+          return;
+        }
+      }
+
+      task.status = 'completed';
+      task.exitCode = outcome.exitCode;
+      task.result = truncateTail(stripAnsi(outcome.output).trim(), RESULT_LIMIT) || '(ok, no output)';
+      task.finishedAt = nowIso();
+      task.lastOutput = null;
+      task.pid = null;
+      this.log(
+        'task-done',
+        task.id,
+        `completed${outcome.exitCode !== null ? ` (exit ${outcome.exitCode})` : ''}${
+          task.reviewCmd ? ' — review passed' : ''
+        }`,
+      );
+    } catch (err) {
+      if (this.tokens.get(task.id) !== token) return;
+      // The worktree may hold real work: save it before the worktree goes.
+      this.salvageWorktree(task.id, this.stopping ? 'stopped' : 'failed');
+      const reason: FailureKind =
+        this.reasons.get(task.id) ?? (err as { kind?: FailureKind }).kind ?? 'exit';
+      const message = err instanceof Error ? err.message : String(err);
+      const exitCode = (err as { exitCode?: number | null }).exitCode ?? null;
+      task.finishedAt = nowIso();
+      task.result = truncate(message, RESULT_LIMIT);
+      task.pid = null;
+      if (reason === 'exit') task.exitCode = exitCode;
+
+      // Everything except a deliberate stop or a missing command is
+      // retryable while attempts remain. Stall and timeout included.
+      const retryable = reason !== 'manual' && task.attempts < task.maxAttempts;
+      if (this.stopping) {
+        task.status = 'pending';
+        task.failureKind = 'killed';
+        task.result = 'stopped by user';
+        this.log('task-killed', task.id, 'stopped; requeued as pending');
+      } else if (retryable) {
+        task.status = 'pending';
+        task.failureKind = null;
+        task.result = null;
+        task.exitCode = null;
+        this.log(
+          'task-retry',
+          task.id,
+          `attempt ${task.attempts}/${task.maxAttempts} failed (${reason}: ${truncate(message, 120)}); backing off`,
+        );
+        const delay = Math.min(60_000, 1000 * 2 ** Math.max(0, task.attempts - 1));
+        await this.backoff(delay * (0.5 + Math.random() * 0.5));
+      } else {
+        task.status = 'failed';
+        task.failureKind = reason;
+        const type =
+          reason === 'timeout' ? 'task-timeout' : reason === 'stalled' ? 'task-stalled' : 'task-fail';
+        this.log(type, task.id, `failed (${reason}): ${truncate(message, 300)}`);
+        if (!this.tryRepair(task, scope)) this.notify(type, task.id, truncate(message, 200));
+      }
+    } finally {
+      this.kills.delete(task.id);
+      this.reasons.delete(task.id);
+      this.closeLog(task.id);
+      this.attemptByTask.delete(task.id);
+      this.dropWorktree(task.id);
+      if (this.tokens.get(task.id) === token) {
+        this.inFlight.delete(task.id);
+        this.tokens.delete(task.id);
+        this.persist();
+      }
+    }
+  }
+}
