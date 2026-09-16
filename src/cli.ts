@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import {
   acquireLock,
   addTask,
+  assertNoForeignLock,
   attemptLogFiles,
   buildIntegrationSpec,
   editTask,
@@ -40,6 +41,7 @@ import {
 import { DagRunner } from './runner.js';
 import { startServer } from './server.js';
 import { parseWhen, type Reviewer } from './review-policy.js';
+import { activeRunFile, archiveRun, findRun, listRuns, projectOf, startNewRun } from './runs.js';
 import { listAgentModels } from './agent-models.js';
 import { addProject, loadRegistry, projectId, removeProject, resolveRunFile } from './registry.js';
 import {
@@ -181,8 +183,11 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'serve') {
+    // With --file: serve that run. Without it: hub mode, serving every
+    // registered project from the registry (never an implicit ./dag.run.json).
+    const explicit = flag(rest, 'file');
     startServer({
-      file,
+      file: explicit,
       port: Number(flag(rest, 'port') ?? 8787),
       autoResume: has(rest, 'auto-resume'),
       killOrphansOnResume: has(rest, 'kill-orphans'),
@@ -808,6 +813,65 @@ async function main(): Promise<void> {
     throw new Error('usage: dag reviewer add|rm|list --id <task> [--name N] [--cmd C] [--when W] [--verdict v]');
   }
 
+  if (cmd === 'new-run') {
+    // Archive the active run and start a fresh one, so history stays in the
+    // project folder instead of being overwritten.
+    guard(file, rest);
+    const objective = flag(rest, 'objective');
+    if (!objective) throw new Error('--objective is required');
+    const dir = projectOf(file);
+    const active = activeRunFile(dir);
+    if (existsSync(active)) {
+      try {
+        assertNoForeignLock(active);
+      } catch (err) {
+        throw new Error(err instanceof Error ? err.message : String(err));
+      }
+    }
+    const { run, archivedTo } = startNewRun(dir, objective);
+    emit(
+      rest,
+      { runId: run.id, archivedTo, file: active },
+      () =>
+        `${run.id}\n` +
+        (archivedTo ? `archived the previous run to ${archivedTo}\n` : '') +
+        `active run: ${active}`,
+    );
+    return;
+  }
+
+  if (cmd === 'runs') {
+    const sub = rest[0] ?? 'list';
+    const dir = projectOf(file);
+    if (sub === 'archive') {
+      guard(file, rest);
+      const target = archiveRun(dir, activeRunFile(dir));
+      emit(rest, { archivedTo: target }, () => (target ? `archived to ${target}` : 'nothing to archive'));
+      if (!target) process.exitCode = 1;
+      return;
+    }
+    const rows = listRuns(dir);
+    if (sub === 'show') {
+      const id = flag(rest, 'id') ?? rest[1];
+      if (!id) throw new Error('usage: dag runs show --id <runId>');
+      const found = findRun(dir, id);
+      if (!found) throw new Error(`no run ${id} in ${dir}`);
+      emit(rest, found, () => `${found.runId}\n${found.archived ? 'archived' : 'active'}\n${found.file}`);
+      return;
+    }
+    emit(rest, rows, () =>
+      rows.length === 0
+        ? 'no runs in this project yet'
+        : rows
+            .map(
+              (r) =>
+                `${r.runId}  ${r.archived ? 'archived' : 'active  '}  ${r.status.padEnd(8)} ${String(r.total).padStart(4)} tasks  ${r.objective.slice(0, 60)}`,
+            )
+            .join('\n'),
+    );
+    return;
+  }
+
   if (cmd === 'models') {
     const { models, error } = listAgentModels(flag(rest, 'refresh') === '1');
     emit(rest, { models, error }, () =>
@@ -1063,7 +1127,8 @@ usage: dag <cmd> [flags]
                                one server per project, stable port each
   servers [--json] | servers --stop --all|--dir F
   projects [list|add --dir F [--name N]|rm <id|path|name>]
-  serve --file F [--port 8787] [--open] [--auto-resume] [--kill-orphans]
+  serve [--file F] [--port 8787] [--open] [--auto-resume] [--kill-orphans]
+                               no --file: one hub for every registered project
   schedule add --file F [--name N] [--at "YYYY-MM-DD HH:MM"] [--after JOB]
       [--concurrency N] [--retries N] [--timeout SEC] [--silence SEC]
       [--max-hours H] [--on-dep-failure block|skip] [--gates wait|skip]
@@ -1092,6 +1157,8 @@ usage: dag <cmd> [flags]
   reviewer rm --id ID --name N
   set-cmd [--all | --only a,b | --match REGEX] --cmd "harness ... {spec}"
   models [--refresh]            list models available to the agent CLI
+  new-run --objective "..."     archive the active run, start a fresh one
+  runs [list] | runs show --id ID | runs archive
   set [--all | --only a,b | --match REGEX]
       [--cmd "..." | --clear-review] [--plan-cmd "..."] [--review-cmd "..."]
       [--review-rounds N] [--repair-rounds N] [--retries N] [--timeout SEC]
