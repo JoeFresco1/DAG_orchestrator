@@ -34,6 +34,7 @@ import {
 } from './graph.js';
 import { DagRunner, parseVerdict, renderTokens, resolveHarness, shellExecutor, sleep, type ExecContext } from './runner.js';
 import { describeDeps } from './graph.js';
+import { decideReviewers, globMatches, parseWhen, type Reviewer } from './review-policy.js';
 import { resolveCommand } from './command-resolution.js';
 import {
   commitAll,
@@ -63,7 +64,7 @@ function tempDir(): string {
   return mkdtempSync(join(tmpdir(), 'dag-'));
 }
 
-describe('dag edits (the Orca gaps)', () => {
+describe('dag edits', () => {
   it('edits title/spec/deps in place', () => {
     const run = newRun('t');
     const a = addTask(run, { title: 'a', spec: 'sa' });
@@ -578,18 +579,18 @@ describe('projects and scheduling', () => {
   });
 });
 
-describe('worktree isolation', () => {
-  function gitRepo(): string {
-    const dir = tempDir();
-    const g = (args: string[]): ReturnType<typeof git> => git(dir, args);
-    g(['init', '-q']);
-    g(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'init']);
-    writeFileSync(join(dir, 'tracked.txt'), 'tracked\n');
-    g(['add', 'tracked.txt']);
-    g(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'base']);
-    return dir;
-  }
+function gitRepo(): string {
+  const dir = tempDir();
+  const g = (args: string[]): ReturnType<typeof git> => git(dir, args);
+  g(['init', '-q']);
+  g(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'init']);
+  writeFileSync(join(dir, 'tracked.txt'), 'tracked\n');
+  g(['add', 'tracked.txt']);
+  g(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'base']);
+  return dir;
+}
 
+describe('worktree isolation', () => {
   it('snapshots a dirty tree without touching the caller index or branch', () => {
     const repo = gitRepo();
     try {
@@ -650,6 +651,157 @@ describe('worktree isolation', () => {
   });
 });
 
+describe('reviewer panel', () => {
+  it('parses the when DSL and matches globs', () => {
+    assert.equal(parseWhen('always').onReject, false);
+    assert.equal(parseWhen(undefined).minLines, null);
+    assert.equal(parseWhen('on-reject').onReject, true);
+    assert.equal(parseWhen('diff-lines>250').minLines, 250);
+    assert.deepEqual(parseWhen('diff-touches:src/api/**,src/routers/*').touches, [
+      'src/api/**',
+      'src/routers/*',
+    ]);
+    const both = parseWhen('diff-lines>10;diff-touches:src/**');
+    assert.equal(both.minLines, 10);
+    assert.deepEqual(both.touches, ['src/**']);
+    assert.equal(parseWhen('whenever').invalid, 'whenever');
+
+    assert.ok(globMatches('src/api/**', 'src/api/http/router.ts'));
+    assert.ok(globMatches('src/api/**', 'src/api/router.ts'));
+    assert.ok(globMatches('**/*.ts', 'deep/nested/file.ts'));
+    assert.ok(globMatches('src/routers/*.ts', 'src/routers/cases.ts'));
+    assert.ok(!globMatches('src/routers/*.ts', 'src/routers/nested/cases.ts'));
+    assert.ok(!globMatches('src/api/**', 'frontend/api/router.ts'));
+  });
+
+  it('decides applicability from the diff, and runs what it cannot measure', () => {
+    const reviewers: Reviewer[] = [
+      { name: 'regression', cmd: 'x', when: 'always' },
+      { name: 'quality', cmd: 'x', when: 'diff-lines>250' },
+      { name: 'api', cmd: 'x', when: 'diff-touches:src/api/**' },
+      { name: 'triage', cmd: 'x', when: 'on-reject' },
+    ];
+    const small = decideReviewers(reviewers, { lines: 40, files: ['src/util.ts'] }, false);
+    assert.deepEqual(small.map((d) => d.run), [true, false, false, false]);
+    assert.match(small[1].reason, /diff is 40 lines/);
+
+    const big = decideReviewers(reviewers, { lines: 400, files: ['src/api/router.ts'] }, false);
+    assert.deepEqual(big.map((d) => d.run), [true, true, true, false]);
+
+    const afterReject = decideReviewers(reviewers, { lines: 40, files: [] }, true);
+    assert.equal(afterReject[3].run, true, 'triage reviewer runs once something rejected');
+
+    // No diff measurable (no worktree isolation): gates run rather than open.
+    const unknown = decideReviewers(reviewers, null, false);
+    assert.deepEqual(unknown.map((d) => d.run), [true, true, true, false]);
+  });
+
+  it('passes only when every applicable reviewer passes', async () => {
+    const run = newRun('panel-pass');
+    const a = addTask(run, { title: 'work', spec: '', cmd: 'work' });
+    run.tasks[a.id].reviewers = [
+      { name: 'regression', cmd: 'pnpm test', when: 'always', verdict: 'exit-code' },
+      { name: 'contract', cmd: 'agent', when: 'always' },
+      { name: 'quality', cmd: 'agent', when: 'diff-lines>250' },
+    ];
+    const ran: string[] = [];
+    const runner = new DagRunner(run, {
+      executor: async (_t, _c, command) => {
+        ran.push(command ?? '');
+        if (command === 'agent') return { output: 'citations...\nVERDICT: PASS', exitCode: 0 };
+        return { output: 'ok', exitCode: 0 };
+      },
+    });
+    await runner.start();
+    assert.equal(run.tasks[a.id].status, 'completed');
+    // quality is conditional; without a measurable diff it still runs (fail-closed).
+    assert.deepEqual(ran.filter((c) => c !== 'work'), ['pnpm test', 'agent', 'agent']);
+    const verdicts = run.tasks[a.id].reviewerVerdicts;
+    assert.equal(verdicts.regression.verdict, 'pass');
+    assert.equal(verdicts.contract.verdict, 'pass');
+    assert.match(run.tasks[a.id].reviewResult ?? '', /regression: pass/);
+  });
+
+  it('stops at the first rejection and only triage reviewers run after it', async () => {
+    const run = newRun('panel-reject');
+    const a = addTask(run, { title: 'work', spec: '', cmd: 'work' });
+    run.tasks[a.id].reviewers = [
+      { name: 'regression', cmd: 'pnpm test', when: 'always', verdict: 'exit-code' },
+      { name: 'contract', cmd: 'agent', when: 'always' },
+      { name: 'quality', cmd: 'agent-q', when: 'always' },
+      { name: 'triage', cmd: 'agent-triage', when: 'on-reject' },
+    ];
+    run.tasks[a.id].reviewRounds = 0; // reject once and stop
+    const ran: string[] = [];
+    const runner = new DagRunner(run, {
+      executor: async (_t, _c, command) => {
+        ran.push(command ?? '');
+        if (command === 'pnpm test') return { output: 'failing', exitCode: 1 };
+        if (command === 'agent-triage') return { output: 'cause: schema drift\nVERDICT: FAIL: schema drift', exitCode: 0 };
+        return { output: 'VERDICT: PASS', exitCode: 0 };
+      },
+    });
+    await runner.start();
+    assert.equal(run.tasks[a.id].status, 'failed');
+    assert.equal(run.tasks[a.id].failureKind, 'review');
+    // regression rejected (exit 1) -> contract/quality skipped, triage ran.
+    assert.deepEqual(ran.filter((c) => c !== 'work'), ['pnpm test', 'agent-triage']);
+    const verdicts = run.tasks[a.id].reviewerVerdicts;
+    assert.equal(verdicts.regression.verdict, 'fail');
+    assert.equal(verdicts.contract.verdict, 'skipped');
+    assert.equal(verdicts.triage.verdict, 'fail');
+    // The rejection reason is carried into the next attempt's prompt.
+    assert.match(run.tasks[a.id].lastRejection ?? '', /schema drift/);
+    assert.match(run.tasks[a.id].result ?? '', /schema drift/);
+  });
+
+  it('feeds the last rejection into the redo prompt via {lastRejection}', async () => {
+    const dir = tempDir();
+    const out = join(dir, 'argv.jsonl').replace(/\\/g, '/');
+    const probe = `"${process.execPath}" -e "require('fs').appendFileSync('${out}', JSON.stringify(process.argv.slice(1)) + '\\n')"`;
+    try {
+      const run = newRun('panel-feedback');
+      const a = addTask(run, { title: 'work', spec: 'do the thing', cmd: `${probe} -- {lastRejection}` });
+      run.tasks[a.id].reviewers = [{ name: 'contract', cmd: 'agent', when: 'always' }];
+      run.tasks[a.id].reviewRounds = 1;
+      let workRuns = 0;
+      const runner = new DagRunner(run, {
+        executor: async (_task, _ctx, command) => {
+          if (command?.startsWith('"')) {
+            // Real argv path: split and render exactly like the shell executor.
+            const { shellExecutor } = await import('./runner.js');
+            const exec = shellExecutor();
+            const ctx = {
+              onOutput: () => undefined,
+              registerKill: () => undefined,
+              aborted: () => false,
+              setPid: () => undefined,
+            };
+            workRuns += 1;
+            return exec(run.tasks[a.id], ctx, command);
+          }
+          void workRuns;
+          return workRuns === 1
+            ? { output: 'VERDICT: FAIL: the migration is missing', exitCode: 0 }
+            : { output: 'VERDICT: PASS', exitCode: 0 };
+        },
+      });
+      await runner.start();
+      assert.equal(run.tasks[a.id].status, 'completed');
+      const prompts = readFileSync(out, 'utf8')
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l) as string[]);
+      assert.equal(prompts.length, 2, 'work ran twice');
+      assert.deepEqual(prompts[0], ['(none)'], 'first attempt has nothing to learn from');
+      const second = prompts[1].join(' ');
+      assert.match(second, /the migration is missing/, 'the redo is told why it was rejected');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('reviewer agents and integration repair', () => {
   it('completes when the reviewer accepts the work', async () => {
     const run = newRun('review-pass');
@@ -667,7 +819,8 @@ describe('reviewer agents and integration repair', () => {
     await runner.start();
     assert.equal(calls, 2, 'ran the task and the reviewer');
     assert.equal(run.tasks[a.id].status, 'completed');
-    assert.match(run.tasks[a.id].reviewResult ?? '', /VERDICT: PASS/);
+    assert.equal(run.tasks[a.id].reviewerVerdicts.review.verdict, 'pass');
+    assert.match(run.tasks[a.id].reviewResult ?? '', /review: pass/);
     assert.ok(run.events.some((e) => e.type === 'task-review' && /passed/.test(e.message)));
   });
 
@@ -1285,7 +1438,8 @@ describe('reviewer agents and integration repair', () => {
     await runner.start();
     assert.equal(run.tasks[a.id].status, 'completed');
     assert.equal(workRuns, 1);
-    assert.match(run.tasks[a.id].reviewResult ?? '', /VERDICT: PASS/);
+    assert.equal(run.tasks[a.id].reviewerVerdicts.review.verdict, 'pass');
+    assert.match(run.tasks[a.id].reviewResult ?? '', /review: pass/);
   });
 
   it('treats VERDICT: FAIL as a rejection even though the agent exits 0', async () => {
@@ -1358,7 +1512,102 @@ describe('reviewer agents and integration repair', () => {
       },
     });
     await runner.start();
-    assert.match(run.tasks[a.id].reviewResult ?? '', /VERDICT: FAIL: missing migration/);
+    assert.equal(run.tasks[a.id].reviewerVerdicts.review.verdict, 'fail');
+    assert.match(run.tasks[a.id].reviewerVerdicts.review.reason, /missing migration/);
+    assert.match(run.tasks[a.id].reviewResult ?? '', /review: fail — missing migration/);
+  });
+
+  it('a refused run does not wedge the runner', async () => {
+    const dir = tempDir(); // not a git repo
+    const file = join(dir, 'run.json');
+    const run = newRun('no-git');
+    addTask(run, { title: 'x', spec: '', cmd: 'true' });
+    run.settings.worktree = 'task'; // isolation requested, impossible here
+    saveRun(run, file);
+    try {
+      const runner = new DagRunner(loadRun(file), { file });
+      await runner.start();
+      assert.equal(runner.isRunning, false, 'refused to start without isolation');
+      assert.equal(runner.result?.stopped, true);
+      assert.ok(runner.state.events.some((e) => /not starting/.test(e.message)));
+
+      // The refusal must not block a later attempt.
+      await runner.start();
+      assert.equal(runner.isRunning, false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('prepares the worktree once before the phases, and fails as setup when it breaks', async () => {
+    const repo = gitRepo();
+    const file = join(repo, 'dag.run.json');
+    try {
+      const run = newRun('prepare');
+      const a = addTask(run, { title: 'needs env', spec: '', cmd: 'work' });
+      run.settings.worktree = 'task';
+      run.settings.worktreePrepareCmd = 'provision';
+      saveRun(run, file);
+      const order: string[] = [];
+      const runner = new DagRunner(run, {
+        file,
+        persist: (state) => saveRun(state, file),
+        executor: async (_t, ctx, command) => {
+          order.push(command ?? '');
+          if (command === 'provision') {
+            // stands in for uv sync / pnpm install
+            writeFileSync(join(ctx.cwd as string, 'env.txt'), 'ready\n');
+          }
+          return { output: '', exitCode: 0 };
+        },
+      });
+      await runner.start();
+      assert.deepEqual(order, ['provision', 'work'], 'prepare runs before the work phase');
+      assert.equal(run.tasks[a.id].status, 'completed');
+
+      // A failing prepare fails the task as setup, and the work never runs.
+      const run2 = newRun('prepare-fail');
+      const b = addTask(run2, { title: 'bad env', spec: '', cmd: 'work' });
+      run2.settings.worktree = 'task';
+      run2.settings.worktreePrepareCmd = 'provision';
+      saveRun(run2, join(repo, 'dag2.run.json'));
+      const order2: string[] = [];
+      const runner2 = new DagRunner(run2, {
+        file: join(repo, 'dag2.run.json'),
+        persist: (state) => saveRun(state, join(repo, 'dag2.run.json')),
+        executor: async (_t, _c, command) => {
+          order2.push(command ?? '');
+          if (command === 'provision') {
+            throw Object.assign(new Error('uv sync failed: no network'), { kind: 'exit', exitCode: 1 });
+          }
+          return { output: '', exitCode: 0 };
+        },
+      });
+      await runner2.start();
+      assert.deepEqual(order2, ['provision'], 'work never ran without an environment');
+      assert.equal(run2.tasks[b.id].status, 'failed');
+      assert.equal(run2.tasks[b.id].failureKind, 'setup');
+      assert.match(run2.tasks[b.id].result ?? '', /uv sync failed/);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('skips the prepare step when worktree isolation is off', async () => {
+    const run = newRun('prepare-off');
+    const a = addTask(run, { title: 'in place', spec: '', cmd: 'work' });
+    run.settings.worktreePrepareCmd = 'provision';
+    const ran: string[] = [];
+    const runner = new DagRunner(run, {
+      executor: async (_t, _c, command) => {
+        ran.push(command ?? '');
+        return { output: '', exitCode: 0 };
+      },
+    });
+    await runner.start();
+    assert.deepEqual(ran, ['work'], 'no worktree, no prepare — it would mutate the real checkout');
+    assert.equal(run.tasks[a.id].status, 'completed');
+    assert.ok(run.events.some((e) => /worktree isolation is off/.test(e.message)));
   });
 
   it('runs the notify command on permanent failure with event env vars', async () => {

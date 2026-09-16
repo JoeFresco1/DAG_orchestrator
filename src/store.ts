@@ -19,6 +19,7 @@ import {
 import { hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { assertNoCycle, isTerminal, topoSort, transitiveBlocked } from './graph.js';
+import type { Reviewer } from './review-policy.js';
 import {
   DEFAULT_SETTINGS,
   DEFINITION_FIELDS,
@@ -424,6 +425,10 @@ function normalizeTask(raw: Partial<Task>, run: Run, index: number): Task {
     mergeRetries: raw.mergeRetries ?? 0,
     planCmd: raw.planCmd ?? null,
     plan: raw.plan ?? null,
+    prepareCmd: raw.prepareCmd ?? null,
+    reviewers: Array.isArray(raw.reviewers) ? raw.reviewers : [],
+    reviewerVerdicts: raw.reviewerVerdicts ?? {},
+    lastRejection: raw.lastRejection ?? null,
     model: raw.model ?? null,
     variant: raw.variant ?? null,
   };
@@ -549,6 +554,8 @@ export interface AddTaskInput {
   planCmd?: string | null;
   model?: string | null;
   variant?: string | null;
+  reviewers?: Reviewer[];
+  prepareCmd?: string | null;
 }
 
 export function addTask(run: Run, input: AddTaskInput): Task {  const deps = input.deps ?? [];
@@ -591,6 +598,10 @@ export function addTask(run: Run, input: AddTaskInput): Task {  const deps = inp
     mergeRetries: 0,
     planCmd: input.planCmd ?? null,
     plan: null,
+    prepareCmd: input.prepareCmd ?? null,
+    reviewers: input.reviewers ?? [],
+    reviewerVerdicts: {},
+    lastRejection: null,
     model: input.model ?? null,
     variant: input.variant ?? null,
   };
@@ -617,6 +628,8 @@ export interface EditTaskInput {
   planCmd?: string | null;
   model?: string | null;
   variant?: string | null;
+  reviewers?: Reviewer[];
+  prepareCmd?: string | null;
 }
 
 export function editTask(run: Run, id: string, patch: EditTaskInput): Task {
@@ -635,6 +648,8 @@ export function editTask(run: Run, id: string, patch: EditTaskInput): Task {
   if (patch.planCmd !== undefined) task.planCmd = patch.planCmd;
   if (patch.model !== undefined) task.model = patch.model;
   if (patch.variant !== undefined) task.variant = patch.variant;
+  if (patch.reviewers !== undefined) task.reviewers = patch.reviewers;
+  if (patch.prepareCmd !== undefined) task.prepareCmd = patch.prepareCmd;
   if (patch.reviewRounds !== undefined) task.reviewRounds = Math.max(0, patch.reviewRounds);
   if (patch.repairRounds !== undefined) task.repairRounds = Math.max(0, patch.repairRounds);
   if (patch.deps !== undefined) {
@@ -683,6 +698,8 @@ export function retryTask(run: Run, id: string, cascade = false): string[] {
     // A manual retry is a fresh start: review and repair budgets reset, or a
     // task that exhausted its rounds could never run again.
     t.plan = null;
+    t.reviewerVerdicts = {};
+    t.lastRejection = null;
     t.reviews = 0;
     t.reviewResult = null;
     t.reviewExitCode = null;
@@ -851,6 +868,8 @@ export interface TaskPatch {
   planCmd?: string | null;
   model?: string | null;
   variant?: string | null;
+  reviewers?: Reviewer[];
+  prepareCmd?: string | null;
   reviewRounds?: number;
   repairRounds?: number;
   maxAttempts?: number;
@@ -898,6 +917,9 @@ export function setTasks(run: Run, patch: TaskPatch, selector: TaskSelector): st
     if (patch.planCmd !== undefined) task.planCmd = patch.planCmd;
     if (patch.model !== undefined) task.model = patch.model;
     if (patch.variant !== undefined) task.variant = patch.variant;
+    if (patch.reviewers !== undefined) task.reviewers = patch.reviewers;
+    if (patch.prepareCmd !== undefined) task.prepareCmd = patch.prepareCmd;
+  if (patch.prepareCmd !== undefined) task.prepareCmd = patch.prepareCmd;
     if (patch.reviewRounds !== undefined) task.reviewRounds = Math.max(0, patch.reviewRounds);
     if (patch.repairRounds !== undefined) task.repairRounds = Math.max(0, patch.repairRounds);
     if (patch.maxAttempts !== undefined) task.maxAttempts = Math.max(1, patch.maxAttempts);

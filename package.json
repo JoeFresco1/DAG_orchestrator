@@ -1,5 +1,5 @@
 {
-  "name": "lightweight-dag",
+  "name": "dag-orchestrator",
   "version": "0.1.0",
   "description": "A file-backed DAG orchestrator for coding agents: dependency graphs, per-task planning and verification, git-worktree isolation, retries and repair, live viewer. No daemon, no database.",
   "type": "module",

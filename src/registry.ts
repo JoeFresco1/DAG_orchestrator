@@ -19,6 +19,8 @@ export interface Registry {
   projects: ProjectEntry[];
 }
 
+// Kept at ~/.lightweight-dag for continuity with existing installs; the
+// name is historical, the contents are the project registry.
 export function registryPath(): string {
   return process.env.DAG_REGISTRY ?? join(homedir(), '.lightweight-dag', 'projects.json');
 }

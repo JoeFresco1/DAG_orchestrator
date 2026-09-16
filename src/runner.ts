@@ -1,17 +1,25 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { createWriteStream, existsSync, mkdirSync, statSync, writeFileSync, type WriteStream } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, rmSync, statSync, writeFileSync, type WriteStream } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { resolveCommand } from './command-resolution.js';
 import {
   commitAll,
   createTaskWorktree,
   ensureIntegrationWorktree,
+  git,
   isDirty,
   isGitRepo,
   mergeIntoIntegration,
   removeWorktree,
+  worktreeRoot,
 } from './git-worktree.js';
 import { depsMet, describeDeps, gateBlocks, isTerminal, topoSort } from './graph.js';
+import {
+  decideReviewers,
+  summarizeVerdicts,
+  type DiffStats,
+  type Reviewer,
+} from './review-policy.js';
 import {
   acquireLock,
   attemptLogPath,
@@ -48,7 +56,15 @@ const refuseMessage = (file: string): string =>
   'Parallel workers live inside a run: raise --concurrency (up to 64). ' +
   'Independent graphs need their own run file (dag launch --all).';
 
-export interface ExecContext {
+export interface TokenContext {
+  planFile?: string;
+  deps?: string;
+  depsAll?: string;
+  depsFile?: string;
+  lastRejection?: string | null;
+}
+
+export interface ExecContext extends TokenContext {
   onOutput: (chunk: string) => void;
   registerKill: (fn: () => void) => void;
   aborted: () => boolean;
@@ -188,7 +204,7 @@ export function resolveHarness(
   return out;
 }
 
-export function renderTokens(token: string, task: Task, ctx?: ExecContext): string {
+export function renderTokens(token: string, task: Task, ctx?: TokenContext): string {
   if (!token.includes('{')) return token;
   const rendered = token
     .replace(/\{id\}/g, task.id)
@@ -198,7 +214,8 @@ export function renderTokens(token: string, task: Task, ctx?: ExecContext): stri
     .replace(/\{planFile\}/g, ctx?.planFile ?? '')
     .replace(/\{deps\}/g, ctx?.deps ?? '(no dependencies)')
     .replace(/\{depsAll\}/g, ctx?.depsAll ?? '(no upstream tasks)')
-    .replace(/\{depsFile\}/g, ctx?.depsFile ?? '');
+    .replace(/\{depsFile\}/g, ctx?.depsFile ?? '')
+    .replace(/\{lastRejection\}/g, task.lastRejection ?? '(none)');
   // A substituted value that starts with "-" would be read as a CLI flag by
   // the spawned program (yargs/commander print usage and exit 1). A leading
   // newline keeps it a positional without changing what the agent reads.
@@ -329,6 +346,7 @@ export class DagRunner {
   private recovery: RecoveryResult = { requeued: [], orphanPids: [] };
   private releaseLock: (() => void) | null = null;
   private worktrees = new Map<string, string>();
+  private worktreeBases = new Map<string, string>();
   private integration: { path: string; branch: string } | null = null;
   private repoDir: string | null = null;
   private landChain: Promise<void> = Promise.resolve();
@@ -437,6 +455,9 @@ export class DagRunner {
         budgetReached: false,
         interrupted: { requeued: [], orphanPids: [] },
       };
+      // Never leave the runner wedged: a refused start must be retryable.
+      this.active = false;
+      this.stopping = false;
       this.flush();
       this.releaseLock?.();
       this.releaseLock = null;
@@ -455,6 +476,7 @@ export class DagRunner {
         this.flush();
         this.closeAllLogs();
         for (const taskId of [...this.worktrees.keys()]) this.dropWorktree(taskId);
+        this.cleanupIsolation();
         this.releaseLock?.();
         this.releaseLock = null;
         if (this.opts.file) ownedFiles.delete(this.opts.file);
@@ -728,6 +750,45 @@ export class DagRunner {
     }
   }
 
+  // Worktree preparation: provision the environment a suite reviewer needs.
+  // Runs once per attempt (worktrees are per attempt) and only in worktree
+  // mode — a prepare step must never mutate the user's own checkout.
+  private async prepareWorktree(
+    task: Task,
+    execute: Executor,
+    worktreePath?: string,
+    planFile?: string,
+    depsContext?: { deps: string; depsAll: string; depsFile?: string },
+  ): Promise<'ok' | 'fail' | 'skipped'> {
+    const cmd = task.prepareCmd ?? this.state.settings.worktreePrepareCmd ?? '';
+    if (!cmd.trim()) return 'skipped';
+    if (!worktreePath) {
+      this.log('note', task.id, 'worktreePrepareCmd set but worktree isolation is off; skipping it');
+      return 'skipped';
+    }
+    this.log('task-plan', task.id, `preparing the worktree: ${truncate(cmd, 120)}`);
+    this.appendLog(task.id, '\n--- prepare ---\n');
+    try {
+      const outcome = await this.runPhase(task, execute, cmd, 'plan', worktreePath, planFile, depsContext);
+      const out = stripAnsi(outcome.output).trim();
+      if (out) this.appendLog(task.id, `\n${truncateTail(out, 2000)}\n`);
+      this.log('note', task.id, 'worktree ready');
+      return 'ok';
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (this.stopping) {
+        task.status = 'pending';
+        task.failureKind = 'killed';
+        task.result = 'stopped by user';
+        return 'fail';
+      }
+      task.failureKind = 'setup';
+      task.result = `worktree prepare failed: ${truncate(message, RESULT_LIMIT)}`;
+      this.log('task-fail', task.id, `worktree prepare failed: ${truncate(message, 200)}`);
+      return 'fail';
+    }
+  }
+
   // Planning phase: produce the plan the work phase should follow. A plan
   // command that fails fails the task (retryable) — proceeding unplanned
   // defeats the point of configuring one.
@@ -880,6 +941,7 @@ export class DagRunner {
       },
       cwd: worktreePath,
       planFile,
+      lastRejection: task.lastRejection,
       deps: depsContext?.deps,
       depsAll: depsContext?.depsAll,
       depsFile: depsContext?.depsFile,
@@ -905,10 +967,40 @@ export class DagRunner {
     }
   }
 
-  // Reviewer loop: a reviewer that exits non-zero rejects the work, which is
-  // redone up to reviewRounds times. A reviewer that dies (timeout/stall/
-  // spawn) fails the task outright — that is infrastructure, not a verdict.
-  private async review(
+  // Every reviewer that applies to this task. The legacy single `reviewCmd`
+  // is just a reviewer named "review".
+  private reviewersFor(task: Task): Reviewer[] {
+    const list: Reviewer[] = [...(task.reviewers ?? [])];
+    if (task.reviewCmd && !list.some((r) => r.name === 'review')) {
+      list.push({ name: 'review', cmd: task.reviewCmd, when: 'always' });
+    }
+    return list;
+  }
+
+  // What the task's work changed, for diff-gated reviewers. Needs worktree
+  // isolation: without it there is no per-task diff to measure.
+  private diffStats(task: Task): DiffStats | null {
+    const path = this.worktrees.get(task.id);
+    const base = this.worktreeBases.get(task.id);
+    if (!path || !base) return null;
+    git(path, ['add', '-A']);
+    const numstat = git(path, ['diff', '--cached', '--numstat', base]);
+    if (numstat.code !== 0) return null;
+    let lines = 0;
+    const files: string[] = [];
+    for (const row of numstat.stdout.split('\n')) {
+      const [added, removed, file] = row.split('\t');
+      if (!file) continue;
+      files.push(file);
+      lines += (Number(added) || 0) + (Number(removed) || 0);
+    }
+    return { lines, files };
+  }
+
+  // Reviewers run in order. The first rejection stops the always-on reviewers
+  // (the work will be redone) but still runs the on-reject triage ones, whose
+  // diagnosis is fed to the redo through {lastRejection}.
+  private async reviewPass(
     task: Task,
     execute: Executor,
     scope: Set<string> | null,
@@ -918,59 +1010,151 @@ export class DagRunner {
   ): Promise<'pass' | 'requeue' | 'fail'> {
     const round = task.reviews + 1;
     const total = task.reviewRounds + 1;
-    this.log('task-review', task.id, `review ${round}/${total} starting`);
-    this.appendLog(task.id, `\n--- review ${round}/${total} ---\n`);
-    try {
-      const outcome = await this.runPhase(task, execute, task.reviewCmd, 'review', worktreePath, planFile, depsContext);
-      task.reviewExitCode = outcome.exitCode;
-      const cleaned = stripAnsi(outcome.output).trim();
-      task.reviewResult = truncateTail(cleaned, RESULT_LIMIT) || '(review produced no output)';
-      const mode = this.state.settings.reviewVerdict ?? 'marker';
+    const reviewers = this.reviewersFor(task);
+    const diff = this.diffStats(task);
+    const decisions = decideReviewers(reviewers, diff, false);
+    this.log(
+      'task-review',
+      task.id,
+      `review ${round}/${total} starting with ${reviewers.length} reviewer(s)` +
+        (diff ? ` against a ${diff.lines}-line diff` : ''),
+    );
+    task.reviewerVerdicts = {};
+
+    let rejected: { name: string; reason: string } | null = null;
+    for (const decision of decisions) {
+      const reviewer = decision.reviewer;
+      if (!decision.run && !decision.onReject) {
+        task.reviewerVerdicts[reviewer.name] = {
+          verdict: 'skipped',
+          reason: decision.reason,
+          at: nowIso(),
+        };
+        this.log('task-review', task.id, `skip reviewer "${reviewer.name}": ${decision.reason}`);
+        continue;
+      }
+      if (decision.onReject && !rejected) {
+        task.reviewerVerdicts[reviewer.name] = {
+          verdict: 'skipped',
+          reason: 'no rejection to triage',
+          at: nowIso(),
+        };
+        continue;
+      }
+      // After a rejection, only the triage reviewers are worth spending on.
+      if (rejected && !decision.onReject) {
+        task.reviewerVerdicts[reviewer.name] = {
+          verdict: 'skipped',
+          reason: 'work is being redone',
+          at: nowIso(),
+        };
+        continue;
+      }
+
+      this.appendLog(task.id, `\n--- review ${round}/${total}: ${reviewer.name} ---\n`);
+      let cleaned = '';
+      let reviewerExit: number | null = null;
+      try {
+        const outcome = await this.runPhase(task, execute, reviewer.cmd, 'review', worktreePath, planFile, depsContext);
+        reviewerExit = outcome.exitCode;
+        task.reviewExitCode = outcome.exitCode;
+        cleaned = stripAnsi(outcome.output).trim();
+      } catch (err) {
+        const reason: FailureKind =
+          this.reasons.get(task.id) ?? (err as { kind?: FailureKind }).kind ?? 'exit';
+        const message = err instanceof Error ? err.message : String(err);
+        if (this.stopping) {
+          task.status = 'pending';
+          task.failureKind = 'killed';
+          task.result = 'stopped by user';
+          this.log('task-killed', task.id, 'stopped during review; requeued as pending');
+          return 'requeue';
+        }
+        task.reviewerVerdicts[reviewer.name] = { verdict: 'error', reason: truncate(message, 300), at: nowIso() };
+        task.reviewExitCode = (err as { exitCode?: number | null }).exitCode ?? null;
+        if (reason === 'timeout' || reason === 'stalled' || reason === 'spawn') {
+          task.status = 'failed';
+          task.failureKind = reason;
+          task.result = truncate(`reviewer "${reviewer.name}" ${reason}: ${message}`, RESULT_LIMIT);
+          task.reviewResult = summarizeVerdicts(task.reviewerVerdicts);
+          const type =
+            reason === 'timeout' ? 'task-timeout' : reason === 'stalled' ? 'task-stalled' : 'task-fail';
+          this.log(type, task.id, `reviewer "${reviewer.name}" failed (${reason}): ${truncate(message, 200)}`);
+          if (!this.tryRepair(task, scope)) this.notify(type, task.id, `reviewer ${reason}: ${message}`);
+          return 'fail';
+        }
+        return this.handleRejection(task, `reviewer "${reviewer.name}" failed: ${message}`, scope);
+      }
+
+      const mode = reviewer.verdict ?? this.state.settings.reviewVerdict ?? 'marker';
       const verdict = parseVerdict(cleaned);
-      if (mode === 'exit-code' || verdict.kind === 'pass') {
-        this.log('task-review', task.id, `review ${round}/${total} passed${verdict.kind === 'pass' ? ' (VERDICT: PASS)' : ''}`);
-        return 'pass';
+      const exit = reviewerExit ?? 0;
+      // A non-zero exit is a rejection whatever the verdict mode says: shell
+      // reviewers signal failure that way, and an executor may report it
+      // without throwing.
+      if (exit !== 0) {
+        const tail = cleaned
+          ? cleaned.split('\n').map((l) => l.trim()).filter(Boolean).pop() ?? `exit ${exit}`
+          : `exit ${exit}`;
+        task.reviewExitCode = exit;
+        task.reviewerVerdicts[reviewer.name] = {
+          verdict: 'fail',
+          reason: truncate(tail, 300),
+          at: nowIso(),
+        };
+        rejected = { name: reviewer.name, reason: `exit ${exit}: ${tail}` };
+        this.log('task-review', task.id, `reviewer "${reviewer.name}" failed (exit ${exit})`);
+        continue;
+      }
+      if (mode === 'exit-code') {
+        task.reviewerVerdicts[reviewer.name] = {
+          verdict: 'pass',
+          reason: cleaned ? truncateTail(cleaned, 300).replace(/\s+/g, ' ') : 'exit 0',
+          at: nowIso(),
+        };
+        this.log('task-review', task.id, `reviewer "${reviewer.name}" passed (exit 0)`);
+        continue;
+      }
+      if (verdict.kind === 'pass') {
+        task.reviewerVerdicts[reviewer.name] = { verdict: 'pass', reason: verdict.reason, at: nowIso() };
+        this.log('task-review', task.id, `reviewer "${reviewer.name}" passed (VERDICT: PASS)`);
+        continue;
       }
       if (verdict.kind === 'fail') {
         task.reviewExitCode = 1;
-        this.log('task-review', task.id, `reviewer returned VERDICT: FAIL — ${truncate(verdict.reason || '(no reason given)', 200)}`);
-        return this.handleRejection(task, verdict.reason || 'reviewer failed the work', scope);
+        task.reviewerVerdicts[reviewer.name] = {
+          verdict: 'fail',
+          reason: verdict.reason || '(no reason given)',
+          at: nowIso(),
+        };
+        rejected = { name: reviewer.name, reason: verdict.reason || 'reviewer failed the work' };
+        this.log(
+          'task-review',
+          task.id,
+          `reviewer "${reviewer.name}" returned VERDICT: FAIL — ${truncate(rejected.reason, 200)}`,
+        );
+        // Keep going only for the triage (on-reject) reviewers below.
+        continue;
       }
       // Fail closed: an unreadable review must never count as approval.
       task.reviewExitCode = 1;
+      task.reviewerVerdicts[reviewer.name] = {
+        verdict: 'error',
+        reason: 'produced no VERDICT line',
+        at: nowIso(),
+      };
       this.log(
         'task-review',
         task.id,
-        'reviewer produced no VERDICT line (expected "VERDICT: PASS" or "VERDICT: FAIL: reason"); treating as not reviewed',
+        `reviewer "${reviewer.name}" produced no VERDICT line (expected "VERDICT: PASS" or "VERDICT: FAIL: reason")`,
       );
-      return this.handleRejection(task, 'reviewer produced no machine-readable verdict', scope);
-    } catch (err) {
-      const reason: FailureKind =
-        this.reasons.get(task.id) ?? (err as { kind?: FailureKind }).kind ?? 'exit';
-      const message = err instanceof Error ? err.message : String(err);
-      // A stop is not a verdict: requeue without spending a review round.
-      if (this.stopping) {
-        task.status = 'pending';
-        task.failureKind = 'killed';
-        task.result = 'stopped by user';
-        this.log('task-killed', task.id, 'stopped during review; requeued as pending');
-        return 'requeue';
-      }
-      if (reason === 'timeout' || reason === 'stalled' || reason === 'spawn') {
-        task.status = 'failed';
-        task.failureKind = reason;
-        task.result = truncate(message, RESULT_LIMIT);
-        task.reviewResult = truncate(message, RESULT_LIMIT);
-        const type =
-          reason === 'timeout' ? 'task-timeout' : reason === 'stalled' ? 'task-stalled' : 'task-fail';
-        this.log(type, task.id, `reviewer failed (${reason}): ${truncate(message, 200)}`);
-        if (!this.tryRepair(task, scope)) this.notify(type, task.id, `reviewer ${reason}: ${message}`);
-        return 'fail';
-      }
-      task.reviewExitCode = (err as { exitCode?: number | null }).exitCode ?? null;
-      task.reviewResult = truncate(message, RESULT_LIMIT);
-      return this.handleRejection(task, message, scope);
+      return this.handleRejection(task, `reviewer "${reviewer.name}" produced no machine-readable verdict`, scope);
     }
+
+    task.reviewResult = summarizeVerdicts(task.reviewerVerdicts);
+    if (!rejected) return 'pass';
+    task.lastRejection = truncate(`${rejected.name}: ${rejected.reason}`, 800);
+    return this.handleRejection(task, `${rejected.name}: ${rejected.reason}`, scope);
   }
 
   private handleRejection(task: Task, message: string, scope: Set<string> | null): 'requeue' | 'fail' {
@@ -1083,6 +1267,10 @@ export class DagRunner {
       this.integration.branch,
     );
     this.worktrees.set(task.id, path);
+    this.worktreeBases.set(
+      task.id,
+      git(this.repoDir, ['rev-parse', this.integration.branch]).stdout,
+    );
     task.branch = branch;
     task.commit = null;
     return path;
@@ -1149,10 +1337,28 @@ export class DagRunner {
     }
   }
 
+  // Frees the integration worktree (the branch survives) and the temp root.
+  private cleanupIsolation(): void {
+    if (!this.repoDir || !this.integration) return;
+    const root = worktreeRoot(this.repoDir, this.state.id);
+    try {
+      removeWorktree(this.repoDir, this.integration.path);
+    } catch {
+      // best effort
+    }
+    try {
+      rmSync(root, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+    this.integration = null;
+  }
+
   private dropWorktree(taskId: string): void {
     const path = this.worktrees.get(taskId);
     if (!path || !this.repoDir) return;
     this.worktrees.delete(taskId);
+    this.worktreeBases.delete(taskId);
     try {
       removeWorktree(this.repoDir, path);
     } catch {
@@ -1239,6 +1445,24 @@ export class DagRunner {
     }
 
     try {
+      // Environment first: nothing else can run without it.
+      const prepared = await this.prepareWorktree(task, execute, worktreePath ?? undefined, planFile, depsContext);
+      if (prepared === 'fail') {
+        if (this.tokens.get(task.id) !== token) return;
+        task.status = 'failed';
+        this.salvageWorktree(task.id, 'setup failed');
+        const retryable = task.attempts < task.maxAttempts;
+        if (retryable) {
+          task.status = 'pending';
+          task.failureKind = null;
+          this.log('task-retry', task.id, `worktree prepare failed; attempt ${task.attempts}/${task.maxAttempts}`);
+        } else if (!this.tryRepair(task, scope)) {
+          this.notify('task-fail', task.id, 'worktree prepare failed');
+        }
+        this.persist();
+        return;
+      }
+
       // Planning phase first: the work command follows {plan} / {planFile}.
       if (task.planCmd) {
         const planned = await this.plan(task, execute, worktreePath ?? undefined, planFile);
@@ -1260,8 +1484,8 @@ export class DagRunner {
       const outcome = await this.runPhase(task, execute, task.cmd, 'run', worktreePath ?? undefined, planFile, depsContext);
       if (this.tokens.get(task.id) !== token) return;
 
-      if (task.reviewCmd) {
-        const verdict = await this.review(task, execute, scope, worktreePath ?? undefined, planFile, depsContext);
+      if (this.reviewersFor(task).length > 0) {
+        const verdict = await this.reviewPass(task, execute, scope, worktreePath ?? undefined, planFile, depsContext);
         if (this.tokens.get(task.id) !== token) return;
         if (verdict !== 'pass') {
           this.dropWorktree(task.id);

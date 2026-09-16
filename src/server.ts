@@ -25,6 +25,8 @@ import { DagRunner } from './runner.js';
 import { deriveStatus, getReady } from './graph.js';
 import { openBrowser } from './launcher.js';
 import { listAgentModels } from './agent-models.js';
+import { statSync } from 'node:fs';
+import { fileURLToPath as fileUrl } from 'node:url';
 import {
   addProject,
   findProject,
@@ -258,6 +260,7 @@ interface StartOptions {
   model?: string;
   variant?: string;
   worktree?: 'none' | 'task';
+  worktreePrepareCmd?: string;
   force?: boolean;
 }
 
@@ -318,6 +321,9 @@ async function startRun(rt: ProjectRuntime, opts: StartOptions): Promise<StartRe
     if (opts.model !== undefined) run.settings.model = opts.model;
     if (opts.variant !== undefined) run.settings.variant = opts.variant;
     if (opts.worktree !== undefined) run.settings.worktree = opts.worktree;
+    if (opts.worktreePrepareCmd !== undefined) {
+      run.settings.worktreePrepareCmd = opts.worktreePrepareCmd;
+    }
     saveRun(run, file);
 
     // Manual tasks (no cmd) are skipped, not failed.
@@ -400,6 +406,19 @@ async function autoResumeAll(killOrphansOnResume: boolean): Promise<void> {
 // Server
 // ---------------------------------------------------------------------------
 
+// A long-lived server keeps serving the code it started with. Comparing the
+// build's mtime against our own start time tells us the source has moved on.
+const processStartedAt = Date.now();
+const runnerFile = fileUrl(new URL('./runner.js', import.meta.url));
+
+function staleBuild(): boolean {
+  try {
+    return statSync(runnerFile).mtimeMs > processStartedAt;
+  } catch {
+    return false;
+  }
+}
+
 export function startServer(opts: ServeOptions): void {
   const basePort = opts.port ?? 8787;
 
@@ -410,7 +429,7 @@ export function startServer(opts: ServeOptions): void {
   }
 
   const reportCrash = (kind: string, err: unknown): void => {
-    console.error(`[lightweight-dag] ${kind}: ${err instanceof Error ? err.message : String(err)}`);
+    console.error(`[dag-orchestrator] ${kind}: ${err instanceof Error ? err.message : String(err)}`);
   };
   process.on('uncaughtException', (err) => reportCrash('uncaught exception', err));
   process.on('unhandledRejection', (err) => reportCrash('unhandled rejection', err));
@@ -556,10 +575,10 @@ export function startServer(opts: ServeOptions): void {
       const run = currentRun(file, rt);
       const since = Number(url.searchParams.get('since') ?? -1);
       if (since === run.rev) {
-        json(res, 200, { rev: run.rev, unchanged: true, file, job: jobView(rt) });
+        json(res, 200, { rev: run.rev, unchanged: true, file, job: jobView(rt), staleBuild: staleBuild() });
         return true;
       }
-      json(res, 200, { ...summaryPayload(run), file, job: jobView(rt) });
+      json(res, 200, { ...summaryPayload(run), file, job: jobView(rt), staleBuild: staleBuild() });
       return true;
     }
 
@@ -730,7 +749,7 @@ export function startServer(opts: ServeOptions): void {
   let attempts = 0;
   server.on('listening', () => {
     listeningPort = (server.address() as { port: number } | null)?.port ?? port;
-    console.log(`lightweight-dag: http://localhost:${listeningPort}`);
+    console.log(`DAG Orchestrator: http://localhost:${listeningPort}`);
     for (const rt of runtimes.values()) console.log(`project: ${rt.entry.name} → ${rt.entry.file}`);
     if (opts.open) openBrowser(`http://localhost:${listeningPort}`);
     if (opts.autoResume) void autoResumeAll(opts.killOrphansOnResume ?? false);

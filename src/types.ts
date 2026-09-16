@@ -22,6 +22,7 @@ export type FailureKind =
   | 'review'
   | 'merge'
   | 'worktree'
+  | 'setup'
   | 'plan';
 
 export type EventType =
@@ -52,6 +53,14 @@ export interface DagEvent {
   type: EventType;
   taskId: string | null;
   message: string;
+}
+
+import type { Reviewer } from './review-policy.js';
+
+export interface ReviewerVerdict {
+  verdict: 'pass' | 'fail' | 'skipped' | 'error';
+  reason: string;
+  at: string;
 }
 
 export interface ApprovalGate {
@@ -110,6 +119,15 @@ export interface Task {
   // command can follow it (`{plan}` / `{planFile}` tokens).
   planCmd: string | null;
   plan: string | null;
+  // Per-reviewer outcomes for the last review pass, keyed by reviewer name.
+  reviewerVerdicts: Record<string, ReviewerVerdict>;
+  // Why the previous attempt was rejected, fed back to the redo via {lastRejection}.
+  lastRejection: string | null;
+  // Per-task override for the worktree prepare command.
+  prepareCmd: string | null;
+  // Reviewers for this task: each emits its own verdict, and the task passes
+  // only if every applicable one passes. `when` decides applicability.
+  reviewers: Reviewer[];
   // Model selection: null = use the run default. Commands reference these as
   // {model} / {variant}, so the UI can retarget tasks without editing text.
   model: string | null;
@@ -148,6 +166,10 @@ export interface RunSettings {
   // {variant}; an individual task can override either.
   model: string;
   variant: string;
+  // Command run once per task worktree before the phases (uv sync, pnpm
+  // install, …). Without it a suite reviewer in a fresh checkout has no
+  // environment to run in. Non-zero exit fails the task as `setup`.
+  worktreePrepareCmd: string;
   // 'task' gives every task its own git worktree on a per-run integration
   // branch; 'none' runs agents directly in the project directory.
   worktree: 'none' | 'task';
@@ -171,6 +193,7 @@ export const DEFAULT_SETTINGS: RunSettings = {
   model: '',
   variant: '',
   worktree: 'none',
+  worktreePrepareCmd: '',
   mergeRounds: 2,
 };
 
@@ -217,6 +240,8 @@ export const DEFINITION_FIELDS = [
   'planCmd',
   'model',
   'variant',
+  'reviewers',
+  'prepareCmd',
 ] as const;
 
 export const DYNAMIC_FIELDS = [
@@ -238,6 +263,8 @@ export const DYNAMIC_FIELDS = [
   'commit',
   'mergeRetries',
   'plan',
+  'reviewerVerdicts',
+  'lastRejection',
 ] as const;
 
 export const PLAN_LIMIT = 20000;

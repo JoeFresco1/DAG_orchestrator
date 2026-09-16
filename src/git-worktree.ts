@@ -53,10 +53,7 @@ export function isDirty(dir: string): boolean {
     .map((l) => l.trim())
     .filter(Boolean)
     .filter(
-      (l) =>
-        !/dag\.run\.d\//.test(l) &&
-        !/dag\.run\.json/.test(l) &&
-        !/\.orca-dag\./.test(l),
+      (l) => !/dag\.run\.d\//.test(l) && !/dag\.run\.json/.test(l),
     );
   return lines.length > 0;
 }
@@ -69,7 +66,7 @@ export function currentBranch(dir: string): string {
   return git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']).stdout;
 }
 
-const IDENTITY = ['-c', 'user.name=lightweight-dag', '-c', 'user.email=dag@localhost'];
+const IDENTITY = ['-c', 'user.name=dag-orchestrator', '-c', 'user.email=dag@localhost'];
 
 // Commit the current working tree (tracked + untracked, minus run artifacts)
 // without touching the caller's index or branch: a throwaway index file feeds
@@ -91,7 +88,6 @@ export function snapshotCommit(repoDir: string): string {
         ':(exclude)dag.run.json',
         ':(exclude)dag.run.json.bak',
         ':(exclude)dag.run.json.lock',
-        ':(exclude)..orca-dag.scheduler-state.json.tmp.failed',
       ],
       env,
     );

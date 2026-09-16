@@ -154,6 +154,11 @@ button.icon { font-size: 13px; padding: 5px 9px; letter-spacing: 0; }
 #settingsModal .field.wide { grid-column: 1 / -1; }
 #settingsModal .flabel { font-size: 11px; color: var(--text); display: flex; align-items: center; }
 #settingsModal input, #settingsModal select { width: 100%; }
+.reviewers { margin: 6px 0; display: flex; flex-direction: column; gap: 5px; }
+.rvrow { border: 1px solid var(--line); border-radius: 3px; padding: 5px 7px; font-size: 11px; }
+.rvrow .rvwhen { color: var(--muted); font-size: 10px; margin-left: 4px; }
+.rvrow .rvcmd { color: var(--dim); font-family: var(--mono); font-size: 10px;
+  margin-top: 3px; white-space: pre-wrap; word-break: break-word; }
 .sec.collapsed .scroll { display: none; }
 .sec.collapsed { flex: 0 0 auto !important; }
 .sec .chev { cursor: pointer; color: var(--cyan); font-size: 10px; user-select: none; }
@@ -374,6 +379,12 @@ aside {
           </datalist>
         </label>
         <label class="field wide">
+          <span class="flabel">Worktree prepare command:
+            <span class="info" data-tip="Run once in each task's worktree before anything else — the environment is not in git, so a fresh checkout has no .venv or node_modules. Example: uv sync --directory backend --frozen, or pnpm install. A failure fails the task as 'setup' (retried, then repair). Only used with worktree isolation: on.">i</span>
+          </span>
+          <input type="text" id="worktreePrepareCmd" placeholder="e.g. uv sync --directory backend --frozen" />
+        </label>
+        <label class="field wide">
           <span class="flabel">Notify command:
             <span class="info" data-tip="Command run on task-fail, task-quiet, task-stalled and run-end. It receives DAG_EVENT, DAG_TASK, DAG_MESSAGE, DAG_FILE, DAG_RUN in its environment. Empty = no notifications.">i</span>
           </span>
@@ -434,6 +445,7 @@ network.on('click', (p) => { if (p.nodes.length > 0) select(p.nodes[0]); });
 
 let summary = null, job = null, meta = null, def = null;
 let rev = -1, defRev = -1, latestSeq = 0, initialized = false;
+let staleBuild = false;
 let inspected = null, detail = null, queueFilter = null, search = '';
 const checked = new Set();
 const nodeSig = new Map();
@@ -441,7 +453,7 @@ const titleById = new Map();
 
 // ---- settings persistence ----
 const NUM_SETTINGS = ['concurrency', 'timeout', 'silence', 'retries', 'maxHours'];
-const TEXT_SETTINGS = ['model', 'variant'];
+const TEXT_SETTINGS = ['model', 'variant', 'worktreePrepareCmd'];
 const SELECT_SETTINGS = ['onDepFailure', 'onGateBlocked', 'worktree', 'silenceAction'];
 for (const id of [...NUM_SETTINGS, ...SELECT_SETTINGS, ...TEXT_SETTINGS]) {
   const el = $(id);
@@ -465,6 +477,7 @@ function applySettings(def) {
     silenceAction: s.silenceAction ?? 'warn',
     model: s.model ?? '',
     variant: s.variant ?? '',
+    worktreePrepareCmd: s.worktreePrepareCmd ?? '',
     notifyCmd: s.notifyCmd ?? '',
   };
   for (const id of [...NUM_SETTINGS, ...SELECT_SETTINGS]) {
@@ -572,6 +585,10 @@ function renderHeader(s) {
   $('orphanBtn').disabled = running || !!external;
   for (const id of [...NUM_SETTINGS, ...SELECT_SETTINGS, ...TEXT_SETTINGS]) $(id).disabled = running || !!external;
 
+  if (staleBuild) {
+    note('server is running an older build — restart `dag serve` to load the current code', 'error');
+    return;
+  }
   if (job.stopping) note('stopping: killing running tasks…');
   else if (running) note(`running ${job.current.length} of ${job.scope?.length ?? '?'} selected`);
   else if (external) {
@@ -683,7 +700,8 @@ function renderInspector() {
     ${t.plan ? `<pre>plan output:\n${esc(t.plan)}</pre>` : ''}
     ${t.reviewCmd ? `<pre>review: ${esc(t.reviewCmd)}</pre>` : ''}
     ${t.result ? `<pre>result: ${esc(t.result)}</pre>` : ''}
-    ${t.reviewResult ? `<pre>review result: ${esc(t.reviewResult)}</pre>` : ''}
+    ${reviewPanel(t)}
+  ${t.reviewResult ? `<pre>review: ${esc(t.reviewResult)}</pre>` : ''}
     ${t.lastOutput && t.status === 'running' ? `<pre>live output:\n${esc(t.lastOutput)}</pre>` : ''}
   `;
   const btns = document.createElement('div');
@@ -805,6 +823,7 @@ $('runBtn').onclick = async () => {
       silenceAction: $('silenceAction').value,
       model: $('model').value.trim(),
       variant: $('variant').value.trim(),
+      worktreePrepareCmd: $('worktreePrepareCmd').value.trim(),
       notifyCmd: $('notifyCmd').value.trim(),
     }),
   });
@@ -909,6 +928,22 @@ document.addEventListener('keydown', (e) => {
   if (termTask) closeTerminal();
 });
 
+function reviewPanel(t) {
+  const verdicts = t.reviewerVerdicts || {};
+  const live = t.reviewers || [];
+  if (live.length === 0 && Object.keys(verdicts).length === 0) {
+    return t.reviewCmd ? `<pre>reviewers:\n  review (always)\n  ${esc(t.reviewCmd)}</pre>` : '';
+  }
+  const rows = live.map((r) => {
+    const v = verdicts[r.name];
+    const chip = v ? v.verdict : 'not run';
+    const cls = { pass: 'st-ready', fail: 'st-failed', error: 'st-blocked', skipped: 'st-skipped' }[chip] || 'st-pending';
+    const note = v && v.reason ? ` — ${esc(v.reason.slice(0, 160))}` : '';
+    return `<div class="rvrow"><span class="status ${cls}">${chip}</span> <b>${esc(r.name)}</b> <span class="rvwhen">${esc(r.when || 'always')}${r.verdict ? ' · ' + esc(r.verdict) : ''}</span><div class="rvcmd">${esc(r.cmd)}${note}</div></div>`;
+  });
+  return `<div class="reviewers">${rows.join('')}</div>`;
+}
+
 function modelOptions() {
   return [...document.querySelectorAll('#model option')].map((o) => o.value).filter(Boolean);
 }
@@ -990,6 +1025,7 @@ async function poll() {
     if (!r.ok) return;
     const s = await r.json();
     job = s.job;
+    if (s.staleBuild !== undefined) staleBuild = s.staleBuild;
     if (s.file) meta = { file: s.file };
     if (s.unchanged) { if (summary) renderHeader(summary); return; }
     rev = s.rev;

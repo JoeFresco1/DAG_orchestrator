@@ -127,7 +127,7 @@ Usable in any task command (`cmd`, `planCmd`, `reviewCmd`):
 | `{depsAll}` `{depsFile}` | transitive roll-up, inline / as a file |
 | `{model}` `{variant}` | effective model/effort: task override → run default; unset removes the flag |
 
-## Multi-project, scheduling, migration
+## Multi-project and scheduling
 
 ```bash
 dag launch --all --open          # one server + stable port per project
@@ -137,8 +137,6 @@ dag schedule add --file a/dag.run.json --name a
 dag schedule add --file b/dag.run.json --name b --after a
 dag scheduler                    # runs jobs strictly in order
 
-dag import-orca --list           # migrate an existing Orca run (read-only)
-dag import-orca --run run_xxx --cmd "opencode run --auto {spec}"
 ```
 
 ## CLI cheat sheet
@@ -175,9 +173,32 @@ pnpm test        # 66 tests: graph semantics, scheduling, watchdogs, retries,
 
 ## Notes
 
-- This is a clean-room tool; it does not depend on or talk to Orca. The
-  optional `import-orca` command reads Orca's SQLite database **read-only** to
-  migrate an existing graph.
 - Task state is plain JSON; nothing is hidden in a database you cannot diff.
+- Everything is local: the run file lives in your project, the server binds
+  loopback only, and no data leaves the machine.
+
+## Design boundaries
+
+Worth knowing before you build on it — these are deliberate, not gaps:
+
+- **One writer per run file.** A pid lockfile makes a single runner own a run
+  file; a second one is refused rather than allowed to clobber state. That
+  runner still runs many workers in parallel; *different projects are different
+  files* and run independently. The lock is local-only: sharing one run file
+  across machines is unsafe, and a lock from another host is respected rather
+  than stolen.
+- **Files, not a database.** State is a JSON file rewritten atomically
+  (tmp → fsync → rename, previous revision kept as `.bak`), plus an append-only
+  event log. Coalesced writes make 1000 tasks cheap; it is not a system for
+  millions.
+- **Deterministic first, agents second.** Regression and evidence checks are
+  commands (`pytest`, `ruff`, `git diff`); only judgment calls spend a model.
+- **Fail closed.** A reviewer with no readable verdict, an isolation mode that
+  cannot be established, or a prepare step that fails all stop the task rather
+  than let unverified work merge.
+- **Not a service.** One process serves the viewer and runs the graph; no auth,
+  no HA, no remote execution. Multi-machine work would mean driving remote
+  hosts as workers, which is intentionally out of scope today.
+
 
 MIT licensed.

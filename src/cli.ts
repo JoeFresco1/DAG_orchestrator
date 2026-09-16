@@ -39,7 +39,7 @@ import {
 } from './graph.js';
 import { DagRunner } from './runner.js';
 import { startServer } from './server.js';
-import { importOrcaRun, listOrcaRuns } from './import-orca.js';
+import { parseWhen, type Reviewer } from './review-policy.js';
 import { listAgentModels } from './agent-models.js';
 import { addProject, loadRegistry, projectId, removeProject, resolveRunFile } from './registry.js';
 import {
@@ -415,6 +415,8 @@ async function main(): Promise<void> {
       }
       patch.silenceAction = silenceAction;
     }
+    const prepare = flag(rest, 'worktree-prepare');
+    if (prepare !== undefined) patch.worktreePrepareCmd = prepare;
     const model = flag(rest, 'model');
     if (model !== undefined) patch.model = model;
     const variant = flag(rest, 'variant');
@@ -737,6 +739,75 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (cmd === 'reviewer') {
+    // Manage the reviewers attached to a task: each emits its own verdict and
+    // the task passes only when every applicable one passes.
+    guard(file, rest);
+    const run = loadRun(file);
+    const id = flag(rest, 'id');
+    const sub = rest[0] ?? 'list';
+    if (sub === 'list') {
+      if (!id) throw new Error('usage: dag reviewer list --id <task>');
+      const task = run.tasks[id];
+      if (!task) throw new Error(`unknown task ${id}`);
+      const list = [...(task.reviewers ?? [])];
+      if (task.reviewCmd) list.push({ name: 'review', cmd: task.reviewCmd, when: 'always' });
+      emit(rest, list, () =>
+        list.length === 0
+          ? 'no reviewers'
+          : list
+              .map((r) => `${r.name.padEnd(12)} when=${r.when ?? 'always'} verdict=${r.verdict ?? 'default'}\n  ${r.cmd}`)
+              .join('\n'),
+      );
+      return;
+    }
+    if (sub === 'rm' || sub === 'remove') {
+      if (!id) throw new Error('usage: dag reviewer rm --id <task> --name <reviewer>');
+      const name = flag(rest, 'name');
+      if (!name) throw new Error('--name is required');
+      const task = run.tasks[id];
+      if (!task) throw new Error(`unknown task ${id}`);
+      const before = (task.reviewers ?? []).length;
+      task.reviewers = (task.reviewers ?? []).filter((r) => r.name !== name);
+      if (name === 'review' && task.reviewCmd) {
+        task.reviewCmd = null;
+      }
+      saveRun(run, file);
+      emit(rest, { removed: before - (task.reviewers ?? []).length }, () =>
+        `removed reviewer "${name}" from ${id}`,
+      );
+      return;
+    }
+    if (sub === 'add' || sub === 'set') {
+      if (!id) throw new Error('usage: dag reviewer add --id <task> --name N --cmd "..." [--when W] [--verdict v]');
+      const name = flag(rest, 'name');
+      const cmdText = flag(rest, 'cmd');
+      if (!name || !cmdText) throw new Error('--name and --cmd are required');
+      const when = flag(rest, 'when') ?? 'always';
+      const invalid = parseWhen(when).invalid;
+      if (invalid) throw new Error(`unknown --when clause "${invalid}"`);
+      const verdict = flag(rest, 'verdict');
+      if (verdict !== undefined && verdict !== 'marker' && verdict !== 'exit-code') {
+        throw new Error(`--verdict must be marker|exit-code (got ${verdict})`);
+      }
+      const task = run.tasks[id];
+      if (!task) throw new Error(`unknown task ${id}`);
+      const list = (task.reviewers ?? []).filter((r) => r.name !== name);
+      list.push({
+        name,
+        cmd: cmdText,
+        when,
+        ...(verdict ? { verdict: verdict as 'marker' | 'exit-code' } : {}),
+        ...(flag(rest, 'why') ? { why: flag(rest, 'why') } : {}),
+      });
+      task.reviewers = list;
+      saveRun(run, file);
+      emit(rest, task.reviewers, () => `${id}: ${list.length} reviewer(s), added "${name}" (${when})`);
+      return;
+    }
+    throw new Error('usage: dag reviewer add|rm|list --id <task> [--name N] [--cmd C] [--when W] [--verdict v]');
+  }
+
   if (cmd === 'models') {
     const { models, error } = listAgentModels(flag(rest, 'refresh') === '1');
     emit(rest, { models, error }, () =>
@@ -745,45 +816,6 @@ async function main(): Promise<void> {
         : models.length === 0
           ? 'no models reported by opencode'
           : models.join('\n'),
-    );
-    return;
-  }
-
-  if (cmd === 'import-orca') {
-    // Migrate one Orca orchestration run into this project's dag.run.json.
-    guard(file, rest);
-    const runId = flag(rest, 'run');
-    if (!runId) {
-      if (has(rest, 'list')) {
-        const runs = listOrcaRuns(flag(rest, 'db'));
-        emit(rest, runs, () =>
-          runs
-            .map((r) => `${r.id}  ${r.created_at}  ${r.objective.slice(0, 90)}`)
-            .join('\n'),
-        );
-        return;
-      }
-      console.log('usage: dag import-orca --run run_xxxxxxxx [--file dag.run.json]');
-      console.log('       dag import-orca --list      # recent runs in the Orca database');
-      console.log('       [--cmd "opencode run --auto {spec}"] [--only id1,id2]');
-      process.exitCode = 1;
-      return;
-    }
-    const summary = importOrcaRun({
-      runId,
-      file,
-      dbPath: flag(rest, 'db'),
-      cmdTemplate: rest.includes('--cmd') ? (flag(rest, 'cmd') ?? null) : null,
-      only: parseList(flag(rest, 'only')),
-    });
-    emit(
-      rest,
-      summary,
-      () =>
-        `imported ${summary.tasks} task(s), ${summary.edges} dependency edge(s) from ${summary.runId}\n` +
-        `objective: ${summary.objective}\n` +
-        `old statuses: ${JSON.stringify(summary.statuses)}\n` +
-        `saved to ${summary.file}`,
     );
     return;
   }
@@ -877,9 +909,14 @@ async function main(): Promise<void> {
     const patch: Parameters<typeof setTasks>[1] = {};
     if (rest.includes('--cmd')) patch.cmd = flag(rest, 'cmd') ?? null;
     if (rest.includes('--model')) patch.model = flag(rest, 'model') ?? null;
+    if (rest.includes('--reviewers-json')) {
+      const parsed = JSON.parse(flag(rest, 'reviewers-json') ?? '[]') as Reviewer[];
+      patch.reviewers = parsed;
+    }
     if (rest.includes('--variant')) patch.variant = flag(rest, 'variant') ?? null;
     if (rest.includes('--review-cmd')) patch.reviewCmd = flag(rest, 'review-cmd') ?? null;
     if (rest.includes('--plan-cmd')) patch.planCmd = flag(rest, 'plan-cmd') ?? null;
+    if (rest.includes('--prepare-cmd')) patch.prepareCmd = flag(rest, 'prepare-cmd') ?? null;
     if (has(rest, 'clear-review')) patch.reviewCmd = null;
     const reviewRounds = flag(rest, 'review-rounds');
     if (reviewRounds !== undefined) patch.reviewRounds = Number(reviewRounds);
@@ -1019,7 +1056,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log(`lightweight-dag
+  console.log(`DAG Orchestrator
 usage: dag <cmd> [flags]
 
   launch [--all | --dir F ...] [--open] [--auto-resume]
@@ -1049,6 +1086,10 @@ usage: dag <cmd> [flags]
   review --id X --review-cmd "check" [--review-rounds N]
                                attach a reviewer postcondition to a task
   show --id ID                 full task detail incl. review/verdict/logs
+  reviewer list --id ID        reviewers attached to a task
+  reviewer add --id ID --name N --cmd "..." [--when always|on-reject|diff-lines>N|diff-touches:glob]
+      [--verdict marker|exit-code]   each reviewer emits its own verdict
+  reviewer rm --id ID --name N
   set-cmd [--all | --only a,b | --match REGEX] --cmd "harness ... {spec}"
   models [--refresh]            list models available to the agent CLI
   set [--all | --only a,b | --match REGEX]
@@ -1056,8 +1097,6 @@ usage: dag <cmd> [flags]
       [--review-rounds N] [--repair-rounds N] [--retries N] [--timeout SEC]
       [--silence SEC]
                                bulk edit harness / planner / reviewer / repair
-  import-orca --run run_xxx [--list] [--cmd "..."] [--only a,b]
-                               migrate an Orca orchestration run into dag.run.json
   resume                       requeue tasks interrupted by a crash/restart
   skip-blocked                 mark blocked/gated tasks skipped so the run converges
   kill-orphans                 kill process trees left behind by a crash
