@@ -127,16 +127,58 @@ Usable in any task command (`cmd`, `planCmd`, `reviewCmd`):
 | `{depsAll}` `{depsFile}` | transitive roll-up, inline / as a file |
 | `{model}` `{variant}` | effective model/effort: task override → run default; unset removes the flag |
 
-## Multi-project and scheduling
+## One host, many projects
+
+`dag serve` with no `--file` starts a **hub**: one process serving every
+registered project, with a separate URL per run.
 
 ```bash
-dag launch --all --open          # one server + stable port per project
-dag servers | dag servers --stop --all
+dag serve --open                 # hub: index of projects and their runs
+dag serve --file dag.run.json    # focus one run (redirects / to it)
+```
 
+- `/` is an index: projects, their runs (active + archived), status counts,
+  and `New run` / `Add project` buttons.
+- `/r/<runId>` is **one run, scoped end to end** — its graph, queue,
+  inspector, logs and terminals. A run page can never show another run's
+  tasks: every API call is namespaced by that run id.
+- Runs execute independently: one runner per run, its own lock, its own
+  integration branch. A run in progress in one project never blocks another.
+- Archived runs are **read-only history**; the API refuses to start them.
+
+## Run history
+
+Runs live in the project folder, so history travels with the repository:
+
+```
+<project>/dag.run.json + dag.run.d/      the active run
+<project>/dag.runs/<runId>/dag.run.json  archived runs (same shape)
+```
+
+```bash
+dag new-run --objective "next plan"   # archive the active run, start fresh
+dag runs                              # active + archived, with counts
+dag runs show --id run_xxxxxxxx       # where that run lives
+dag runs archive                      # archive without starting a new one
+```
+
+Nothing is stored in a database: an archived run is a directory you can read,
+diff, grep or delete.
+
+## Scheduling
+
+```bash
 dag schedule add --file a/dag.run.json --name a
 dag schedule add --file b/dag.run.json --name b --after a
 dag scheduler                    # runs jobs strictly in order
+```
 
+Prefer one hub process (`dag serve`); `dag launch` remains for the
+one-server-per-project layout with stable ports:
+
+```bash
+dag launch --all --open
+dag servers | dag servers --stop --all
 ```
 
 ## CLI cheat sheet
