@@ -41,8 +41,10 @@ import {
 import { DagRunner } from './runner.js';
 import { startServer } from './server.js';
 import { parseWhen, type Reviewer } from './review-policy.js';
+import { HARNESSES, findHarness, harnessCommands } from './harnesses.js';
 import { activeRunFile, archiveRun, findRun, listRuns, projectOf, startNewRun } from './runs.js';
 import { listAgentModels } from './agent-models.js';
+import { resolveCommand } from './command-resolution.js';
 import { addProject, loadRegistry, projectId, removeProject, resolveRunFile } from './registry.js';
 import {
   launchProject,
@@ -872,7 +874,46 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (cmd === 'harness') {
+    // Presets for driving other agent CLIs, so a task is not tied to one tool.
+    const sub = rest[0] ?? 'list';
+    if (sub === 'show') {
+      const name = flag(rest, 'name') ?? rest[1];
+      const harness = name ? findHarness(name) : undefined;
+      if (!harness) throw new Error(`unknown harness ${name ?? ''}; try: dag harness list`);
+      emit(rest, harness, () => JSON.stringify(harness, null, 2));
+      return;
+    }
+    const rows = HARNESSES.map((h) => ({
+      name: h.name,
+      label: h.label,
+      detected: h.binary ? existsSync(resolveCommand(h.binary).file) : true,
+      verified: h.verified,
+      cmd: h.cmd,
+      notes: h.notes ?? '',
+    }));
+    emit(rest, rows, () =>
+      rows
+        .map(
+          (r) =>
+            `${r.detected ? '[x]' : '[ ]'} ${r.name.padEnd(14)} ${r.label.padEnd(18)} ${r.verified ? 'verified' : 'unverified'}` +
+            (r.cmd ? `\n    ${r.cmd}` : '') +
+            (r.notes ? `\n    ${r.notes}` : ''),
+        )
+        .join('\n'),
+    );
+    return;
+  }
+
   if (cmd === 'models') {
+    const harnessName = flag(rest, 'harness') ?? 'opencode';
+    const harness = findHarness(harnessName);
+    if (harness && !harness.modelListCmd) {
+      emit(rest, { models: [], error: `${harnessName} has no model list command; set --model free-text` }, () =>
+        `${harnessName} has no model list command; set --model free-text`,
+      );
+      return;
+    }
     const { models, error } = listAgentModels(flag(rest, 'refresh') === '1');
     emit(rest, { models, error }, () =>
       error
@@ -972,6 +1013,23 @@ async function main(): Promise<void> {
     const run = loadRun(file);
     const patch: Parameters<typeof setTasks>[1] = {};
     if (rest.includes('--cmd')) patch.cmd = flag(rest, 'cmd') ?? null;
+    const harnessName = flag(rest, 'harness');
+    if (harnessName !== undefined) {
+      const harness = findHarness(harnessName);
+      if (!harness) throw new Error(`unknown harness ${harnessName}; try: dag harness list`);
+      if (!harness.cmd) throw new Error(`harness ${harnessName} has no command preset`);
+      Object.assign(
+        patch,
+        harnessCommands(harness, {
+          withPlan: !has(rest, 'no-plan'),
+          withReview: has(rest, 'with-review'),
+        }),
+      );
+      // Model ids are provider-specific: carrying one across harnesses sends a
+      // name the new tool cannot resolve, so clear it unless set in this call.
+      if (!rest.includes('--model')) patch.model = null;
+      if (!rest.includes('--variant')) patch.variant = null;
+    }
     if (rest.includes('--model')) patch.model = flag(rest, 'model') ?? null;
     if (rest.includes('--reviewers-json')) {
       const parsed = JSON.parse(flag(rest, 'reviewers-json') ?? '[]') as Reviewer[];
@@ -1156,7 +1214,10 @@ usage: dag <cmd> [flags]
       [--verdict marker|exit-code]   each reviewer emits its own verdict
   reviewer rm --id ID --name N
   set-cmd [--all | --only a,b | --match REGEX] --cmd "harness ... {spec}"
-  models [--refresh]            list models available to the agent CLI
+  harness [list|show --name N]  agent CLI presets (opencode, claude, codex, …)
+  models [--harness N] [--refresh]   models available to that agent CLI
+  set --harness NAME            retarget tasks at another agent CLI
+      [--with-review] [--no-plan]
   new-run --objective "..."     archive the active run, start a fresh one
   runs [list] | runs show --id ID | runs archive
   set [--all | --only a,b | --match REGEX]
