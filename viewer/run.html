@@ -652,9 +652,9 @@ function renderQueue() {
       job.current.includes(t.id) ? 'runnow' : '',
     ].filter(Boolean).join(' ');
     const meta = `attempts ${t.attempts}/${t.maxAttempts}${t.failureKind ? ` · ${t.failureKind}` : ''}${t.exitCode !== null && t.exitCode !== undefined ? ` · exit ${t.exitCode}` : ''}${t.reviewRounds > 0 ? ` · rev ${t.reviews}/${t.reviewRounds + 1}` : ''}${t.repairRounds > 0 ? ` · fix ${t.repairs}/${t.repairRounds}` : ''}`;
-    return `<div class="${cls}" data-id="${t.id}">
+    return `<div class="${cls}" data-id="${esc(t.id)}">
       <input type="checkbox" ${checked.has(t.id) ? 'checked' : ''} />
-      <div class="t"><div class="title">${esc(titleOf(t.id))}</div><div class="id">${t.id} · ${meta}</div></div>
+      <div class="t"><div class="title">${esc(titleOf(t.id))}</div><div class="id">${esc(t.id)} · ${meta}</div></div>
       <span class="status st-${t.display}">${t.display}</span>
     </div>`;
   });
@@ -694,7 +694,7 @@ function renderInspector() {
   if (t.failureKind) bits.push(`failure: ${t.failureKind}`);
   if (t.branch) bits.push(`branch: ${t.branch}${t.commit ? ` @ ${t.commit.slice(0, 8)}` : ''}`);
   bits.push('model: ' + (t.model || runModel() || '(none)') + (t.variant ? ' / ' + t.variant : ''));
-  const chain = t.harnessChain || (run && run.settings && run.settings.harnessChain) || [];
+  const chain = t.harnessChain || (def && def.settings && def.settings.harnessChain) || [];
   if (chain.length) {
     const used = chain.findIndex((c) => c.harness === t.harness);
     const tag = (i) => (i === used ? '◀' : '');
@@ -946,10 +946,10 @@ function reviewPanel(t) {
   }
   const rows = live.map((r) => {
     const v = verdicts[r.name];
-    const chip = v ? v.verdict : 'not run';
+    const chip = v ? String(v.verdict) : 'not run';
     const cls = { pass: 'st-ready', fail: 'st-failed', error: 'st-blocked', skipped: 'st-skipped' }[chip] || 'st-pending';
     const note = v && v.reason ? ` — ${esc(v.reason.slice(0, 160))}` : '';
-    return `<div class="rvrow"><span class="status ${cls}">${chip}</span> <b>${esc(r.name)}</b> <span class="rvwhen">${esc(r.when || 'always')}${r.verdict ? ' · ' + esc(r.verdict) : ''}</span><div class="rvcmd">${esc(r.cmd)}${note}</div></div>`;
+    return `<div class="rvrow"><span class="status ${cls}">${esc(chip)}</span> <b>${esc(r.name)}</b> <span class="rvwhen">${esc(r.when || 'always')}${r.verdict ? ' · ' + esc(r.verdict) : ''}</span><div class="rvcmd">${esc(r.cmd)}${note}</div></div>`;
   });
   return `<div class="reviewers">${rows.join('')}</div>`;
 }

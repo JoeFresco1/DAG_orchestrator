@@ -89,9 +89,10 @@ function runRow(row) {
     : row.archived
       ? '<span class="tag archived">archived</span>'
       : '<span class="tag active">active</span>';
-  return `<a class="run" href="/r/${row.runId}">
+  const runId = escapeHtml(row.runId);
+  return `<a class="run" href="/r/${encodeURIComponent(row.runId)}">
     ${tag}
-    <span class="id">${row.runId}</span>
+    <span class="id">${runId}</span>
     <span class="obj">${escapeHtml(row.objective || '(no objective)')}</span>
     <span class="counts">${counts(row)}</span>
     <span class="id">${row.total} tasks</span>

@@ -35,6 +35,9 @@ export interface ScheduleJob {
   finishedAt: string | null;
   exitCode: number | null;
   note: string | null;
+  // Pid of the running `dag run`, so a scheduler that dies can tell whether
+  // its job is still alive when it comes back.
+  pid?: number | null;
 }
 
 export interface ScheduleFile {
@@ -170,6 +173,16 @@ function log(line: string): void {
   console.log(line);
 }
 
+// Signal 0 asks "does this process exist" without touching it.
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export interface SchedulerOptions {
   pollMs?: number;
   once?: boolean;
@@ -187,6 +200,28 @@ export async function runScheduler(opts: SchedulerOptions = {}): Promise<number>
   let child: ChildProcess | null = null;
   let runningId: string | null = null;
   let lastCode = 0;
+
+  // A job left 'running' by a scheduler that died is not running: mark it
+  // failed so its dependents (`--after`) can be decided instead of waiting
+  // forever for a process that no longer exists.
+  {
+    const schedule = loadSchedule();
+    let changed = false;
+    for (const job of schedule.jobs) {
+      if (job.status !== 'running') continue;
+      if (job.pid && pidAlive(job.pid)) continue;
+      job.status = 'failed';
+      job.finishedAt = new Date().toISOString();
+      job.exitCode = null;
+      job.note = job.pid
+        ? `interrupted: pid ${job.pid} is gone (scheduler restarted)`
+        : 'interrupted: scheduler restarted while this job was running';
+      job.pid = null;
+      changed = true;
+      log(`job ${job.id} was left running by a dead scheduler; marked failed`);
+    }
+    if (changed) saveSchedule(schedule);
+  }
 
   const killChild = (): void => {
     if (!child?.pid) return;
@@ -311,6 +346,8 @@ export async function runScheduler(opts: SchedulerOptions = {}): Promise<number>
     if (job) {
       job.status = 'running';
       job.startedAt = new Date().toISOString();
+      // Recorded so a scheduler that dies can tell its job is gone.
+      job.pid = child.pid ?? null;
       saveSchedule(scheduleNow);
     }
     runningId = next.id;

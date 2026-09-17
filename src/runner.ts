@@ -11,7 +11,9 @@ import {
   isGitRepo,
   mergeIntoIntegration,
   removeWorktree,
+  snapshotExcludes,
   worktreeRoot,
+  type SnapshotExcludes,
 } from './git-worktree.js';
 import { depsMet, describeDeps, gateBlocks, isTerminal, topoSort } from './graph.js';
 import { attemptsForChain, planAttempt, type HarnessCandidate } from './harness-chain.js';
@@ -198,25 +200,31 @@ export function resolveHarness(
   let out = cmd;
   out = model
     ? out.replace(/\{model\}/g, model)
-    : out.replace(/(?:-m|--model)\s+\{model\}\s?/g, '');
+    : out.replace(/(?:-m|--model)[=\s]+\{model\}\s?/g, '');
   out = variant
     ? out.replace(/\{variant\}/g, variant)
-    : out.replace(/--variant\s+\{variant\}\s?/g, '');
+    : out.replace(/--variant[=\s]+\{variant\}\s?/g, '');
   return out;
 }
 
 export function renderTokens(token: string, task: Task, ctx?: TokenContext): string {
   if (!token.includes('{')) return token;
-  const rendered = token
-    .replace(/\{id\}/g, task.id)
-    .replace(/\{title\}/g, task.title)
-    .replace(/\{spec\}/g, task.spec ?? '')
-    .replace(/\{plan\}/g, task.plan ?? '(no plan)')
-    .replace(/\{planFile\}/g, ctx?.planFile ?? '')
-    .replace(/\{deps\}/g, ctx?.deps ?? '(no dependencies)')
-    .replace(/\{depsAll\}/g, ctx?.depsAll ?? '(no upstream tasks)')
-    .replace(/\{depsFile\}/g, ctx?.depsFile ?? '')
-    .replace(/\{lastRejection\}/g, task.lastRejection ?? '(none)');
+  const values: Record<string, string> = {
+    id: task.id,
+    title: task.title,
+    spec: task.spec ?? '',
+    plan: task.plan ?? '(no plan)',
+    planFile: ctx?.planFile ?? '',
+    deps: ctx?.deps ?? '(no dependencies)',
+    depsAll: ctx?.depsAll ?? '(no upstream tasks)',
+    depsFile: ctx?.depsFile ?? '',
+    lastRejection: task.lastRejection ?? '(none)',
+  };
+  // One pass, so a token appearing inside an injected value (a spec that
+  // mentions "{deps}") is text, not a substitution.
+  const rendered = token.replace(/\{(\w+)\}/g, (match, name: string) =>
+    name in values ? values[name] : match,
+  );
   // A substituted value that starts with "-" would be read as a CLI flag by
   // the spawned program (yargs/commander print usage and exit 1). A leading
   // newline keeps it a positional without changing what the agent reads.
@@ -350,6 +358,7 @@ export class DagRunner {
   private worktreeBases = new Map<string, string>();
   private integration: { path: string; branch: string } | null = null;
   private repoDir: string | null = null;
+  private excludes: SnapshotExcludes | undefined;
   private landChain: Promise<void> = Promise.resolve();
 
   constructor(
@@ -1234,11 +1243,16 @@ export class DagRunner {
     if (!isGitRepo(repoDir)) {
       throw new Error(`worktree isolation requested but ${repoDir} is not a git repository`);
     }
+    // Keep the run's own artifacts out of the snapshot even when --file points
+    // somewhere other than dag.run.json (the lock holds a live pid).
+    this.excludes = this.opts.file
+      ? snapshotExcludes(this.opts.file, repoDir)
+      : undefined;
     try {
-      const integration = ensureIntegrationWorktree(repoDir, this.state.id);
+      const integration = ensureIntegrationWorktree(repoDir, this.state.id, undefined, this.excludes);
       this.repoDir = repoDir;
       this.integration = { path: integration.path, branch: integration.branch };
-      const dirty = isDirty(repoDir);
+      const dirty = isDirty(repoDir, this.excludes);
       this.log(
         'note',
         null,
@@ -1326,10 +1340,19 @@ export class DagRunner {
       const saved = commitAll(path, `dag: WIP ${taskId} ${task?.title ?? ''} (${why})`);
       if (saved.commit && task) {
         task.commit = saved.commit;
+        // Park the commit on its own ref: the next attempt force-resets the
+        // task branch, which would otherwise leave this work unreachable.
+        if (this.repoDir && this.state.id) {
+          git(this.repoDir, [
+            'update-ref',
+            `refs/dag-salvage/${this.state.id}-${taskId}`,
+            saved.commit,
+          ]);
+        }
         this.log(
           'note',
           taskId,
-          `partial work salvaged to ${task.branch} @ ${saved.commit.slice(0, 8)} (${saved.files} file(s), not merged)`,
+          `partial work salvaged to ${task.branch} @ ${saved.commit.slice(0, 8)} (${saved.files} file(s), not merged; also refs/dag-salvage/${this.state.id}-${taskId})`,
         );
       }
     } catch {

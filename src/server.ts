@@ -70,24 +70,46 @@ function projectDirs(): string[] {
 function runtimeFor(runId: string): RunRuntime | null {
   const existing = runtimes.get(runId);
   if (existing) return existing;
+  const matches: { dir: string; found: NonNullable<ReturnType<typeof findRun>> }[] = [];
   for (const dir of projectDirs()) {
     const found = findRun(dir, runId);
-    if (!found) continue;
-    const rt: RunRuntime = {
-      runId,
-      projectDir: dir,
-      file: found.file,
-      archived: found.archived,
-      runner: null,
-      releaseLock: null,
-      jobStartedAt: null,
-      activeScope: null,
-      starting: false,
-    };
-    runtimes.set(runId, rt);
-    return rt;
+    if (found) matches.push({ dir, found });
   }
-  return null;
+  if (matches.length === 0) return null;
+  // Prefer a live run over archived history; run ids are only unique per
+  // project, so copied repos can share one.
+  const active = matches.filter((m) => !m.found.archived);
+  if (active.length > 1) return null; // ambiguous: the caller reports 409
+  const pick = active[0] ?? matches[0];
+  const rt: RunRuntime = {
+    runId,
+    projectDir: pick.dir,
+    file: pick.found.file,
+    archived: pick.found.archived,
+    runner: null,
+    releaseLock: null,
+    jobStartedAt: null,
+    activeScope: null,
+    starting: false,
+  };
+  runtimes.set(runId, rt);
+  return rt;
+}
+
+// True when a run id resolves to more than one active run across projects.
+function ambiguousRunId(runId: string): string[] {
+  const dirs: string[] = [];
+  for (const dir of projectDirs()) {
+    const found = findRun(dir, runId);
+    if (found && !found.archived) dirs.push(dir);
+  }
+  return dirs;
+}
+
+// A runtime's cached file can go stale: `dag new-run` (or the HTTP route)
+// archives the run and creates a new one at the same path.
+function dropRuntime(runId: string): void {
+  runtimes.delete(runId);
 }
 
 function projectName(dir: string): string {
@@ -102,12 +124,69 @@ function projectName(dir: string): string {
 function readBody(req: import('node:http').IncomingMessage): Promise<string> {
   return new Promise((resolveBody, reject) => {
     let data = '';
-    req.on('data', (c) => {
+    req.on('data', (c: Buffer) => {
       data += c;
+      if (data.length > MAX_BODY_BYTES) {
+        reject(new Error('request body too large'));
+        req.destroy();
+      }
     });
     req.on('end', () => resolveBody(data));
     req.on('error', reject);
   });
+}
+
+const MAX_BODY_BYTES = 1024 * 1024;
+
+// Malformed JSON is the caller's fault, not a server error.
+function parseBody(req: import('node:http').IncomingMessage, raw: string): Record<string, unknown> {
+  const text = raw.trim();
+  if (!text) return {};
+  const type = String(req.headers['content-type'] ?? '');
+  if (!type.includes('application/json')) {
+    throw Object.assign(new Error('content-type must be application/json'), { code: 415 });
+  }
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('body must be a JSON object');
+    }
+    return parsed as Record<string, unknown>;
+  } catch (err) {
+    throw Object.assign(new Error(`invalid JSON body: ${err instanceof Error ? err.message : String(err)}`), {
+      code: 400,
+    });
+  }
+}
+
+// Browsers can reach localhost from any page, and the server can spawn
+// processes (notifyCmd, worktreePrepareCmd). Only accept mutations from our own
+// origin: this blocks CSRF and DNS-rebinding without a token.
+function checkOrigin(req: import('node:http').IncomingMessage, port: number): string | null {
+  const host = String(req.headers.host ?? '');
+  const hostOk =
+    /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(host) ||
+    host === `localhost:${port}` ||
+    host === `127.0.0.1:${port}`;
+  if (!hostOk) return `host not allowed: ${host}`;
+  const origin = req.headers.origin;
+  if (origin) {
+    const ok =
+      origin === `http://localhost:${port}` ||
+      origin === `http://127.0.0.1:${port}` ||
+      origin === `http://[::1]:${port}`;
+    if (!ok) return `origin not allowed: ${origin}`;
+  }
+  return null;
+}
+
+function activeRuntimeForFile(file: string): RunRuntime | null {
+  const target = resolve(file);
+  for (const rt of runtimes.values()) {
+    if (resolve(rt.file) !== target) continue;
+    if (rt.runner?.isRunning || rt.runner?.isStopping || rt.starting) return rt;
+  }
+  return null;
 }
 
 function json(res: import('node:http').ServerResponse, code: number, body: unknown): void {
@@ -237,6 +316,13 @@ async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult
   if (rt.runner?.isRunning || rt.runner?.isStopping || rt.starting) {
     return { started: false, error: 'this run is already in progress', code: 409 };
   }
+  // Another runtime (a stale runId alias) may already be driving this same
+  // file: acquiring the lock below would overwrite the live runner's lock and
+  // leave the file unprotected.
+  const busy = activeRuntimeForFile(rt.file);
+  if (busy && busy !== rt) {
+    return { started: false, error: `run ${busy.runId} is already in progress on this file`, code: 409 };
+  }
   rt.starting = true;
   let lock: (() => void) | null = null;
   try {
@@ -351,6 +437,11 @@ export function startServer(opts: ServeOptions): void {
     try {
       const url = new URL(req.url ?? '/', 'http://localhost');
       const path = url.pathname;
+      const originError = checkOrigin(req, listeningPort);
+      if (originError) {
+        json(res, 403, { error: originError });
+        return;
+      }
 
       // ---- index: projects and their runs ----
       if (path === '/api/runs' && req.method === 'GET') {
@@ -383,14 +474,14 @@ export function startServer(opts: ServeOptions): void {
       }
 
       if (path === '/api/models' && req.method === 'GET') {
-        const { models, error } = listAgentModels(url.searchParams.get('refresh') === '1');
+        const { models, error } = await listAgentModels(url.searchParams.get('refresh') === '1');
         json(res, 200, { models, error, source: 'opencode models' });
         return;
       }
 
       // ---- register a project (and give it a first run if it has none) ----
       if (path === '/api/projects' && req.method === 'POST') {
-        const body = JSON.parse((await readBody(req)) || '{}') as { dir?: string; name?: string };
+        const body = parseBody(req, await readBody(req)) as { dir?: string; name?: string };
         if (!body.dir) {
           json(res, 400, { error: 'dir is required' });
           return;
@@ -409,7 +500,7 @@ export function startServer(opts: ServeOptions): void {
 
       // ---- archive the active run and start a fresh one ----
       if (path === '/api/runs/new' && req.method === 'POST') {
-        const body = JSON.parse((await readBody(req)) || '{}') as { dir?: string; objective?: string };
+        const body = parseBody(req, await readBody(req)) as { dir?: string; objective?: string };
         if (!body.dir) {
           json(res, 400, { error: 'dir is required' });
           return;
@@ -418,6 +509,13 @@ export function startServer(opts: ServeOptions): void {
         const dir = projectOf(entry.file);
         const active = activeRunFile(dir);
         if (existsSync(active)) {
+          // Archiving replaces the run file: doing that under a live runner
+          // (this process's or another's) destroys both runs.
+          const busy = activeRuntimeForFile(active);
+          if (busy) {
+            json(res, 409, { error: `run ${busy.runId} is in progress; stop it before starting a new one` });
+            return;
+          }
           try {
             assertNoForeignLock(active);
           } catch (err) {
@@ -426,9 +524,12 @@ export function startServer(opts: ServeOptions): void {
           }
         }
         const { run, archivedTo } = startNewRun(dir, body.objective ?? entry.name);
-        const rt = runtimeFor(run.id);
+        // The archived run's cached runtime now points at the new file.
+        for (const [id, rt] of runtimes) {
+          if (resolve(rt.file) === resolve(active)) dropRuntime(id);
+        }
+        runtimeFor(run.id);
         json(res, 200, { runId: run.id, archivedTo, project: { name: entry.name, dir } });
-        void rt;
         return;
       }
 
@@ -439,6 +540,13 @@ export function startServer(opts: ServeOptions): void {
         const rest = runMatch[2] ?? '';
         const rt = runtimeFor(runId);
         if (!rt) {
+          const dirs = ambiguousRunId(runId);
+          if (dirs.length > 1) {
+            json(res, 409, {
+              error: `run id ${runId} exists in ${dirs.length} projects (${dirs.join(', ')}); ids are only unique per project`,
+            });
+            return;
+          }
           json(res, 404, { error: `unknown run ${runId}` });
           return;
         }
@@ -473,7 +581,12 @@ export function startServer(opts: ServeOptions): void {
       }
       res.writeHead(404).end('not found');
     } catch (err) {
-      res.writeHead(500).end(err instanceof Error ? err.message : String(err));
+      const code = (err as { code?: number }).code ?? 500;
+      if (code >= 500) {
+        res.writeHead(500).end(err instanceof Error ? err.message : String(err));
+        return;
+      }
+      json(res, code, { error: err instanceof Error ? err.message : String(err) });
     }
   });
 
@@ -556,7 +669,7 @@ export function startServer(opts: ServeOptions): void {
     }
 
     if (rest === '/run/start' && req.method === 'POST') {
-      const body = JSON.parse((await readBody(req)) || '{}') as StartOptions;
+      const body = parseBody(req, await readBody(req)) as unknown as StartOptions;
       const result = await startRun(rt, body);
       json(res, result.started ? 200 : (result.code ?? 400), result);
       return;
@@ -599,7 +712,7 @@ export function startServer(opts: ServeOptions): void {
         json(res, 409, { error: 'stop the run before retrying tasks' });
         return;
       }
-      const body = JSON.parse((await readBody(req)) || '{}') as {
+      const body = parseBody(req, await readBody(req)) as {
         ids?: string[] | null;
         cascade?: boolean;
       };
@@ -609,14 +722,18 @@ export function startServer(opts: ServeOptions): void {
         json(res, 409, { error: err instanceof Error ? err.message : String(err) });
         return;
       }
-      const touched = await mutate(file, (run) => {
-        if (body.ids && body.ids.length > 0) {
-          const out: string[] = [];
-          for (const taskId of body.ids) out.push(...retryTask(run, taskId, body.cascade ?? false));
-          return out;
-        }
-        return retryFailed(run, body.cascade ?? false);
-      });
+      const touched = await mutate(
+        file,
+        (run) => {
+          if (body.ids && body.ids.length > 0) {
+            const out: string[] = [];
+            for (const taskId of body.ids) out.push(...retryTask(run, taskId, body.cascade ?? false));
+            return out;
+          }
+          return retryFailed(run, body.cascade ?? false);
+        },
+        'viewer retry',
+      );
       json(res, 200, { retried: touched });
       return;
     }
@@ -633,7 +750,11 @@ export function startServer(opts: ServeOptions): void {
         json(res, 409, { error: err instanceof Error ? err.message : String(err) });
         return;
       }
-      const skipped = await mutate(file, (run) => [...skipBlocked(run), ...skipGated(run)]);
+      const skipped = await mutate(
+        file,
+        (run) => [...skipBlocked(run), ...skipGated(run)],
+        'viewer skip',
+      );
       json(res, 200, { skipped });
       return;
     }
@@ -650,7 +771,7 @@ export function startServer(opts: ServeOptions): void {
         json(res, 409, { error: err instanceof Error ? err.message : String(err) });
         return;
       }
-      const killed = await mutate(file, (run) => killOrphans(run));
+      const killed = await mutate(file, (run) => killOrphans(run), 'viewer kill-orphans');
       json(res, 200, { killed });
       return;
     }
@@ -689,7 +810,7 @@ export function startServer(opts: ServeOptions): void {
         json(res, 409, { error: `task ${taskId} is running; stop the run first` });
         return;
       }
-      const body = JSON.parse((await readBody(req)) || '{}') as {
+      const body = parseBody(req, await readBody(req)) as {
         status?: Task['status'];
         result?: string | null;
         approved?: boolean | null;
@@ -711,8 +832,13 @@ export function startServer(opts: ServeOptions): void {
         json(res, 200, apply(rt.runner.state));
         saveRun(rt.runner.state, file);
       } else {
-        assertNoForeignLock(file);
-        json(res, 200, await mutate(file, apply));
+        try {
+          assertNoForeignLock(file);
+        } catch (err) {
+          json(res, 409, { error: err instanceof Error ? err.message : String(err) });
+          return;
+        }
+        json(res, 200, await mutate(file, apply, 'viewer edit'));
       }
       return;
     }
@@ -781,7 +907,7 @@ export function startServer(opts: ServeOptions): void {
         continue;
       }
       if (killOrphansOnResume) {
-        const killed = await mutate(rt.file, (run) => killOrphans(run));
+        const killed = await mutate(rt.file, (run) => killOrphans(run), 'serve auto-resume');
         const n = killed.filter((k) => k.killed).length;
         if (n > 0) console.log(`auto-resume: ${projectName(dir)}: killed ${n} orphan(s)`);
       }

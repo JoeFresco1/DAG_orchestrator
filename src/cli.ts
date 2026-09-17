@@ -64,20 +64,51 @@ import {
   type JobArgs,
 } from './scheduler.js';
 import type { DepFailurePolicy, GatePolicy, TaskStatus } from './types.js';
-import { MAX_CONCURRENCY } from './types.js';
+import { MAX_CONCURRENCY, TASK_STATUSES } from './types.js';
 
 const wantsJson = (argv: string[]): boolean => argv.includes('--json');
 const emit = (argv: string[], data: unknown, human: () => string): void => {
   console.log(wantsJson(argv) ? JSON.stringify(data, null, 2) : human());
 };
 
+// A value that looks like another flag means the value is missing. Without
+// this, `set --cmd --file X` stores the literal string "--file" as the command.
 function flag(argv: string[], name: string): string | undefined {
   const i = argv.indexOf(`--${name}`);
-  return i >= 0 ? argv[i + 1] : undefined;
+  if (i < 0) return undefined;
+  const next = argv[i + 1];
+  if (next === undefined || (next.startsWith('--') && next !== '--')) return undefined;
+  return next;
+}
+
+// For flags whose value is required: `--cmd` with nothing after it is a
+// mistake, not a request to clear the field.
+function flagRequired(argv: string[], name: string): string {
+  const v = flag(argv, name);
+  if (v === undefined) throw new Error(`--${name} needs a value`);
+  return v;
+}
+
+// --cmd takes a value: a missing one is a mistake, an empty string an explicit clear.
+function cmdFlag(argv: string[]): string | null | undefined {
+  if (!argv.includes('--cmd')) return undefined;
+  const value = flagRequired(argv, 'cmd');
+  return value.trim() === '' ? null : value;
 }
 
 function has(argv: string[], name: string): boolean {
   return argv.includes(`--${name}`);
+}
+
+// `-n` is not a --flag, so it needs its own reader.
+function shortN(argv: string[]): number | undefined {
+  const i = argv.indexOf('-n');
+  if (i < 0) return undefined;
+  const raw = argv[i + 1];
+  if (raw === undefined || raw.startsWith('-')) throw new Error('-n needs a value');
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) throw new Error(`-n must be an integer >= 0 (got ${raw})`);
+  return n;
 }
 
 function fileOf(argv: string[]): string {
@@ -85,12 +116,11 @@ function fileOf(argv: string[]): string {
 }
 
 function parseList(v: string | undefined): string[] {
-  return v
-    ? v
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean)
-    : [];
+  const seen = new Set<string>();
+  for (const item of v ? v.split(',').map((s) => s.trim()).filter(Boolean) : []) {
+    seen.add(item);
+  }
+  return [...seen];
 }
 
 // CLI accepts seconds; the file stores ms. 0 = no limit.
@@ -99,6 +129,27 @@ function secondsToMs(v: string | undefined): number | undefined {
   const n = Number(v);
   if (!Number.isFinite(n) || n < 0) throw new Error(`invalid seconds value: ${v}`);
   return Math.round(n * 1000);
+}
+
+// Counts and budgets: reject junk instead of silently storing NaN/null.
+function countFlag(argv: string[], name: string, min = 0): number | undefined {
+  const raw = flag(argv, name);
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < min) {
+    throw new Error(`--${name} must be an integer >= ${min} (got ${raw})`);
+  }
+  return n;
+}
+
+function numberFlag(argv: string[], name: string, min = 0): number | undefined {
+  const raw = flag(argv, name);
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < min) {
+    throw new Error(`--${name} must be a number >= ${min} (got ${raw})`);
+  }
+  return n;
 }
 
 function retriesToMaxAttempts(v: string | undefined): number | undefined {
@@ -128,14 +179,14 @@ function taskTimingFlags(argv: string[]): {
   } = {};
   const maxAttempts = retriesToMaxAttempts(flag(argv, 'retries'));
   if (maxAttempts !== undefined) out.maxAttempts = maxAttempts;
-  if (argv.includes('--timeout')) out.timeoutMs = secondsToMs(flag(argv, 'timeout')) ?? 0;
-  if (argv.includes('--silence')) out.silenceMs = secondsToMs(flag(argv, 'silence')) ?? 0;
-  if (argv.includes('--review-cmd')) out.reviewCmd = flag(argv, 'review-cmd') ?? null;
-  if (argv.includes('--plan-cmd')) out.planCmd = flag(argv, 'plan-cmd') ?? null;
-  const reviewRounds = flag(argv, 'review-rounds');
-  if (reviewRounds !== undefined) out.reviewRounds = Math.max(0, Number(reviewRounds));
-  const repairRounds = flag(argv, 'repair-rounds');
-  if (repairRounds !== undefined) out.repairRounds = Math.max(0, Number(repairRounds));
+  if (has(argv, 'timeout')) out.timeoutMs = secondsToMs(flagRequired(argv, 'timeout'));
+  if (has(argv, 'silence')) out.silenceMs = secondsToMs(flagRequired(argv, 'silence'));
+  if (has(argv, 'review-cmd')) out.reviewCmd = flag(argv, 'review-cmd') ?? null;
+  if (has(argv, 'plan-cmd')) out.planCmd = flag(argv, 'plan-cmd') ?? null;
+  const reviewRounds = countFlag(argv, 'review-rounds');
+  if (reviewRounds !== undefined) out.reviewRounds = reviewRounds;
+  const repairRounds = countFlag(argv, 'repair-rounds');
+  if (repairRounds !== undefined) out.repairRounds = repairRounds;
   return out;
 }
 
@@ -181,7 +232,7 @@ async function main(): Promise<void> {
     const s = taskTimingFlags(rest);
     if (s.maxAttempts !== undefined) run.settings.maxAttempts = s.maxAttempts;
     saveRun(run, file);
-    console.log(`${run.id}\nSaved to ${file}`);
+    emit(rest, { runId: run.id, file }, () => `${run.id}\nSaved to ${file}`);
     return;
   }
 
@@ -191,7 +242,7 @@ async function main(): Promise<void> {
     const explicit = flag(rest, 'file');
     startServer({
       file: explicit,
-      port: Number(flag(rest, 'port') ?? 8787),
+      port: countFlag(rest, 'port', 1) ?? 8787,
       autoResume: has(rest, 'auto-resume'),
       killOrphansOnResume: has(rest, 'kill-orphans'),
       open: has(rest, 'open'),
@@ -281,7 +332,7 @@ async function main(): Promise<void> {
   if (cmd === 'schedule' || cmd === 'scheduler') {
     if (cmd === 'scheduler') {
       const code = await runScheduler({
-        pollMs: Number(flag(rest, 'poll') ?? 5) * 1000,
+        pollMs: (numberFlag(rest, 'poll', 0.1) ?? 5) * 1000,
         once: has(rest, 'once'),
         drain: has(rest, 'drain'),
         watch: has(rest, 'watch'),
@@ -303,7 +354,7 @@ async function main(): Promise<void> {
       if (timeout !== undefined) args.timeout = Number(timeout);
       const silence = flag(rest, 'silence');
       if (silence !== undefined) args.silence = Number(silence);
-      const maxHours = flag(rest, 'max-hours');
+      const maxHours = numberFlag(rest, 'max-hours', 0);
       if (maxHours !== undefined) args.maxHours = Number(maxHours);
       const onDepFailure = flag(rest, 'on-dep-failure');
       if (onDepFailure !== undefined) args.onDepFailure = onDepFailure;
@@ -397,16 +448,21 @@ async function main(): Promise<void> {
     guard(file, rest);
     const run = loadRun(file);
     const patch: Parameters<typeof setSettings>[1] = {};
-    const concurrency = flag(rest, 'concurrency');
-    if (concurrency !== undefined) patch.concurrency = Number(concurrency);
+    const concurrency = countFlag(rest, 'concurrency', 1);
+    if (concurrency !== undefined) {
+      if (concurrency > MAX_CONCURRENCY) {
+        throw new Error(`--concurrency max is ${MAX_CONCURRENCY}`);
+      }
+      patch.concurrency = concurrency;
+    }
     const maxAttempts = retriesToMaxAttempts(flag(rest, 'retries'));
     if (maxAttempts !== undefined) patch.maxAttempts = maxAttempts;
     const timeoutMs = secondsToMs(flag(rest, 'timeout'));
     if (timeoutMs !== undefined) patch.timeoutMs = timeoutMs;
     const silenceMs = secondsToMs(flag(rest, 'silence'));
     if (silenceMs !== undefined) patch.silenceMs = silenceMs;
-    const maxHours = flag(rest, 'max-hours');
-    if (maxHours !== undefined) patch.maxWallClockMs = Math.round(Number(maxHours) * 3600_000);
+    const maxHours = numberFlag(rest, 'max-hours', 0);
+    if (maxHours !== undefined) patch.maxWallClockMs = Math.round(maxHours * 3600_000);
     const notify = flag(rest, 'notify');
     if (notify !== undefined) patch.notifyCmd = notify;
     const worktree = flag(rest, 'worktree');
@@ -435,6 +491,11 @@ async function main(): Promise<void> {
     const variant = flag(rest, 'variant');
     if (variant !== undefined) patch.variant = variant;
     Object.assign(patch, policyFlags(rest));
+    if (Object.keys(patch).length === 0) {
+      throw new Error(
+        'nothing to set; use --concurrency, --retries, --timeout, --silence, --max-hours, --worktree, --model, ...',
+      );
+    }
     const settings = setSettings(run, patch);
     saveRun(run, file);
     console.log(JSON.stringify(settings, null, 2));
@@ -444,8 +505,10 @@ async function main(): Promise<void> {
   if (cmd === 'run') {
     guard(file, rest);
     const run = loadRun(file);
-    const concurrency = Number(flag(rest, 'concurrency') ?? run.settings.concurrency);
-    run.settings.concurrency = Math.min(MAX_CONCURRENCY, Math.max(1, concurrency));
+    const requested = countFlag(rest, 'concurrency', 1) ?? run.settings.concurrency;
+    if (requested > MAX_CONCURRENCY) throw new Error(`--concurrency max is ${MAX_CONCURRENCY}`);
+    const concurrency = Math.max(1, requested);
+    run.settings.concurrency = concurrency;
     if (concurrency > MAX_CONCURRENCY) {
       console.log(`concurrency capped at ${MAX_CONCURRENCY}`);
     }
@@ -468,7 +531,7 @@ async function main(): Promise<void> {
       run.settings.silenceMs = timing.silenceMs;
     }
     Object.assign(run.settings, policyFlags(rest));
-    const maxHours = flag(rest, 'max-hours');
+    const maxHours = numberFlag(rest, 'max-hours', 0);
     if (maxHours !== undefined) run.settings.maxWallClockMs = Math.round(Number(maxHours) * 3600_000);
     const worktree = flag(rest, 'worktree');
     if (worktree !== undefined) {
@@ -513,6 +576,9 @@ async function main(): Promise<void> {
       console.log(`skipping ${manual.length} manual task(s) without cmd: ${manual.join(', ')}`);
     }
     if (has(rest, 'kill-orphans')) {
+      // Recover first: only then do the crashed run's tasks carry the pids we
+      // are about to kill (and the runner's own recovery pass is idempotent).
+      recoverInterrupted(run);
       const killed = killOrphans(run);
       const n = killed.filter((k) => k.killed).length;
       if (n > 0) console.log(`killed ${n} orphan process(es)`);
@@ -523,7 +589,10 @@ async function main(): Promise<void> {
       persist: (state) => saveRun(state, file),
       onEvent: (ev) => {
         const where = ev.taskId ? `${ev.taskId} ` : '';
-        console.log(`[${ev.ts.slice(11, 19)}] ${ev.type.padEnd(12)} ${where}${ev.message}`);
+        // Progress goes to stderr under --json so stdout stays parseable.
+        const line = `[${ev.ts.slice(11, 19)}] ${ev.type.padEnd(12)} ${where}${ev.message}`;
+        if (wantsJson(rest)) console.error(line);
+        else console.log(line);
       },
     });
     const onSignal = (): void => {
@@ -548,11 +617,17 @@ async function main(): Promise<void> {
       },
       () => summarize(run),
     );
-    if (!wantsJson(rest)) console.log(summarize(run));
     if (summary && summary.budgetReached) {
       console.log('note: wall clock budget reached before finishing');
     }
-    if ((summary?.failed.length ?? 0) > 0 || (summary?.unfinished.length ?? 0) > 0) {
+    if (!summary) {
+      // The runner refused to start (isolation unavailable, bad graph): say so
+      // and fail, because a scheduler treats exit 0 as success.
+      console.error('run did not start; nothing was executed');
+      process.exitCode = 1;
+      return;
+    }
+    if (summary.failed.length > 0 || summary.unfinished.length > 0) {
       process.exitCode = 1;
     }
     return;
@@ -624,7 +699,7 @@ async function main(): Promise<void> {
       title,
       spec,
       deps: parseList(flag(rest, 'deps')),
-      cmd: flag(rest, 'cmd') ?? null,
+      cmd: cmdFlag(rest) ?? null,
       ...taskTimingFlags(rest),
     });
     saveRun(run, file);
@@ -640,18 +715,33 @@ async function main(): Promise<void> {
     const patch: Parameters<typeof editTask>[2] = {};
     const title = flag(rest, 'title');
     const spec = flag(rest, 'spec');
-    const cmdV = rest.includes('--cmd') ? (flag(rest, 'cmd') ?? null) : undefined;
+    const cmdV = cmdFlag(rest);
     const status = flag(rest, 'status') as TaskStatus | undefined;
     if (title !== undefined) patch.title = title;
     if (spec !== undefined) patch.spec = spec;
     if (cmdV !== undefined) patch.cmd = cmdV;
-    if (status !== undefined) patch.status = status;
+    if (status !== undefined) {
+      if (!TASK_STATUSES.includes(status)) {
+        throw new Error(`--status must be one of ${TASK_STATUSES.join('|')} (got ${status})`);
+      }
+      patch.status = status;
+    }
     if (has(rest, 'clear-deps')) patch.deps = [];
-    else if (rest.includes('--deps')) patch.deps = parseList(flag(rest, 'deps'));
+    else if (rest.includes('--deps')) patch.deps = parseList(flagRequired(rest, 'deps'));
     const timing = taskTimingFlags(rest);
     if (timing.maxAttempts !== undefined) patch.maxAttempts = timing.maxAttempts;
     if (timing.timeoutMs !== undefined) patch.timeoutMs = timing.timeoutMs;
     if (timing.silenceMs !== undefined) patch.silenceMs = timing.silenceMs;
+    // These four are documented on `edit`; they used to be parsed and dropped.
+    if (timing.reviewCmd !== undefined) patch.reviewCmd = timing.reviewCmd;
+    if (timing.planCmd !== undefined) patch.planCmd = timing.planCmd;
+    if (timing.reviewRounds !== undefined) patch.reviewRounds = timing.reviewRounds;
+    if (timing.repairRounds !== undefined) patch.repairRounds = timing.repairRounds;
+    if (Object.keys(patch).length === 0) {
+      throw new Error(
+        'nothing to edit; use --title, --spec, --cmd, --deps, --status, --model, --review-cmd, ...',
+      );
+    }
     const task = editTask(run, id, patch);
     saveRun(run, file);
     console.log(`${task.id} ${task.status} deps=[${task.deps.join(',')}] attempts=${task.attempts}/${task.maxAttempts}`);
@@ -665,14 +755,14 @@ async function main(): Promise<void> {
     if (!id) throw new Error('--id is required');
     removeTask(run, id);
     saveRun(run, file);
-    console.log(`removed ${id}`);
+    emit(rest, { removed: id }, () => `removed ${id}`);
     return;
   }
 
   if (cmd === 'list') {
     const run = loadRun(file);
     const only = flag(rest, 'status');
-    const limit = Number(flag(rest, 'limit') ?? 0);
+    const limit = countFlag(rest, 'limit', 0) ?? 0;
     const rows = topoSort(run)
       .map((t) => ({
         id: t.id,
@@ -788,14 +878,15 @@ async function main(): Promise<void> {
       const task = run.tasks[id];
       if (!task) throw new Error(`unknown task ${id}`);
       const before = (task.reviewers ?? []).length;
+      const legacyCleared = name === 'review' && Boolean(task.reviewCmd);
       task.reviewers = (task.reviewers ?? []).filter((r) => r.name !== name);
-      if (name === 'review' && task.reviewCmd) {
-        task.reviewCmd = null;
+      if (legacyCleared) task.reviewCmd = null;
+      const removed = before - (task.reviewers ?? []).length;
+      if (removed === 0 && !legacyCleared) {
+        throw new Error(`no reviewer named "${name}" on ${id}`);
       }
       saveRun(run, file);
-      emit(rest, { removed: before - (task.reviewers ?? []).length }, () =>
-        `removed reviewer "${name}" from ${id}`,
-      );
+      emit(rest, { removed }, () => `removed reviewer "${name}" from ${id}`);
       return;
     }
     if (sub === 'add' || sub === 'set') {
@@ -927,7 +1018,7 @@ async function main(): Promise<void> {
       );
       return;
     }
-    const { models, error } = listAgentModels(flag(rest, 'refresh') === '1');
+    const { models, error } = await listAgentModels(flag(rest, 'refresh') === '1');
     emit(rest, { models, error }, () =>
       error
         ? `could not list models: ${error}`
@@ -980,7 +1071,7 @@ async function main(): Promise<void> {
       const rounds = flag(rest, 'review-rounds');
       const task = editTask(run, attachTo, {
         reviewCmd,
-        reviewRounds: rounds !== undefined ? Number(rounds) : 1,
+        reviewRounds: rounds !== undefined ? countFlag(rest, 'review-rounds', 0) ?? 1 : 1,
       });
       saveRun(run, file);
       emit(rest, task, () => `${task.id} reviewCmd set (rounds ${task.reviewRounds})`);
@@ -1007,8 +1098,8 @@ async function main(): Promise<void> {
       timeoutMs: secondsToMs(flag(rest, 'timeout')) ?? null,
       silenceMs: secondsToMs(flag(rest, 'silence')) ?? null,
       reviewCmd: rest.includes('--review-cmd') ? (flag(rest, 'review-cmd') ?? null) : null,
-      reviewRounds: Number(flag(rest, 'review-rounds') ?? 0),
-      repairRounds: repairRounds !== undefined ? Number(repairRounds) : 1,
+      reviewRounds: countFlag(rest, 'review-rounds', 0) ?? 0,
+      repairRounds: repairRounds !== undefined ? countFlag(rest, 'repair-rounds', 0) ?? 1 : 1,
     });
     saveRun(run, file);
     emit(
@@ -1025,7 +1116,7 @@ async function main(): Promise<void> {
     guard(file, rest);
     const run = loadRun(file);
     const patch: Parameters<typeof setTasks>[1] = {};
-    if (rest.includes('--cmd')) patch.cmd = flag(rest, 'cmd') ?? null;
+    if (rest.includes('--cmd')) patch.cmd = cmdFlag(rest) ?? null;
     const chainText = flag(rest, 'harness-chain');
     if (chainText !== undefined) {
       patch.harnessChain = chainText ? parseHarnessChain(chainText) : null;
@@ -1059,10 +1150,10 @@ async function main(): Promise<void> {
     if (rest.includes('--plan-cmd')) patch.planCmd = flag(rest, 'plan-cmd') ?? null;
     if (rest.includes('--prepare-cmd')) patch.prepareCmd = flag(rest, 'prepare-cmd') ?? null;
     if (has(rest, 'clear-review')) patch.reviewCmd = null;
-    const reviewRounds = flag(rest, 'review-rounds');
-    if (reviewRounds !== undefined) patch.reviewRounds = Number(reviewRounds);
+    const reviewRounds = countFlag(rest, 'review-rounds', 0);
+    if (reviewRounds !== undefined) patch.reviewRounds = reviewRounds;
     const repairRounds = flag(rest, 'repair-rounds');
-    if (repairRounds !== undefined) patch.repairRounds = Number(repairRounds);
+    if (repairRounds !== undefined) patch.repairRounds = countFlag(rest, 'repair-rounds', 0);
     const maxAttempts = retriesToMaxAttempts(flag(rest, 'retries'));
     if (maxAttempts !== undefined) patch.maxAttempts = maxAttempts;
     const timeoutMs = secondsToMs(flag(rest, 'timeout'));
@@ -1102,7 +1193,7 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'log') {
-    const n = Number(flag(rest, 'n') ?? 40);
+    const n = shortN(rest) ?? countFlag(rest, 'lines', 0) ?? 40;
     const events = readEventLog(file, n);
     emit(rest, events, () =>
       events
@@ -1130,7 +1221,7 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'gc') {
-    const days = Number(flag(rest, 'days') ?? 7);
+    const days = numberFlag(rest, 'days', 0) ?? 7;
     const cutoff = Date.now() - days * 24 * 3600_000;
     const paths = runPaths(file);
     let removed = 0;
@@ -1154,7 +1245,7 @@ async function main(): Promise<void> {
     } catch {
       // no rotated log
     }
-    console.log(`removed ${removed} file(s) older than ${days} day(s)`);
+    emit(rest, { removed, days }, () => `removed ${removed} file(s) older than ${days} day(s)`);
     return;
   }
 
@@ -1165,9 +1256,9 @@ async function main(): Promise<void> {
     const question = flag(rest, 'question');
     if (!id || !question) throw new Error('--id and --question are required');
     const options = parseList(flag(rest, 'options'));
-    setGate(run, id, question, options.length > 0 ? options : ['approved', 'rejected']);
+    const gate = setGate(run, id, question, options.length > 0 ? options : ['approved', 'rejected']);
     saveRun(run, file);
-    console.log(`gate set on ${id}`);
+    emit(rest, { id, gate }, () => `gate set on ${id}`);
     return;
   }
 
@@ -1176,24 +1267,22 @@ async function main(): Promise<void> {
     const run = loadRun(file);
     const id = flag(rest, 'id');
     if (!id) throw new Error('--id is required');
-    resolveGate(run, id, cmd === 'approve');
+    const resolved = resolveGate(run, id, cmd === 'approve');
     saveRun(run, file);
-    console.log(`${id} ${cmd}d`);
+    emit(rest, { id, resolved }, () => `${id} ${cmd}d`);
     return;
   }
 
   if (cmd === 'dot') {
     const run = loadRun(file);
-    console.log(`digraph "${run.id}" {`);
-    console.log(`  label="${run.objective.replace(/"/g, "'")}";`);
+    const lines = [`digraph "${run.id}" {`, `  label="${run.objective.replace(/"/g, "'")}";`];
     for (const t of Object.values(run.tasks)) {
       const display = deriveStatus(run, t);
-      console.log(
-        `  "${t.id}" [label="${t.id}\\n${t.title.replace(/"/g, "'")}\\n${display}"];`,
-      );
-      for (const d of t.deps) console.log(`  "${d}" -> "${t.id}";`);
+      lines.push(`  "${t.id}" [label="${t.id}\\n${t.title.replace(/"/g, "'")}\\n${display}"];`);
+      for (const d of t.deps) lines.push(`  "${d}" -> "${t.id}";`);
     }
-    console.log('}');
+    lines.push('}');
+    emit(rest, { dot: lines.join('\n') }, () => lines.join('\n'));
     return;
   }
 

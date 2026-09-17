@@ -227,7 +227,7 @@ vis-network; nothing is fetched from the network.
 ## Tests
 
 ```bash
-pnpm test        # 82 tests: graph semantics, scheduling, watchdogs, retries,
+pnpm test        # 93 tests: graph semantics, scheduling, watchdogs, retries,
                  # review/verdict protocol, worktree isolation + conflicts,
                  # harness chains + fallback, locks, recovery, migration
 ```

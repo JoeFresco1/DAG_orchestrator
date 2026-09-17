@@ -6,6 +6,15 @@ export type TaskStatus =
   | 'failed'
   | 'skipped';
 
+export const TASK_STATUSES: TaskStatus[] = [
+  'pending',
+  'ready',
+  'running',
+  'completed',
+  'failed',
+  'skipped',
+];
+
 export type TerminalStatus = 'completed' | 'failed' | 'skipped';
 
 // What the UI/CLI show: real status plus two derived states.

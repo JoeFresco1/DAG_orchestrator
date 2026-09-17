@@ -18,6 +18,7 @@ import {
   readEventLog,
   readLock,
   recordHeartbeat,
+  orphanedPids,
   recoverInterrupted,
   removeTask,
   retryFailed,
@@ -45,6 +46,7 @@ import {
   mergeIntoIntegration,
   removeWorktree,
   snapshotCommit,
+  snapshotExcludes,
 } from './git-worktree.js';
 import { addProject, loadRegistry, projectId, removeProject } from './registry.js';
 import { addJob, decideDue, jobArgsToArgv, loadSchedule, parseAt, removeJob, retryJob } from './scheduler.js';
@@ -452,7 +454,67 @@ describe('hardening', () => {
     assert.deepEqual(recovery.orphanPids, [999999]);
     assert.equal(reloaded.tasks[a.id].status, 'pending');
     assert.equal(reloaded.tasks[a.id].failureKind, 'interrupted');
+    // The pid is forgotten, or a later kill-orphans would tree-kill whatever
+    // process the OS handed that pid to next.
+    assert.equal(reloaded.tasks[a.id].pid, null);
     assert.equal(reloaded.tasks[b.id].status, 'completed');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('treats every recorded pid as an orphan once we own the file', () => {
+    const run = newRun('orphans');
+    const a = addTask(run, { title: 'a', spec: '', cmd: 'true' });
+    const b = addTask(run, { title: 'b', spec: '', cmd: 'true' });
+    run.tasks[a.id].status = 'running';
+    run.tasks[a.id].pid = 111;
+    run.tasks[b.id].status = 'failed';
+    run.tasks[b.id].pid = 222;
+    // A caller that got past the lock owns the file: nothing here is alive.
+    assert.deepEqual(orphanedPids(run).sort(), [111, 222]);
+  });
+
+  it('does not write or bump rev when a save changes nothing', () => {
+    const dir = tempDir();
+    const file = join(dir, 'run.json');
+    const run = newRun('noop');
+    addTask(run, { title: 'a', spec: '', cmd: 'true' });
+    saveRun(run, file);
+    const statePath = runPaths(file).state;
+    const before = readFileSync(statePath, 'utf8');
+    const rev = loadRun(file).rev;
+    const reloaded = loadRun(file);
+    saveRun(reloaded, file);
+    assert.equal(readFileSync(statePath, 'utf8'), before, 'state file untouched');
+    assert.equal(loadRun(file).rev, rev, 'rev unchanged');
+    // A real change still writes.
+    reloaded.tasks[Object.keys(reloaded.tasks)[0]].status = 'completed';
+    saveRun(reloaded, file);
+    assert.equal(loadRun(file).rev, rev + 1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('migrates a legacy event log once, not on every read', () => {
+    const dir = tempDir();
+    const file = join(dir, 'legacy2.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        storageVersion: 1,
+        id: 'run_legacy2',
+        objective: 'old',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        tasks: {},
+        events: [{ ts: '2026-01-01T00:00:00.000Z', type: 'task-done', taskId: 'x', message: 'done' }],
+      }),
+      'utf8',
+    );
+    loadRun(file);
+    loadRun(file);
+    loadRun(file);
+    const lines = readFileSync(runPaths(file).events, 'utf8').trim().split('\n').filter(Boolean);
+    assert.equal(lines.length, 1, `one copy of the legacy event (got ${lines.length})`);
+    assert.ok(existsSync(runPaths(file).state), 'migration records itself in state.json');
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -682,6 +744,104 @@ describe('worktree isolation', () => {
     }
   });
 
+  it('re-attaches a worktree whose registration outlived a hard kill', () => {
+    const repo = gitRepo();
+    try {
+      const integration = ensureIntegrationWorktree(repo, 'run_kill');
+      const task = createTaskWorktree(repo, 'run_kill', 'task_wip', integration.branch);
+      writeFileSync(join(task.path, 'wip.txt'), 'agent work\n');
+      // A hard kill (power loss, taskkill /F) leaves the directory gone but the
+      // registration in .git/worktrees: the next add used to fail with
+      // "cannot force update the branch ... used by worktree".
+      rmSync(task.path, { recursive: true, force: true });
+      assert.match(git(repo, ['worktree', 'list']).stdout, /task_wip/);
+      const again = createTaskWorktree(repo, 'run_kill', 'task_wip', integration.branch);
+      assert.ok(existsSync(join(again.path, '.git')));
+      rmSync(integration.path, { recursive: true, force: true });
+      const integration2 = ensureIntegrationWorktree(repo, 'run_kill');
+      assert.ok(existsSync(join(integration2.path, '.git')));
+      removeWorktree(repo, again.path);
+      removeWorktree(repo, integration2.path);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('works in a repo that has no commits yet', () => {
+    const dir = tempDir();
+    try {
+      git(dir, ['init', '-q']);
+      writeFileSync(join(dir, 'first.txt'), 'no commits yet\n');
+      const snapshot = snapshotCommit(dir);
+      assert.ok(snapshot, 'snapshot of an unborn HEAD');
+      assert.equal(git(dir, ['show', `${snapshot}:first.txt`]).stdout, 'no commits yet');
+      const integration = ensureIntegrationWorktree(dir, 'run_unborn');
+      const task = createTaskWorktree(dir, 'run_unborn', 'task_first', integration.branch);
+      assert.ok(existsSync(join(task.path, 'first.txt')));
+      removeWorktree(dir, task.path);
+      removeWorktree(dir, integration.path);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps run artifacts out of the snapshot for any --file name', () => {
+    const repo = gitRepo();
+    try {
+      mkdirSync(join(repo, 'sub'), { recursive: true });
+      const runFile = join(repo, 'sub', 'myrun.json');
+      writeFileSync(runFile, '{}\n');
+      writeFileSync(`${runFile}.lock`, '{"pid":1234}\n');
+      mkdirSync(join(repo, 'sub', 'myrun.d', 'logs'), { recursive: true });
+      writeFileSync(join(repo, 'sub', 'myrun.d', 'state.json'), '{}\n');
+      mkdirSync(join(repo, 'dag.runs', 'run_old'), { recursive: true });
+      writeFileSync(join(repo, 'dag.runs', 'run_old', 'dag.run.json'), '{}\n');
+      writeFileSync(join(repo, 'sub', 'dirty.txt'), 'work\n');
+      writeFileSync(join(repo, 'root-dirty.txt'), 'work\n');
+      const excludes = snapshotExcludes(runFile, repo);
+      const commit = snapshotCommit(repo, excludes);
+      const tree = git(repo, ['ls-tree', '-r', '--name-only', commit]).stdout.split('\n');
+      assert.ok(!tree.some((p) => /myrun|dag\.runs/.test(p)), tree.join(' '));
+      // The snapshot is repo-wide, not limited to the run file's directory.
+      assert.ok(tree.includes('root-dirty.txt'), tree.join(' '));
+      assert.ok(tree.includes('sub/dirty.txt'), tree.join(' '));
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores the user\'s git hooks when committing agent work', () => {
+    const repo = gitRepo();
+    try {
+      const integration = ensureIntegrationWorktree(repo, 'run_hooks');
+      const task = createTaskWorktree(repo, 'run_hooks', 'task_h', integration.branch);
+      mkdirSync(join(repo, '.git', 'hooks'), { recursive: true });
+      writeFileSync(join(repo, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\nexit 1\n');
+      writeFileSync(join(repo, '.git', 'hooks', 'commit-msg'), '#!/bin/sh\nexit 1\n');
+      writeFileSync(join(task.path, 'valuable.txt'), 'agent output\n');
+      const saved = commitAll(task.path, 'dag: test');
+      assert.ok(saved.commit, 'the work is committed even with failing hooks');
+      assert.equal(git(task.path, ['show', `${saved.commit}:valuable.txt`]).stdout, 'agent output');
+      removeWorktree(repo, task.path);
+      removeWorktree(repo, integration.path);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('never deletes a directory git does not list as a worktree', () => {
+    const repo = gitRepo();
+    try {
+      const plain = join(repo, 'plain-dir');
+      mkdirSync(plain, { recursive: true });
+      writeFileSync(join(plain, 'user-data.txt'), 'keep\n');
+      removeWorktree(repo, plain);
+      assert.ok(existsSync(join(plain, 'user-data.txt')));
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
   it('task branches never collide with the integration branch ref', () => {
     const repo = gitRepo();
     try {
@@ -768,6 +928,38 @@ describe('reviewer panel', () => {
     // No diff measurable (no worktree isolation): gates run rather than open.
     const unknown = decideReviewers(reviewers, null, false);
     assert.deepEqual(unknown.map((d) => d.run), [true, true, true, false]);
+  });
+
+  it('ands every when clause instead of stopping at the first match', () => {
+    const both = decideReviewers(
+      [{ name: 'r', cmd: 'c', when: 'diff-lines>10;diff-touches:src/**' }],
+      { lines: 50, files: ['docs/readme.md'] },
+      false,
+    )[0];
+    assert.equal(both.run, false, both.reason);
+    const neither = decideReviewers(
+      [{ name: 'r', cmd: 'c', when: 'on-reject;diff-lines>1000' }],
+      { lines: 3, files: ['a.ts'] },
+      true,
+    )[0];
+    assert.equal(neither.run, false, neither.reason);
+    const ok = decideReviewers(
+      [{ name: 'r', cmd: 'c', when: 'diff-lines>10;diff-touches:src/**' }],
+      { lines: 50, files: ['src/app.ts'] },
+      false,
+    )[0];
+    assert.equal(ok.run, true, ok.reason);
+    // `always` inside a combined clause is not an unknown condition.
+    assert.equal(parseWhen('always;diff-lines>10').invalid, null);
+  });
+
+  it('globs do not let ** swallow part of a file name', () => {
+    assert.equal(globMatches('**/foo.ts', 'barfoo.ts'), false);
+    assert.equal(globMatches('src/**/x.ts', 'src/ax.ts'), false);
+    assert.equal(globMatches('src/**/x.ts', 'src/x.ts'), true);
+    assert.equal(globMatches('src/**/x.ts', 'src/a/b/x.ts'), true);
+    assert.equal(globMatches('src/**/*.ts', 'src/a/b/c.ts'), true);
+    assert.equal(globMatches('*.ts', 'src/a.ts'), false);
   });
 
   it('passes only when every applicable reviewer passes', async () => {
@@ -1457,6 +1649,18 @@ describe('reviewer agents and integration repair', () => {
     assert.ok(!/\{model\}|\{variant\}/.test(bare));
     // Literal commands without tokens are untouched.
     assert.equal(resolveHarness('node -p 1', task, {}), 'node -p 1');
+    // The `--model={model}` spelling is dropped too.
+    assert.equal(resolveHarness('agent --model={model} {spec}', task, {}), 'agent {spec}');
+    assert.equal(resolveHarness('agent --variant={variant} {spec}', task, {}), 'agent {spec}');
+  });
+
+  it('substitutes tokens in one pass, so injected text is not re-rendered', () => {
+    const run = newRun('tokens');
+    const task = addTask(run, { title: 'title', spec: 'read {deps} then stop' });
+    const rendered = renderTokens('{spec}', task, { deps: 'D1' } as never);
+    assert.equal(rendered, 'read {deps} then stop');
+    assert.equal(renderTokens('{nope}', task), '{nope}');
+    assert.equal(renderTokens('{id}', task), task.id);
   });
 
   it('drops the flag and its value when no model is configured', async () => {

@@ -277,6 +277,12 @@ export function assertNoForeignLock(file: string, force = false): void {
   if (cur) throw new Error(lockedMessage(cur));
 }
 
+// Synchronous sleep for the lock loop: acquireLock is called from sync code,
+// and the wait only happens while another process is mid-write.
+function syncSleep(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 export function acquireLock(file: string, note: string, force = false): () => void {
   const paths = runPaths(file);
   mkdirSync(dirname(paths.lock), { recursive: true });
@@ -286,27 +292,45 @@ export function acquireLock(file: string, note: string, force = false): () => vo
     startedAt: new Date().toISOString(),
     note,
   };
-  for (let attempt = 0; attempt < 3; attempt++) {
+  let held = false;
+  // A lock file exists but reads as nothing: another process may be between
+  // creating it and filling it in. Wait before treating it as garbage — but
+  // not forever, because an empty lock left by a crash must still be stealable.
+  let emptySince: number | null = null;
+  for (let attempt = 0; attempt < 60 && !held; attempt++) {
     try {
       writeFileSync(paths.lock, `${JSON.stringify(mine, null, 2)}\n`, { flag: 'wx' });
+      held = true;
       break;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-      const cur = readLock(file);
-      if (!cur) {
-        rmSync(paths.lock, { force: true }); // unreadable lock: replace
+    }
+    const cur = readLock(file);
+    if (!cur) {
+      if (emptySince === null) emptySince = Date.now();
+      if (Date.now() - emptySince < 1000) {
+        syncSleep(25);
         continue;
       }
-      if (cur.pid === process.pid) {
-        writeFileSync(paths.lock, `${JSON.stringify(mine, null, 2)}\n`);
-        break;
-      }
-      const stale = cur.host === hostname() && !isProcessAlive(cur.pid);
-      if (!stale && !force) {
-        throw new Error(lockedMessage(cur));
-      }
       rmSync(paths.lock, { force: true });
+      continue;
     }
+    emptySince = null;
+    if (cur.pid === process.pid) {
+      writeFileSync(paths.lock, `${JSON.stringify(mine, null, 2)}\n`);
+      held = true;
+      break;
+    }
+    const stale = cur.host === hostname() && !isProcessAlive(cur.pid);
+    if (!stale && !force) {
+      throw new Error(lockedMessage(cur));
+    }
+    rmSync(paths.lock, { force: true });
+  }
+  if (!held) {
+    // Never return a release function for a lock we do not hold: callers treat
+    // this return value as ownership.
+    throw new Error(`could not acquire the run lock at ${paths.lock} (contended)`);
   }
   return () => {
     const cur = readLock(file);
@@ -352,6 +376,16 @@ function stateOf(run: Run): Record<string, unknown> {
 }
 
 const lastDefinitionJson = new Map<string, string>();
+const lastStateJson = new Map<string, string>();
+
+// State without the fields that change on every write, for "did anything
+// actually change" comparisons.
+function stateContent(run: Run): string {
+  const state = stateOf(run);
+  delete state.updatedAt;
+  delete state.rev;
+  return JSON.stringify(state);
+}
 
 export function newRun(objective: string): Run {
   const now = new Date().toISOString();
@@ -396,7 +430,7 @@ function normalizeTask(raw: Partial<Task>, run: Run, index: number): Task {
     id: raw.id ?? `task_${randomUUID().slice(0, 8)}`,
     title: raw.title ?? '(untitled)',
     spec: raw.spec ?? '',
-    deps: raw.deps ?? [],
+    deps: [...new Set(raw.deps ?? [])],
     status: raw.status ?? 'pending',
     cmd: raw.cmd ?? null,
     gate: raw.gate ?? null,
@@ -462,7 +496,9 @@ export function loadRun(file: string): Run {
     run.tasks[task.id] = task;
   }
 
-  // Legacy single-file runs carried events; move them to the jsonl log.
+  // Legacy single-file runs carried events; move them to the jsonl log. Do it
+  // once, by writing the state that marks the run as migrated — otherwise every
+  // read-only load (list, show, viewer polls) appends another copy.
   if (legacy && Array.isArray(def.events) && def.events.length > 0) {
     pathByRun.set(run, paths);
     for (const ev of def.events) {
@@ -472,10 +508,21 @@ export function loadRun(file: string): Run {
     }
     try {
       for (const ev of run.events) appendEventLine(paths, ev);
+      appendedSeqByRun.set(run, run.eventSeq);
+      mkdirSync(paths.dir, { recursive: true });
+      atomicWrite(paths.state, `${JSON.stringify(stateOf(run), null, 2)}\n`);
     } catch {
       // best effort
     }
-    appendedSeqByRun.set(run, run.eventSeq);
+  } else if (legacy) {
+    // Nothing to migrate but the version marker: record it so the next load is
+    // not treated as legacy again.
+    try {
+      mkdirSync(paths.dir, { recursive: true });
+      atomicWrite(paths.state, `${JSON.stringify(stateOf(run), null, 2)}\n`);
+    } catch {
+      // best effort
+    }
   }
 
   // Recover the event cursor if state was lost after events were written.
@@ -489,15 +536,16 @@ export function loadRun(file: string): Run {
   appendedSeqByRun.set(run, run.eventSeq);
 
   pathByRun.set(run, paths);
-  lastDefinitionJson.set(paths.file, JSON.stringify(definitionOf(run)));
+  // Store the same serialization saveRun compares against, or every save
+  // rewrites the definition (and rotates its .bak) even for state-only changes.
+  lastDefinitionJson.set(paths.file, JSON.stringify(definitionOf(run), null, 2));
+  lastStateJson.set(paths.file, stateContent(run));
   return run;
 }
 
 export function saveRun(run: Run, file: string): void {
   const paths = runPaths(file);
   pathByRun.set(run, paths);
-  run.updatedAt = new Date().toISOString();
-  run.rev += 1;
   try {
     mkdirSync(paths.dir, { recursive: true });
     flushPendingEvents(run, paths);
@@ -505,25 +553,43 @@ export function saveRun(run: Run, file: string): void {
     // the state write below is the critical part
   }
   const defJson = JSON.stringify(definitionOf(run), null, 2);
-  if (lastDefinitionJson.get(paths.file) !== defJson) {
+  const stateJson = stateContent(run);
+  const defChanged = lastDefinitionJson.get(paths.file) !== defJson;
+  const stateChanged = lastStateJson.get(paths.file) !== stateJson;
+  // A command that changed nothing must not bump rev or rewrite files: the
+  // viewer polls rev, and a no-op write rotates the definition's .bak.
+  if (!defChanged && !stateChanged) return;
+  run.updatedAt = new Date().toISOString();
+  run.rev += 1;
+  if (defChanged) {
     atomicWrite(paths.file, `${defJson}\n`);
     lastDefinitionJson.set(paths.file, defJson);
   }
-  atomicWrite(paths.state, `${JSON.stringify(stateOf(run), null, 2)}\n`);
+  const nextState = `${JSON.stringify(stateOf(run), null, 2)}\n`;
+  atomicWrite(paths.state, nextState);
+  lastStateJson.set(paths.file, stateContent(run));
 }
 
 // Serialized read-modify-write per file: concurrent editors cannot clobber
 // each other's whole-file writes.
 const writeChains = new Map<string, Promise<unknown>>();
 
-export function mutate<T>(file: string, fn: (run: Run) => T): Promise<T> {
+// In-process callers (the viewer's HTTP routes) check for a foreign lock and
+// then read-modify-write: without holding the lock across both, a CLI command
+// that writes in between has its revision clobbered.
+export function mutate<T>(file: string, fn: (run: Run) => T, lockLabel?: string): Promise<T> {
   const key = resolve(file);
   const prev = writeChains.get(key) ?? Promise.resolve();
   const next = prev.then(() => {
-    const run = loadRun(key);
-    const result = fn(run);
-    saveRun(run, key);
-    return result;
+    const release = lockLabel ? acquireLock(key, lockLabel, false) : null;
+    try {
+      const run = loadRun(key);
+      const result = fn(run);
+      saveRun(run, key);
+      return result;
+    } finally {
+      release?.();
+    }
   });
   writeChains.set(
     key,
@@ -562,7 +628,9 @@ export interface AddTaskInput {
   harnessChain?: HarnessCandidate[] | null;
 }
 
-export function addTask(run: Run, input: AddTaskInput): Task {  const deps = input.deps ?? [];
+export function addTask(run: Run, input: AddTaskInput): Task {
+  // Dedupe: a repeated dep is always a mistake and would double-count edges.
+  const deps = [...new Set(input.deps ?? [])];
   for (const d of deps) {
     if (!run.tasks[d]) throw new Error(`unknown dep ${d}`);
   }
@@ -764,6 +832,7 @@ export function recoverInterrupted(run: Run): RecoveryResult {
   for (const task of Object.values(run.tasks)) {
     if (task.status !== 'running') continue;
     if (task.pid) orphanPids.push(task.pid);
+    task.pid = null;
     task.status = 'pending';
     task.failureKind = 'interrupted';
     task.result = 'interrupted (process died); requeued';
@@ -775,9 +844,12 @@ export function recoverInterrupted(run: Run): RecoveryResult {
   return { requeued, orphanPids };
 }
 
+// Every recorded pid is from a process this run no longer owns: a live runner
+// holds the file lock, so a caller that got past `guard` owns the file and any
+// 'running' task is a leftover from a crashed process.
 export function orphanedPids(run: Run): number[] {
   return Object.values(run.tasks)
-    .filter((t) => t.pid !== null && t.status !== 'running')
+    .filter((t) => t.pid !== null)
     .map((t) => t.pid as number);
 }
 
@@ -787,7 +859,13 @@ export function killPid(pid: number): boolean {
       const out = spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
       return out.status === 0;
     }
-    process.kill(pid, 'SIGKILL');
+    // The agent runs detached in its own process group, so kill the group:
+    // killing the direct pid leaves its children (npm -> node -> agents) alive.
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      process.kill(pid, 'SIGKILL');
+    }
     return true;
   } catch {
     return false;
@@ -796,10 +874,15 @@ export function killPid(pid: number): boolean {
 
 export function killOrphans(run: Run): { pid: number; killed: boolean }[] {
   const out: { pid: number; killed: boolean }[] = [];
-  for (const pid of orphanedPids(run)) {
+  for (const task of Object.values(run.tasks)) {
+    if (task.pid === null) continue;
+    const pid = task.pid;
     const killed = killPid(pid);
+    // Forget the pid: on Windows they are recycled quickly, and a stale entry
+    // would let a later kill-orphans tree-kill an unrelated process.
+    task.pid = null;
     out.push({ pid, killed });
-    logEvent(run, 'note', null, `orphan pid ${pid}: ${killed ? 'killed' : 'not found'}`);
+    logEvent(run, 'note', task.id, `orphan pid ${pid}: ${killed ? 'killed' : 'not found'}`);
   }
   touch(run);
   return out;
@@ -1002,14 +1085,23 @@ export function resolveGate(run: Run, id: string, approved: boolean): Task {
 // Per-attempt logs
 // ---------------------------------------------------------------------------
 
+// Task ids reach these helpers from HTTP routes and hand-edited run files, so
+// they are not trusted as path segments.
+function safeId(id: string): string {
+  if (!/^[A-Za-z0-9._-]+$/.test(id) || id === '.' || id === '..') {
+    throw Object.assign(new Error(`unsafe task id: ${JSON.stringify(id)}`), { code: 400 });
+  }
+  return id;
+}
+
 export function attemptLogPath(file: string, taskId: string, attempt: number): string {
-  return join(runPaths(file).logs, `${taskId}.${attempt}.log`);
+  return join(runPaths(file).logs, `${safeId(taskId)}.${attempt}.log`);
 }
 
 // Heartbeat marker for workers that write files instead of streaming output
 // (an agent that goes quiet on stdout but is still making progress).
 export function heartbeatPath(file: string, taskId: string): string {
-  return join(runPaths(file).dir, 'heartbeats', taskId);
+  return join(runPaths(file).dir, 'heartbeats', safeId(taskId));
 }
 
 export function recordHeartbeat(file: string, taskId: string): void {
@@ -1021,8 +1113,12 @@ export function attemptLogFiles(file: string, taskId: string): number[] {
   const paths = runPaths(file);
   if (!existsSync(paths.logs)) return [];
   const attempts: number[] = [];
+  // The id reaches here from HTTP routes and run files: treat it as a literal,
+  // not as a pattern.
+  const escaped = taskId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`^${escaped}\\.(\\d+)\\.log$`);
   for (const name of readdirSync(paths.logs)) {
-    const m = name.match(new RegExp(`^${taskId}\\.(\\d+)\\.log$`));
+    const m = name.match(re);
     if (m) attempts.push(Number(m[1]));
   }
   return attempts.sort((a, b) => a - b);

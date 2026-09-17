@@ -37,8 +37,9 @@ export interface WhenClause {
 export function parseWhen(when?: string): WhenClause {
   const out: WhenClause = { onReject: false, minLines: null, touches: null, invalid: null };
   const text = (when ?? 'always').trim();
-  if (text === '' || text === 'always') return out;
+  if (text === '') return out;
   for (const clause of text.split(';').map((c) => c.trim()).filter(Boolean)) {
+    if (clause === 'always') continue;
     if (clause === 'on-reject') {
       out.onReject = true;
       continue;
@@ -71,9 +72,15 @@ export function globMatches(pattern: string, path: string): boolean {
     const c = pat[i];
     if (c === '*') {
       if (pat[i + 1] === '*') {
-        re += '.*';
         i += 1;
-        if (pat[i + 1] === '/') i += 1; // "**/" also matches zero directories
+        if (pat[i + 1] === '/') {
+          // "**/" is zero or more whole directories, so the separator has to
+          // belong to the group: "src/**/x" must not match "src/ax".
+          re += '(?:[^/]+/)*';
+          i += 1;
+        } else {
+          re += '.*';
+        }
       } else {
         re += '[^/]*';
       }
@@ -106,30 +113,38 @@ export function decideReviewers(
       // Unknown clause: run it and say so rather than quietly dropping a gate.
       return { reviewer, run: true, reason: `unknown condition "${when.invalid}" — running`, onReject: false };
     }
+    // Clauses are ANDed: every one that can be evaluated must hold. A clause we
+    // cannot evaluate (no diff without worktree isolation) does not close a gate.
+    const reasons: string[] = [];
+    let run = true;
     if (when.onReject) {
-      return {
-        reviewer,
-        run: alreadyRejected,
-        reason: alreadyRejected ? 'runs after a rejection' : 'waits for a rejection',
-        onReject: true,
-      };
-    }
-    if (when.minLines !== null && diff) {
-      if (diff.lines <= when.minLines) {
-        return { reviewer, run: false, reason: `diff is ${diff.lines} lines (needs >${when.minLines})`, onReject: false };
+      if (alreadyRejected) reasons.push('runs after a rejection');
+      else {
+        run = false;
+        reasons.push('waits for a rejection');
       }
-      return { reviewer, run: true, reason: `diff is ${diff.lines} lines (>${when.minLines})`, onReject: false };
     }
-    if (when.touches && diff) {
+    if (run && when.minLines !== null && diff) {
+      if (diff.lines > when.minLines) reasons.push(`diff is ${diff.lines} lines (>${when.minLines})`);
+      else {
+        run = false;
+        reasons.push(`diff is ${diff.lines} lines (needs >${when.minLines})`);
+      }
+    }
+    if (run && when.touches && diff) {
       const hit = diff.files.find((f) => when.touches?.some((g) => globMatches(g, f)));
-      return {
-        reviewer,
-        run: Boolean(hit),
-        reason: hit ? `touches ${hit}` : `no changed path matches ${when.touches.join(', ')}`,
-        onReject: false,
-      };
+      if (hit) reasons.push(`touches ${hit}`);
+      else {
+        run = false;
+        reasons.push(`no changed path matches ${when.touches.join(', ')}`);
+      }
     }
-    return { reviewer, run: true, reason: 'always', onReject: false };
+    return {
+      reviewer,
+      run,
+      reason: reasons.length > 0 ? reasons.join('; ') : 'always',
+      onReject: when.onReject,
+    };
   });
 }
 
