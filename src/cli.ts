@@ -48,7 +48,7 @@ import { parseHarnessChain } from './harness-chain.js';
 import { activeRunFile, archiveRun, findRun, listRuns, projectOf, startNewRun } from './runs.js';
 import { listAgentModels } from './agent-models.js';
 import { resolveCommand } from './command-resolution.js';
-import { addProject, loadRegistry, projectId, removeProject, resolveRunFile } from './registry.js';
+import { addProject, findProject, loadRegistry, projectId, removeProject, resolveRunFile } from './registry.js';
 import {
   launchProject,
   pruneServers,
@@ -429,6 +429,18 @@ async function main(): Promise<void> {
       const removed = removeProject(target);
       emit(rest, { removed }, () => (removed ? `removed ${target}` : `no project matched ${target}`));
       if (!removed) process.exitCode = 1;
+      return;
+    }
+    if (sub === 'open') {
+      // Opens the project page in the hub, starting one if needed.
+      const target = flag(rest, 'id') ?? rest[1];
+      if (!target) throw new Error('usage: dag projects open <id|name> [--dir <folder>]');
+      const entry = findProject(target) ?? addProject(flag(rest, 'dir') ?? target);
+      const { launchProject, openBrowser } = await import('./launcher.js');
+      const launched = await launchProject(entry, { open: false });
+      const url = `${launched.url}/p/${projectId(entry.file)}`;
+      openBrowser(url);
+      emit(rest, { project: entry.name, url }, () => url);
       return;
     }
     const registry = loadRegistry();
@@ -1483,7 +1495,8 @@ usage: dag <cmd> [flags]
   launch [--all | --dir F ...] [--open] [--auto-resume]
                                one server per project, stable port each
   servers [--json] | servers --stop --all|--dir F
-  projects [list|add --dir F [--name N]|rm <id|path|name>]
+  projects [list|add --dir F [--name N]|rm <id|path|name>|open <id|name>]
+                               open: hub page for one project
   serve [--file F] [--port 8787] [--open] [--auto-resume] [--kill-orphans]
                                no --file: one hub for every registered project
   schedule add --file F [--name N] [--at "YYYY-MM-DD HH:MM"] [--after JOB]

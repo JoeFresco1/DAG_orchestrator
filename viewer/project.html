@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DAG Orchestrator — Project</title>
+<style>
+  :root {
+    --bg: #04070d; --panel: #0b1220; --border: #1e2a3f; --text: #d7f5ff;
+    --muted: #6f9db4; --dim: #3d6379; --cyan: #00e5ff; --green: #00ff9c;
+    --amber: #ffc400; --magenta: #ff2d95; --teal: #2dd4bf; --slate: #55788c;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.5 var(--mono); }
+  header { display: flex; align-items: baseline; gap: 14px; padding: 12px 18px;
+    border-bottom: 1px solid var(--border); background: var(--panel); flex-wrap: wrap; }
+  .brand { font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: var(--cyan);
+    text-shadow: 0 0 10px rgba(0,229,255,.5); text-decoration: none; }
+  .crumb { color: var(--muted); font-size: 11.5px; text-decoration: none; }
+  .crumb:hover { color: var(--cyan); }
+  .crumb.here { color: var(--text); font-weight: 600; }
+  main { max-width: 1100px; margin: 0 auto; padding: 18px; }
+  h1 { font-size: 16px; margin: 0 0 2px; }
+  .path { color: var(--dim); font-size: 11px; margin-bottom: 14px; word-break: break-all; }
+  button { border: 1px solid rgba(0,229,255,.4); border-radius: 3px; background: rgba(0,229,255,.08);
+    color: var(--cyan); font: 600 10.5px var(--mono); letter-spacing: .08em; text-transform: uppercase;
+    padding: 5px 10px; cursor: pointer; }
+  button:hover { border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,229,255,.3); }
+  button.ghost { border-color: var(--border); color: var(--muted); background: transparent; }
+  button.ghost:hover { border-color: var(--cyan); color: var(--cyan); box-shadow: none; }
+  button:disabled { opacity: .5; cursor: default; }
+  input, select { background: #03070c; color: var(--text); border: 1px solid var(--border);
+    border-radius: 3px; padding: 5px 7px; font: 11.5px var(--mono); }
+  input:focus, select:focus { outline: none; border-color: var(--cyan); }
+  .actions { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  .banner { border: 1px solid var(--magenta); background: rgba(255,45,149,.08); padding: 10px 12px;
+    border-radius: 4px; margin-bottom: 14px; font-size: 12px; }
+  .banner code { background: #03070c; padding: 1px 5px; border-radius: 3px; }
+  .note { font-size: 11px; color: var(--muted); }
+  .note.err { color: var(--magenta); }
+  .panel { border: 1px solid var(--border); border-radius: 4px; background: var(--panel); margin-bottom: 16px; }
+  .phead { padding: 9px 12px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; }
+  .phead .spacer { margin-left: auto; }
+  .run { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid rgba(30,42,63,.5);
+    text-decoration: none; color: inherit; }
+  .run:last-child { border-bottom: none; }
+  .run:hover { background: rgba(0,229,255,.06); }
+  .run .obj { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .run .id { color: var(--dim); font-size: 10.5px; }
+  .tag { font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase; border-radius: 2px;
+    padding: 1px 6px; border: 1px solid var(--border); color: var(--muted); }
+  .tag.running { color: #451a03; background: var(--amber); border-color: var(--amber); font-weight: 700; }
+  .tag.active { color: #02130c; background: var(--green); border-color: var(--green); font-weight: 700; }
+  .tag.archived { color: var(--slate); border-style: dashed; }
+  .counts { display: flex; gap: 8px; font-size: 10.5px; color: var(--muted); }
+  .counts b { color: var(--text); }
+  .empty { color: var(--dim); padding: 14px; font-size: 12px; }
+  .settings { padding: 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+  .field { display: flex; flex-direction: column; gap: 3px; }
+  .field label { font-size: 10px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  .field .hint { font-size: 10px; color: var(--dim); }
+  .sfoot { padding: 0 12px 12px; display: flex; gap: 8px; align-items: center; }
+  .live { display: flex; gap: 10px; align-items: center; padding: 8px 12px; font-size: 11.5px; }
+  .dotlive { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dotlive.off { background: var(--dim); box-shadow: none; }
+  .bar { height: 4px; background: #03070c; border: 1px solid var(--border); border-radius: 3px; overflow: hidden; flex: 1; }
+  .bar > i { display: block; height: 100%; background: var(--green); }
+</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="/">DAG Orchestrator</a>
+  <a class="crumb" href="/">Projects</a>
+  <span class="crumb">/</span>
+  <span class="crumb here" id="crumbName">…</span>
+  <span class="note" id="meta" style="margin-left:auto"></span>
+</header>
+<main>
+  <div id="banner"></div>
+  <h1 id="pname">…</h1>
+  <div class="path" id="pdir"></div>
+
+  <div class="actions">
+    <button id="newRunBtn">New run</button>
+    <button class="ghost" id="openRunBtn">Open active run</button>
+    <button class="ghost" id="settingsBtn">Settings</button>
+    <button class="ghost" id="renameBtn">Rename</button>
+    <span class="note" id="note"></span>
+  </div>
+
+  <div class="panel" id="livePanel" style="display:none">
+    <div class="phead"><b>Active run</b><span class="spacer"></span><span class="note" id="liveState"></span></div>
+    <div class="live">
+      <span class="dotlive" id="liveDot"></span>
+      <span id="liveText">idle</span>
+      <span class="bar"><i id="liveBar" style="width:0%"></i></span>
+      <span class="counts" id="liveCounts"></span>
+    </div>
+  </div>
+
+  <div class="panel" id="settingsPanel" style="display:none">
+    <div class="phead"><b>Settings</b> <span class="note">stored on the active run file — a new run starts from its defaults</span></div>
+    <div class="settings">
+      <div class="field"><label for="sConcurrency">Concurrency</label>
+        <input id="sConcurrency" type="number" min="1" max="64" /><span class="hint">parallel workers</span></div>
+      <div class="field"><label for="sModel">Model</label>
+        <input id="sModel" placeholder="agent default" /><span class="hint">goes into {model}</span></div>
+      <div class="field"><label for="sVariant">Effort / variant</label>
+        <input id="sVariant" placeholder="unset" /><span class="hint">goes into {variant}</span></div>
+      <div class="field"><label for="sWorktree">Worktree isolation</label>
+        <select id="sWorktree"><option value="none">none</option><option value="task">task</option></select><span class="hint">per-task diffs for review</span></div>
+      <div class="field"><label for="sPrepare">Prepare command</label>
+        <input id="sPrepare" placeholder="e.g. uv sync --directory backend --frozen" /><span class="hint">runs once per task worktree</span></div>
+      <div class="field"><label for="sFinalReview">End-of-run review</label>
+        <select id="sFinalReview"><option value="off">off</option><option value="per-task">per-task</option><option value="run">whole run</option></select><span class="hint">agents review the finished work</span></div>
+      <div class="field"><label for="sFinalRounds">Review rounds</label>
+        <input id="sFinalRounds" type="number" min="0" /><span class="hint">failures sent back this often</span></div>
+      <div class="field"><label for="sNotify">Notify command</label>
+        <input id="sNotify" placeholder="optional" /><span class="hint">DAG_EVENT / DAG_RUN in env</span></div>
+    </div>
+    <div class="sfoot">
+      <button id="saveSettingsBtn">Save</button>
+      <button class="ghost" id="cancelSettingsBtn">Cancel</button>
+      <span class="note" id="settingsNote"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="phead"><b>Runs</b><span class="spacer"></span><span class="note" id="runsNote"></span></div>
+    <div id="runs"></div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const PROJECT_ID = location.pathname.replace(/\/+$/, '').split('/').pop();
+let project = null;
+let settings = null;
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+function note(msg, isError) {
+  $('note').textContent = msg || '';
+  $('note').className = 'note' + (isError ? ' err' : '');
+}
+function banner(html) {
+  $('banner').innerHTML = html;
+}
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const text = await res.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = { error: text.slice(0, 200) };
+  }
+  if (!res.ok) throw new Error(body && body.error ? body.error : `HTTP ${res.status}`);
+  return body;
+}
+
+function counts(c) {
+  const order = ['running', 'ready', 'failed', 'blocked', 'gated', 'completed', 'pending'];
+  return order
+    .filter((k) => c && c[k])
+    .map((k) => `<span>${k} <b>${c[k]}</b></span>`)
+    .join('');
+}
+
+function runRow(row) {
+  const job = row.job || {};
+  const tag = job.running
+    ? '<span class="tag running">running</span>'
+    : row.archived
+      ? '<span class="tag archived">archived</span>'
+      : '<span class="tag active">active</span>';
+  return `<a class="run" href="/r/${encodeURIComponent(row.runId)}">
+    ${tag}
+    <span class="id">${esc(row.runId)}</span>
+    <span class="obj">${esc(row.objective || '(no objective)')}</span>
+    <span class="counts">${counts(row.counts)}</span>
+    <span class="id">${row.total} tasks</span>
+  </a>`;
+}
+
+function render() {
+  if (!project) return;
+  $('crumbName').textContent = project.name;
+  document.title = `DAG Orchestrator — ${project.name}`;
+  $('pname').textContent = project.name;
+  $('pdir').textContent = project.dir + (project.exists ? '' : '  (run file missing)');
+  $('meta').textContent = `${project.totalRuns} run(s) · ${location.host}`;
+  const active = project.runs.find((r) => !r.archived);
+  const running = project.runs.filter((r) => r.job && r.job.running);
+  $('openRunBtn').disabled = !active;
+  $('livePanel').style.display = active ? '' : 'none';
+  if (active) {
+    const total = Math.max(1, active.total);
+    const done = ['completed', 'failed', 'skipped'].reduce((n, k) => n + ((active.counts || {})[k] || 0), 0);
+    $('liveDot').className = 'dotlive' + (active.job && active.job.running ? '' : ' off');
+    $('liveText').textContent = active.job && active.job.running
+      ? `running${active.job.current && active.job.current.length ? `: ${active.job.current.join(', ')}` : ''}`
+      : active.status;
+    $('liveBar').style.width = `${Math.round((done / total) * 100)}%`;
+    $('liveCounts').innerHTML = counts(active.counts);
+    $('liveState').textContent = `${active.runId} · updated ${String(active.updatedAt || '').slice(11, 19)}`;
+  }
+  $('runsNote').textContent = running.length > 0 ? `${running.length} run(s) executing` : '';
+  $('runs').innerHTML =
+    project.runs.length === 0
+      ? '<div class="empty">no runs yet — press New run</div>'
+      : project.runs.map(runRow).join('');
+}
+
+function fillSettings() {
+  const s = settings || {};
+  $('sConcurrency').value = s.concurrency ?? '';
+  $('sModel').value = s.model ?? '';
+  $('sVariant').value = s.variant ?? '';
+  $('sWorktree').value = s.worktree ?? 'none';
+  $('sPrepare').value = s.worktreePrepareCmd ?? '';
+  $('sFinalReview').value = s.finalReview ?? 'off';
+  $('sFinalRounds').value = s.finalReviewRounds ?? 1;
+  $('sNotify').value = s.notifyCmd ?? '';
+}
+
+async function load() {
+  try {
+    const data = await api(`/api/projects/${encodeURIComponent(PROJECT_ID)}`);
+    project = data.project;
+    settings = data.settings;
+    banner('');
+    render();
+    if ($('settingsPanel').style.display !== 'none') fillSettings();
+  } catch (err) {
+    banner(
+      `<b>Cannot load this project.</b> ${esc(err.message)}<br>` +
+        `<a class="crumb" href="/">← back to projects</a>`,
+    );
+  }
+}
+
+$('newRunBtn').onclick = async () => {
+  const objective = prompt('Objective for the new run?', `${project.name} — `);
+  if (objective === null) return;
+  note('archiving and starting a new run…');
+  try {
+    const out = await api('/api/runs/new', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir: project.dir, objective }),
+    });
+    note(`created ${out.runId}${out.archivedTo ? ' (previous run archived)' : ''}`);
+    await load();
+  } catch (err) {
+    note(String(err.message), true);
+  }
+};
+$('openRunBtn').onclick = () => {
+  const active = project && project.runs.find((r) => !r.archived);
+  if (active) location.href = `/r/${encodeURIComponent(active.runId)}`;
+};
+$('settingsBtn').onclick = () => {
+  const panel = $('settingsPanel');
+  const open = panel.style.display === 'none';
+  panel.style.display = open ? '' : 'none';
+  if (open) {
+    $('settingsNote').textContent = '';
+    $('settingsNote').className = 'note';
+    fillSettings();
+  }
+};
+$('cancelSettingsBtn').onclick = () => {
+  $('settingsPanel').style.display = 'none';
+};
+$('renameBtn').onclick = async () => {
+  const name = prompt('Project name', project.name);
+  if (name === null || !name.trim()) return;
+  try {
+    await api(`/api/projects/${encodeURIComponent(PROJECT_ID)}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: name.trim() }),
+    });
+    note('renamed');
+    await load();
+  } catch (err) {
+    note(String(err.message), true);
+  }
+};
+$('saveSettingsBtn').onclick = async () => {
+  const active = project && project.runs.find((r) => !r.archived);
+  if (!active) {
+    $('settingsNote').textContent = 'no active run to hold settings';
+    return;
+  }
+  const num = (id) => {
+    const v = $(id).value.trim();
+    return v === '' ? undefined : Number(v);
+  };
+  const body = {
+    concurrency: num('sConcurrency'),
+    model: $('sModel').value.trim() || null,
+    variant: $('sVariant').value.trim() || null,
+    worktree: $('sWorktree').value,
+    worktreePrepareCmd: $('sPrepare').value.trim(),
+    finalReview: $('sFinalReview').value,
+    finalReviewRounds: num('sFinalRounds'),
+    notifyCmd: $('sNotify').value.trim() || null,
+  };
+  for (const k of Object.keys(body)) if (body[k] === undefined) delete body[k];
+  $('settingsNote').textContent = 'saving…';
+  try {
+    const out = await api(`/api/runs/${encodeURIComponent(active.runId)}/settings`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    settings = out.settings;
+    $('settingsNote').textContent = 'saved';
+    await load();
+  } catch (err) {
+    $('settingsNote').textContent = String(err.message);
+    $('settingsNote').className = 'note err';
+  }
+};
+
+load();
+setInterval(load, 4000);
+</script>
+</body>
+</html>

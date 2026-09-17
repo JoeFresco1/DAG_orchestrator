@@ -215,18 +215,32 @@ Usable in any task command (`cmd`, `planCmd`, `reviewCmd`):
 registered project, with a separate URL per run.
 
 ```bash
-dag serve --open                 # hub: index of projects and their runs
+dag serve --open                 # hub: projects page
 dag serve --file dag.run.json    # focus one run (redirects / to it)
+dag projects open <id|name>      # jump straight to one project's page
 ```
 
-- `/` is an index: projects, their runs (active + archived), status counts,
-  and `New run` / `Add project` buttons.
-- `/r/<runId>` is **one run, scoped end to end** — its graph, queue,
-  inspector, logs and terminals. A run page can never show another run's
-  tasks: every API call is namespaced by that run id.
+The viewer is three levels, each with a way back up:
+
+- `/` — **projects**: search, add a folder (typed, or picked with the built-in
+  folder browser — `C:\path` and `"C:\path"` both work), remove one from the
+  hub (files untouched), and see at a glance which projects have live runs.
+- `/p/<projectId>` — **one project**: its live status and progress, every run
+  (active first, then archived history) linking to that run's page, plus
+  `New run`, `Rename` and `Settings` (concurrency, model, isolation, end-of-run
+  review, notify — stored on the active run file).
+- `/r/<runId>` — **one run, scoped end to end**: its graph, queue, inspector,
+  logs and terminals, with a breadcrumb back to its project. Every API call is
+  namespaced by that run id, so a run page can never show another run's tasks.
 - Runs execute independently: one runner per run, its own lock, its own
   integration branch. A run in progress in one project never blocks another.
 - Archived runs are **read-only history**; the API refuses to start them.
+
+Pages are read from disk per request, but routes are frozen when the process
+starts. If the code on disk is newer than the running hub, it serves a
+"restart me" page with the command instead of pages whose API it does not have
+(that mismatch is what made the old index sit on "loading…" forever).
+
 
 ## Run history
 

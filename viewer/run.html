@@ -91,6 +91,8 @@ header {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .total { font-size: 10.5px; color: var(--muted); white-space: nowrap; letter-spacing: .1em; text-transform: uppercase; }
+.crumb { font: 10.5px var(--mono); color: var(--muted); text-decoration: none; white-space: nowrap; }
+.crumb:hover { color: var(--cyan); }
 .total strong { font-size: 18px; color: var(--text); font-weight: 700; margin-right: 4px;
   text-shadow: 0 0 10px rgba(0, 229, 255, .35); }
 .progress {
@@ -246,6 +248,7 @@ aside {
 <body>
 <header>
   <a class="brand" href="/" title="all projects and runs" style="text-decoration:none">◀ DAG Orchestrator</a>
+  <a class="crumb" id="crumb" href="/" style="display:none">← project</a>
   <span class="filepath" id="filepath" title=""></span>
   <span class="total"><strong id="total">0</strong>tasks</span>
   <div class="pills" id="pills"></div>
@@ -537,6 +540,17 @@ async function loadDefinition() {
     });
   }
   $('filepath').textContent = meta ? `${meta.name ? meta.name + ' · ' : ''}${meta.archived ? 'archived · ' : ''}${meta.file}` : '';
+  // Breadcrumb back to the project that owns this run.
+  const crumb = $('crumb');
+  if (crumb) {
+    if (meta && meta.projectId) {
+      crumb.href = `/p/${encodeURIComponent(meta.projectId)}`;
+      crumb.textContent = `← ${meta.name || 'project'}`;
+      crumb.style.display = '';
+    } else {
+      crumb.style.display = 'none';
+    }
+  }
   $('filepath').title = meta?.file ?? '';
   document.title = `DAG Orchestrator · ${def.objective || def.id}`;
 }
@@ -1041,7 +1055,7 @@ async function poll() {
     const s = await r.json();
     job = s.job;
     if (s.staleBuild !== undefined) staleBuild = s.staleBuild;
-    if (s.file) meta = { file: s.file, name: s.name, archived: s.archived };
+    if (s.file) meta = { file: s.file, name: s.name, archived: s.archived, projectId: s.projectId };
     if (s.unchanged) { if (summary) renderHeader(summary); return; }
     rev = s.rev;
     if (!initialized || s.defRev !== defRev) {

@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -26,11 +27,20 @@ import { openBrowser } from './launcher.js';
 import { listAgentModels } from './agent-models.js';
 import {
   addProject,
+  cleanPath,
   loadRegistry,
   projectId,
+  removeProject,
   type ProjectEntry,
 } from './registry.js';
-import { activeRunFile, archiveRun, findRun, listRuns, projectOf, startNewRun } from './runs.js';
+import {
+  activeRunFile,
+  archiveRun,
+  findRun,
+  listRuns,
+  projectOf,
+  startNewRun,
+} from './runs.js';
 import type { DepFailurePolicy, GatePolicy, Run, Task } from './types.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -113,6 +123,30 @@ function ambiguousRunId(runId: string): string[] {
 // archives the run and creates a new one at the same path.
 function dropRuntime(runId: string): void {
   runtimes.delete(runId);
+}
+
+function projectPayload(entry: ProjectEntry): Record<string, unknown> {
+  const dir = projectOf(entry.file);
+  const runs = listRuns(dir).map((row) => ({
+    ...row,
+    job: runtimes.get(row.runId) ? jobView(runtimes.get(row.runId) as RunRuntime) : null,
+  }));
+  const active = runs.find((r) => !r.archived) ?? null;
+  const running = runs.filter((r) => r.job?.running).length;
+  return {
+    id: projectId(entry.file),
+    name: entry.name,
+    dir,
+    file: entry.file,
+    exists: existsSync(entry.file),
+    addedAt: entry.addedAt,
+    activeRunId: active?.runId ?? null,
+    running,
+    totalRuns: runs.length,
+    counts: active?.counts ?? {},
+    status: active?.status ?? 'empty',
+    runs,
+  };
 }
 
 function projectName(dir: string): string {
@@ -446,22 +480,85 @@ export function startServer(opts: ServeOptions): void {
         return;
       }
 
-      // ---- index: projects and their runs ----
-      if (path === '/api/runs' && req.method === 'GET') {
+      // ---- projects: the hub's top level ----
+      if ((path === '/api/projects' || path === '/api/runs') && req.method === 'GET') {
         const registry = loadRegistry();
-        const projects = registry.projects.map((entry: ProjectEntry) => {
-          const dir = projectOf(entry.file);
-          return {
-            projectId: projectId(entry.file),
-            name: entry.name,
-            dir,
-            runs: listRuns(dir).map((row) => ({
-              ...row,
-              job: runtimes.get(row.runId) ? jobView(runtimes.get(row.runId) as RunRuntime) : null,
-            })),
-          };
-        });
+        const projects = registry.projects.map((entry: ProjectEntry) => projectPayload(entry));
         json(res, 200, { projects, singleRunMode, defaultRunId, port: listeningPort });
+        return;
+      }
+
+      // ---- one project: its runs and the active run's settings ----
+      const projectMatch = path.match(/^\/api\/projects\/([^/]+)$/);
+      if (projectMatch) {
+        const id = projectMatch[1];
+        const registry = loadRegistry();
+        const entry = registry.projects.find((p) => projectId(p.file) === id);
+        if (!entry) {
+          json(res, 404, { error: `unknown project ${id}` });
+          return;
+        }
+        if (req.method === 'GET') {
+          const payload = projectPayload(entry);
+          let settings: unknown = null;
+          const activeFile = activeRunFile(projectOf(entry.file));
+          if (existsSync(activeFile)) {
+            try {
+              settings = loadRun(activeFile).settings;
+            } catch {
+              settings = null;
+            }
+          }
+          json(res, 200, { project: payload, settings });
+          return;
+        }
+        if (req.method === 'PATCH') {
+          const body = parseBody(req, await readBody(req)) as { name?: string };
+          const name = body.name?.trim();
+          if (!name) {
+            json(res, 400, { error: 'name is required' });
+            return;
+          }
+          addProject(entry.file, name);
+          json(res, 200, { project: projectPayload({ ...entry, name }) });
+          return;
+        }
+        if (req.method === 'DELETE') {
+          const removed = removeProject(id);
+          json(res, removed ? 200 : 404, removed ? { removed: id } : { error: `unknown project ${id}` });
+          return;
+        }
+        json(res, 405, { error: `${req.method} not allowed` });
+        return;
+      }
+
+      // ---- folder browser for the add-project flow ----
+      if (path === '/api/fs' && req.method === 'GET') {
+        const wanted = cleanPath(url.searchParams.get('dir') ?? '');
+        const dir = wanted ? resolve(wanted) : homedir();
+        let entries: { name: string; path: string; hasRun: boolean }[] = [];
+        try {
+          entries = readdirSync(dir, { withFileTypes: true })
+            .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+            .map((e) => ({
+              name: e.name,
+              path: join(dir, e.name),
+              hasRun: existsSync(join(dir, e.name, 'dag.run.json')),
+            }))
+            .sort((a, b) => Number(b.hasRun) - Number(a.hasRun) || a.name.localeCompare(b.name));
+        } catch (err) {
+          json(res, 400, {
+            error: `cannot read ${dir}: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          return;
+        }
+        const parent = dirname(dir);
+        json(res, 200, {
+          dir,
+          parent: parent === dir ? null : parent,
+          isProject: existsSync(join(dir, 'dag.run.json')),
+          dirs: entries,
+        });
         return;
       }
 
@@ -558,22 +655,46 @@ export function startServer(opts: ServeOptions): void {
       }
 
       // ---- pages ----
+      // Pages are read from disk per request, but the routes were frozen when
+      // this process started. If the code on disk is newer, this process would
+      // serve a page whose API it does not implement (the page then hangs on
+      // "loading…"), so say so instead.
+      const page = async (name: string): Promise<void> => {
+        if (staleBuild()) {
+          res.writeHead(503, { 'content-type': 'text/html' });
+          res.end(
+            `<!doctype html><meta charset="utf-8"><title>DAG Orchestrator — restart needed</title>` +
+              `<body style="background:#04070d;color:#d7f5ff;font:14px ui-monospace,Consolas,monospace;padding:40px">` +
+              `<h1 style="color:#ffc400;font-size:16px;letter-spacing:.1em">THE HUB IS RUNNING OLDER CODE</h1>` +
+              `<p>This process started before the code on disk changed, so it cannot serve the viewer.</p>` +
+              `<p>Stop it and start it again:</p>` +
+              `<pre style="background:#0b1220;border:1px solid #1e2a3f;padding:12px">dag serve</pre>` +
+              `<p style="color:#6f9db4">(Single-run mode: <code>dag serve --file &lt;run file&gt;</code>)</p>` +
+              `</body>`,
+          );
+          return;
+        }
+        const html = await readFile(join(here, '..', 'viewer', name), 'utf8');
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end(html);
+      };
+
       if (path === '/' && req.method === 'GET') {
         if (singleRunMode && defaultRunId) {
           res.writeHead(302, { location: `/r/${defaultRunId}` });
           res.end();
           return;
         }
-        const html = await readFile(join(here, '..', 'viewer', 'index.html'), 'utf8');
-        res.writeHead(200, { 'content-type': 'text/html' });
-        res.end(html);
+        await page('index.html');
+        return;
+      }
+      if (path.match(/^\/p\/[^/]+\/?$/) && req.method === 'GET') {
+        await page('project.html');
         return;
       }
       const pageMatch = path.match(/^\/r\/([^/]+)\/?$/);
       if (pageMatch && req.method === 'GET') {
-        const html = await readFile(join(here, '..', 'viewer', 'run.html'), 'utf8');
-        res.writeHead(200, { 'content-type': 'text/html' });
-        res.end(html);
+        await page('run.html');
         return;
       }
       if (path === '/vendor/vis-network.min.js' && req.method === 'GET') {
@@ -615,6 +736,7 @@ export function startServer(opts: ServeOptions): void {
           port: listeningPort,
           runId: rt.runId,
           name: projectName(rt.projectDir),
+          projectId: projectId(join(rt.projectDir, 'dag.run.json')),
           projectDir: rt.projectDir,
           archived: rt.archived,
         },
@@ -635,6 +757,7 @@ export function startServer(opts: ServeOptions): void {
           unchanged: true,
           file,
           name: projectName(rt.projectDir),
+          projectId: projectId(join(rt.projectDir, 'dag.run.json')),
           archived: rt.archived,
           job: jobView(rt),
           staleBuild: staleBuild(),
@@ -645,6 +768,7 @@ export function startServer(opts: ServeOptions): void {
         ...summaryPayload(run),
         file,
         name: projectName(rt.projectDir),
+        projectId: projectId(join(rt.projectDir, 'dag.run.json')),
         archived: rt.archived,
         job: jobView(rt),
         staleBuild: staleBuild(),
@@ -790,6 +914,57 @@ export function startServer(opts: ServeOptions): void {
       const requested = url.searchParams.get('attempt');
       const attempt = requested ? Number(requested) : attempts[attempts.length - 1];
       json(res, 200, { attempts, attempt, content: readAttemptLog(file, taskId, attempt) });
+      return;
+    }
+
+    // Project-scoped settings live on the run file, so the project page edits
+    // them here rather than shipping a second settings store.
+    if (rest === '/settings' && req.method === 'PATCH') {
+      if (guardArchived()) return;
+      const body = parseBody(req, await readBody(req)) as Record<string, unknown>;
+      const allowed = new Set([
+        'concurrency',
+        'model',
+        'variant',
+        'worktree',
+        'worktreePrepareCmd',
+        'finalReview',
+        'finalReviewRounds',
+        'finalReviewCmd',
+        'failOnNonZeroExit',
+        'notifyCmd',
+        'maxAttempts',
+        'timeoutMs',
+        'silenceMs',
+        'silenceAction',
+        'onDepFailure',
+        'onGateBlocked',
+        'maxWallClockMs',
+      ]);
+      const unknown = Object.keys(body).filter((k) => !allowed.has(k));
+      if (unknown.length > 0) {
+        json(res, 400, { error: `cannot set: ${unknown.join(', ')}` });
+        return;
+      }
+      if (rt.runner?.isRunning) {
+        json(res, 409, { error: 'stop the run before changing its settings' });
+        return;
+      }
+      try {
+        assertNoForeignLock(file);
+      } catch (err) {
+        json(res, 409, { error: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+      const settings = await mutate(
+        file,
+        (run) => {
+          Object.assign(run.settings, body);
+          return run.settings;
+        },
+        'viewer settings',
+      );
+      json(res, 200, { settings });
       return;
     }
 

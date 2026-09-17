@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>DAG Orchestrator</title>
+<title>DAG Orchestrator — Projects</title>
 <style>
   :root {
     --bg: #04070d; --panel: #0b1220; --border: #1e2a3f; --text: #d7f5ff;
@@ -15,150 +15,281 @@
   header { display: flex; align-items: baseline; gap: 14px; padding: 12px 18px;
     border-bottom: 1px solid var(--border); background: var(--panel); }
   .brand { font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: var(--cyan);
-    text-shadow: 0 0 10px rgba(0,229,255,.5); }
+    text-shadow: 0 0 10px rgba(0,229,255,.5); text-decoration: none; }
+  .crumb { color: var(--muted); font-size: 11.5px; }
+  .crumb b { color: var(--text); font-weight: 600; }
   .muted { color: var(--muted); font-size: 11px; }
   main { max-width: 1100px; margin: 0 auto; padding: 18px; }
   button { border: 1px solid rgba(0,229,255,.4); border-radius: 3px; background: rgba(0,229,255,.08);
     color: var(--cyan); font: 600 10.5px var(--mono); letter-spacing: .08em; text-transform: uppercase;
     padding: 5px 10px; cursor: pointer; }
   button:hover { border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,229,255,.3); }
+  button.ghost { border-color: var(--border); color: var(--muted); background: transparent; }
+  button.ghost:hover { border-color: var(--magenta); color: var(--magenta); box-shadow: none; }
+  button:disabled { opacity: .5; cursor: default; box-shadow: none; }
   input { background: #03070c; color: var(--text); border: 1px solid var(--border);
     border-radius: 3px; padding: 5px 7px; font: 11.5px var(--mono); }
-  .project { border: 1px solid var(--border); border-radius: 4px; margin-bottom: 14px;
-    background: var(--panel); }
-  .phead { display: flex; align-items: center; gap: 10px; padding: 9px 12px;
-    border-bottom: 1px solid var(--border); }
-  .pname { font-weight: 600; }
-  .ppath { color: var(--dim); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis;
-    white-space: nowrap; max-width: 380px; }
-  .phead .spacer { margin-left: auto; }
-  .run { display: flex; align-items: center; gap: 10px; padding: 7px 12px;
-    border-bottom: 1px solid rgba(30,42,63,.5); text-decoration: none; color: inherit; }
-  .run:last-child { border-bottom: none; }
-  .run:hover { background: rgba(0,229,255,.06); }
-  .run .obj { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .run .id { color: var(--dim); font-size: 10.5px; }
-  .tag { font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase; border-radius: 2px;
-    padding: 1px 6px; border: 1px solid var(--border); color: var(--muted); }
-  .tag.active { color: #02130c; background: var(--green); border-color: var(--green); font-weight: 700; }
-  .tag.archived { color: var(--slate); border-style: dashed; }
-  .tag.running { color: #451a03; background: var(--amber); border-color: var(--amber); font-weight: 700; }
-  .counts { display: flex; gap: 8px; font-size: 10.5px; color: var(--muted); }
-  .counts b { color: var(--text); }
-  .empty { color: var(--dim); padding: 14px; font-size: 12px; }
-  #addbox { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; }
-  #addbox input { flex: 1; }
+  input:focus { outline: none; border-color: var(--cyan); }
+  .banner { border: 1px solid var(--magenta); background: rgba(255,45,149,.08); color: var(--text);
+    padding: 10px 12px; border-radius: 4px; margin-bottom: 14px; font-size: 12px; }
+  .banner b { color: var(--magenta); }
+  .banner code { background: #03070c; padding: 1px 5px; border-radius: 3px; }
+  #bar { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  #bar input#search { flex: 0 0 220px; }
+  #bar input#newdir { flex: 1; min-width: 240px; }
   .note { font-size: 11px; color: var(--muted); }
   .note.err { color: var(--magenta); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 12px; }
+  .card { border: 1px solid var(--border); border-radius: 4px; background: var(--panel); padding: 11px 12px;
+    text-decoration: none; color: inherit; display: flex; flex-direction: column; gap: 7px; }
+  .card:hover { border-color: rgba(0,229,255,.55); box-shadow: 0 0 14px rgba(0,229,255,.12); }
+  .card .row1 { display: flex; align-items: center; gap: 8px; }
+  .card .pname { font-weight: 600; font-size: 13.5px; }
+  .card .ppath { color: var(--dim); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .row2 { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .card .spacer { margin-left: auto; }
+  .tag { font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase; border-radius: 2px;
+    padding: 1px 6px; border: 1px solid var(--border); color: var(--muted); }
+  .tag.running { color: #451a03; background: var(--amber); border-color: var(--amber); font-weight: 700; }
+  .tag.active { color: #02130c; background: var(--green); border-color: var(--green); font-weight: 700; }
+  .tag.missing { color: var(--magenta); border-color: var(--magenta); }
+  .counts { display: flex; gap: 8px; font-size: 10.5px; color: var(--muted); flex-wrap: wrap; }
+  .counts b { color: var(--text); }
+  .empty { color: var(--dim); padding: 14px; font-size: 12px; border: 1px dashed var(--border); border-radius: 4px; }
+  dialog { border: 1px solid var(--border); background: var(--panel); color: var(--text); border-radius: 4px;
+    width: min(680px, 92vw); padding: 0; }
+  dialog::backdrop { background: rgba(2,5,10,.7); }
+  .dlg { display: flex; flex-direction: column; max-height: 70vh; }
+  .dlg .dhead { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: center; }
+  .dlg .dpath { flex: 1; color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; }
+  .dlg .dlist { overflow: auto; flex: 1; }
+  .dlg .ditem { padding: 7px 12px; cursor: pointer; border-bottom: 1px solid rgba(30,42,63,.5); display: flex; gap: 8px; }
+  .dlg .ditem:hover { background: rgba(0,229,255,.07); }
+  .dlg .ditem .dname { flex: 1; }
+  .dlg .dfoot { padding: 10px 12px; border-top: 1px solid var(--border); display: flex; gap: 8px; align-items: center; }
+  .kbd { color: var(--dim); font-size: 10.5px; }
 </style>
 </head>
 <body>
 <header>
-  <span class="brand">DAG Orchestrator</span>
-  <span class="muted" id="meta">loading…</span>
+  <a class="brand" href="/">DAG Orchestrator</a>
+  <span class="crumb">Projects</span>
+  <span class="muted" id="meta" style="margin-left:auto">…</span>
 </header>
 <main>
-  <div id="addbox">
-    <input id="newdir" placeholder="absolute path to a project folder (e.g. C:\work\my-app)" />
+  <div id="banner"></div>
+
+  <div id="bar">
+    <input id="search" placeholder="filter projects…" autocomplete="off" />
+    <input id="newdir" placeholder="absolute path to a project folder (e.g. C:\work\my-app)" autocomplete="off" />
+    <button class="ghost" id="browseBtn">Browse…</button>
     <button id="addBtn">Add project</button>
     <span class="note" id="note"></span>
   </div>
-  <div id="projects"></div>
+
+  <div id="projects" class="grid"></div>
 </main>
+
+<dialog id="browser">
+  <div class="dlg">
+    <div class="dhead">
+      <button class="ghost" id="upBtn">Up</button>
+      <span class="dpath" id="curPath"></span>
+      <button class="ghost" id="closeBtn">Close</button>
+    </div>
+    <div class="dlist" id="dirs"></div>
+    <div class="dfoot">
+      <button id="pickBtn">Use this folder</button>
+      <span class="note">Folders holding a dag.run.json are marked.</span>
+    </div>
+  </div>
+</dialog>
+
 <script>
 const $ = (id) => document.getElementById(id);
+let projects = [];
+let currentDir = null;
 
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
 function note(msg, isError) {
-  const el = $('note');
-  el.textContent = msg || '';
-  el.className = 'note' + (isError ? ' err' : '');
+  $('note').textContent = msg || '';
+  $('note').className = 'note' + (isError ? ' err' : '');
+}
+function banner(html) {
+  $('banner').innerHTML = html;
+}
+
+// A page whose API does not answer must say so, not spin forever.
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const text = await res.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = { error: text.slice(0, 200) };
+  }
+  if (!res.ok) throw new Error(body && body.error ? body.error : `HTTP ${res.status}`);
+  return body;
 }
 
 function counts(row) {
   const order = ['running', 'ready', 'failed', 'blocked', 'gated', 'completed', 'pending'];
+  const c = row.counts || {};
   return order
-    .filter((k) => row.counts && row.counts[k])
-    .map((k) => `<span>${k} <b>${row.counts[k]}</b></span>`)
+    .filter((k) => c[k])
+    .map((k) => `<span>${k} <b>${c[k]}</b></span>`)
     .join('');
 }
 
-function runRow(row) {
-  const running = row.job && row.job.running;
-  const tag = running
-    ? '<span class="tag running">running</span>'
-    : row.archived
-      ? '<span class="tag archived">archived</span>'
-      : '<span class="tag active">active</span>';
-  const runId = escapeHtml(row.runId);
-  return `<a class="run" href="/r/${encodeURIComponent(row.runId)}">
-    ${tag}
-    <span class="id">${runId}</span>
-    <span class="obj">${escapeHtml(row.objective || '(no objective)')}</span>
-    <span class="counts">${counts(row)}</span>
-    <span class="id">${row.total} tasks</span>
+function card(p) {
+  const tag = !p.exists
+    ? '<span class="tag missing">missing</span>'
+    : p.running > 0
+      ? `<span class="tag running">${p.running} run${p.running > 1 ? 's' : ''} live</span>`
+      : p.totalRuns > 0
+        ? '<span class="tag active">idle</span>'
+        : '<span class="tag">no runs</span>';
+  return `<a class="card" href="/p/${encodeURIComponent(p.id)}" data-dir="${esc(p.dir)}">
+    <div class="row1">
+      <span class="pname">${esc(p.name)}</span>
+      ${tag}
+      <span class="spacer"></span>
+      <span class="muted">${p.totalRuns} run(s)</span>
+    </div>
+    <div class="ppath" title="${esc(p.dir)}">${esc(p.dir)}</div>
+    <div class="row2">
+      <span class="counts">${counts(p)}</span>
+      <span class="spacer"></span>
+      <button class="ghost" data-remove="${esc(p.id)}" data-name="${esc(p.name)}">Remove</button>
+    </div>
   </a>`;
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-}
-
-async function load() {
-  const res = await fetch('/api/runs');
-  const data = await res.json();
-  const projects = data.projects || [];
-  $('meta').textContent =
-    `${projects.length} project(s) · ${projects.reduce((n, p) => n + p.runs.length, 0)} run(s) · ${location.host}`;
+function render() {
+  const q = $('search').value.trim().toLowerCase();
+  const shown = q
+    ? projects.filter((p) => p.name.toLowerCase().includes(q) || p.dir.toLowerCase().includes(q))
+    : projects;
+  $('meta').textContent = `${projects.length} project(s) · ${projects.reduce((n, p) => n + p.totalRuns, 0)} run(s) · ${location.host}`;
   $('projects').innerHTML =
-    projects.length === 0
-      ? '<div class="empty">No projects yet. Add one above — it registers the folder and creates its first run.</div>'
-      : projects
-          .map(
-            (p) => `<div class="project">
-              <div class="phead">
-                <span class="pname">${escapeHtml(p.name)}</span>
-                <span class="ppath" title="${escapeHtml(p.dir)}">${escapeHtml(p.dir)}</span>
-                <span class="spacer"></span>
-                <button data-new="${escapeHtml(p.dir)}">New run</button>
-              </div>
-              ${p.runs.length === 0 ? '<div class="empty">no runs yet</div>' : p.runs.map(runRow).join('')}
-            </div>`,
-          )
-          .join('');
-  for (const btn of document.querySelectorAll('button[data-new]')) {
-    btn.onclick = async () => {
-      const dir = btn.dataset.new;
-      const objective = prompt('Objective for the new run?');
-      if (objective === null) return;
-      note('archiving and starting a new run…');
-      const r = await fetch('/api/runs/new', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ dir, objective }),
-      });
-      const out = await r.json();
-      if (!r.ok) note(out.error || 'failed', true);
-      else note(`created ${out.runId}${out.archivedTo ? ' (previous run archived)' : ''}`);
-      await load();
+    shown.length === 0
+      ? `<div class="empty">${projects.length === 0 ? 'No projects yet. Add a folder above — it registers the folder and creates its first run.' : 'Nothing matches that filter.'}</div>`
+      : shown.map(card).join('');
+  for (const btn of document.querySelectorAll('button[data-remove]')) {
+    btn.onclick = async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const id = btn.dataset.remove;
+      if (!confirm(`Remove ${btn.dataset.name} from the hub?\n\nFiles are left alone; the project is only unregistered.`)) return;
+      try {
+        await api(`/api/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        note('project removed');
+        await load();
+      } catch (err) {
+        note(String(err.message), true);
+      }
     };
   }
 }
 
-$('addBtn').onclick = async () => {
+async function load() {
+  try {
+    const data = await api('/api/projects');
+    projects = data.projects || [];
+    banner('');
+    render();
+  } catch (err) {
+    banner(
+      `<b>Cannot reach the hub API.</b> ${esc(err.message)}<br>` +
+        `If you just updated the code, the running hub is an older build — stop it and run <code>dag serve</code> again.`,
+    );
+    $('meta').textContent = location.host;
+  }
+  // The context call is optional: older hubs do not have it.
+  try {
+    const ctx = await api('/api/context');
+    if (ctx.staleBuild) {
+      banner(
+        `<b>This hub is running older code.</b> Pages are read from disk, so the API may not match — restart it: <code>dag serve</code>`,
+      );
+    }
+  } catch {
+    /* older hub: the banner above covers it */
+  }
+}
+
+// ---- folder browser -------------------------------------------------------
+async function browse(dir) {
+  const q = dir ? `?dir=${encodeURIComponent(dir)}` : '';
+  try {
+    const data = await api(`/api/fs${q}`);
+    currentDir = data.dir;
+    $('curPath').textContent = data.dir;
+    $('curPath').title = data.dir;
+    $('pickBtn').disabled = !data.isProject && false;
+    $('dirs').innerHTML =
+      (data.parent ? `<div class="ditem" data-goto="${esc(data.parent)}"><span class="dname">..</span></div>` : '') +
+      (data.dirs.length === 0
+        ? '<div class="ditem"><span class="dname muted">no folders here</span></div>'
+        : data.dirs
+            .map(
+              (d) =>
+                `<div class="ditem" data-goto="${esc(d.path)}"><span class="dname">${esc(d.name)}</span>${d.hasRun ? '<span class="tag active">dag run</span>' : ''}</div>`,
+            )
+            .join(''));
+    for (const el of $('dirs').querySelectorAll('[data-goto]')) {
+      el.onclick = () => browse(el.dataset.goto);
+    }
+  } catch (err) {
+    $('dirs').innerHTML = `<div class="ditem"><span class="dname err">${esc(err.message)}</span></div>`;
+  }
+}
+
+$('browseBtn').onclick = () => {
+  $('browser').showModal();
+  browse($('newdir').value.trim() || null);
+};
+$('closeBtn').onclick = () => $('browser').close();
+$('upBtn').onclick = async () => {
+  const data = await api(`/api/fs${currentDir ? `?dir=${encodeURIComponent(currentDir)}` : ''}`);
+  if (data.parent) browse(data.parent);
+};
+$('pickBtn').onclick = () => {
+  if (!currentDir) return;
+  $('newdir').value = currentDir;
+  $('browser').close();
+  note('folder selected — press Add project');
+};
+
+// ---- add ------------------------------------------------------------------
+async function add() {
   const dir = $('newdir').value.trim();
   if (!dir) return;
   note('registering…');
-  const r = await fetch('/api/projects', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ dir }),
-  });
-  const out = await r.json();
-  if (!r.ok) note(out.error || 'failed', true);
-  else note(`registered ${out.project.name}`);
-  $('newdir').value = '';
-  await load();
+  $('addBtn').disabled = true;
+  try {
+    const out = await api('/api/projects', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir }),
+    });
+    note(`registered ${out.project.name}`);
+    $('newdir').value = '';
+    await load();
+  } catch (err) {
+    note(String(err.message), true);
+  } finally {
+    $('addBtn').disabled = false;
+  }
+}
+$('addBtn').onclick = add;
+$('newdir').onkeydown = (e) => {
+  if (e.key === 'Enter') add();
 };
+$('search').oninput = render;
 
 load();
 setInterval(load, 5000);

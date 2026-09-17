@@ -47,7 +47,7 @@ export function saveRegistry(registry: Registry): void {
 }
 
 export function projectId(file: string): string {
-  const abs = resolve(file);
+  const abs = resolve(cleanPath(file));
   return `proj_${createHash('sha1').update(abs.toLowerCase()).digest('hex').slice(0, 8)}`;
 }
 
@@ -60,9 +60,22 @@ export function defaultProjectName(file: string): string {
 }
 
 export function resolveRunFile(target: string): string {
-  const abs = resolve(target);
+  const abs = resolve(cleanPath(target));
   if (abs.endsWith('.json')) return abs;
   return join(abs, 'dag.run.json');
+}
+
+// Windows' "Copy as path" hands over a quoted string, and a trailing quote in
+// the registry made a project that could never be opened.
+export function cleanPath(target: string): string {
+  let t = target.trim();
+  while (
+    (t.startsWith('"') && t.endsWith('"')) ||
+    (t.startsWith("'") && t.endsWith("'"))
+  ) {
+    t = t.slice(1, -1).trim();
+  }
+  return t;
 }
 
 // The same run file reaches the registry as "C:/x/dag.run.json",
