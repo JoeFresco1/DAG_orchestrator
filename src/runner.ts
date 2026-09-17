@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createWriteStream, existsSync, mkdirSync, rmSync, statSync, writeFileSync, type WriteStream } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { resolveCommand } from './command-resolution.js';
 import {
   commitAll,
@@ -17,6 +18,7 @@ import {
 } from './git-worktree.js';
 import { depsMet, describeDeps, gateBlocks, isTerminal, topoSort } from './graph.js';
 import { attemptsForChain, planAttempt, type HarnessCandidate } from './harness-chain.js';
+import { findHarness } from './harnesses.js';
 import {
   decideReviewers,
   summarizeVerdicts,
@@ -44,6 +46,7 @@ import {
   type DagEvent,
   type DepFailurePolicy,
   type FailureKind,
+  type FinalReviewMode,
   type GatePolicy,
   type Run,
   type Task,
@@ -61,6 +64,12 @@ const refuseMessage = (file: string): string =>
 
 export interface TokenContext {
   planFile?: string;
+  // End-of-run review: where the diff is, and the range it covers.
+  diffFile?: string;
+  diffBase?: string;
+  diffHead?: string;
+  diffStat?: string;
+  files?: string;
   deps?: string;
   depsAll?: string;
   depsFile?: string;
@@ -215,6 +224,11 @@ export function renderTokens(token: string, task: Task, ctx?: TokenContext): str
     spec: task.spec ?? '',
     plan: task.plan ?? '(no plan)',
     planFile: ctx?.planFile ?? '',
+    diffFile: ctx?.diffFile ?? '',
+    diffBase: ctx?.diffBase ?? '',
+    diffHead: ctx?.diffHead ?? '',
+    diffStat: ctx?.diffStat ?? '',
+    files: ctx?.files ?? '',
     deps: ctx?.deps ?? '(no dependencies)',
     depsAll: ctx?.depsAll ?? '(no upstream tasks)',
     depsFile: ctx?.depsFile ?? '',
@@ -327,6 +341,17 @@ export interface RunSummary {
   stopped: boolean;
   budgetReached: boolean;
   interrupted: RecoveryResult;
+  // End-of-run review outcome, when one was configured.
+  finalReview: FinalReviewSummary | null;
+}
+
+export interface FinalReviewSummary {
+  mode: FinalReviewMode;
+  verdict: 'pass' | 'fail' | 'error' | 'skipped';
+  reason: string;
+  reviewed: string[];
+  failed: string[];
+  requeued: string[];
 }
 
 interface AttemptLog {
@@ -357,9 +382,13 @@ export class DagRunner {
   private worktrees = new Map<string, string>();
   private worktreeBases = new Map<string, string>();
   private integration: { path: string; branch: string } | null = null;
+  private integrationBase: string | null = null;
   private repoDir: string | null = null;
   private excludes: SnapshotExcludes | undefined;
   private landChain: Promise<void> = Promise.resolve();
+  private reviewRound = 0;
+  private reviewRounds = 0;
+  private finalReview: FinalReviewSummary | null = null;
 
   constructor(
     readonly state: Run,
@@ -411,6 +440,7 @@ export class DagRunner {
           stopped: true,
           budgetReached: false,
           interrupted: { requeued: [], orphanPids: [] },
+          finalReview: null,
         };
         this.flush();
         return Promise.resolve();
@@ -464,6 +494,7 @@ export class DagRunner {
         stopped: true,
         budgetReached: false,
         interrupted: { requeued: [], orphanPids: [] },
+        finalReview: null,
       };
       // Never leave the runner wedged: a refused start must be retryable.
       this.active = false;
@@ -650,6 +681,34 @@ export class DagRunner {
       this.opts.maxWallClockMs ?? run.settings.maxWallClockMs ?? DEFAULT_SETTINGS.maxWallClockMs;
     const deadline = budgetMs > 0 ? Date.now() + budgetMs : 0;
 
+    // Work converges, then an end-of-run review may send some of it back and
+    // we go around again — that is the only reason this is a loop of loops.
+    const reviewMode = run.settings.finalReview ?? 'off';
+    const roundsLeftOf = (): number =>
+      Math.max(0, (run.settings.finalReviewRounds ?? 1) - this.reviewRounds);
+    for (;;) {
+      await this.runTasks(execute, scope, concurrency, deadline);
+      if (reviewMode === 'off' || this.stopping || this.budgetReached) {
+        this.finalReview = null;
+        break;
+      }
+      const outcome = await this.finalReviewPass(execute, scope, concurrency, reviewMode, roundsLeftOf());
+      this.finalReview = outcome;
+      if (outcome.verdict === 'pass' || outcome.verdict === 'skipped' || outcome.verdict === 'error') break;
+      if (outcome.requeued.length === 0) break;
+      this.reviewRounds += 1;
+      this.log('run-review', null, `round ${this.reviewRounds}: ${outcome.requeued.length} task(s) sent back for fixes`);
+    }
+    this.summarize(scope);
+  }
+
+  private async runTasks(
+    execute: Executor,
+    scope: Set<string> | null,
+    concurrency: number,
+    deadline: number,
+  ): Promise<void> {
+    const run = this.state;
     while (true) {
       if (deadline > 0 && Date.now() > deadline) {
         this.budgetReached = true;
@@ -691,6 +750,10 @@ export class DagRunner {
       await Promise.all(batch.map((task) => this.executeTask(task, execute, scope)));
     }
 
+  }
+
+  private summarize(scope: Set<string> | null): void {
+    const run = this.state;
     const scoped =
       scope === null
         ? Object.keys(run.tasks).filter((id) => run.tasks[id])
@@ -708,11 +771,16 @@ export class DagRunner {
       stopped: this.stopping,
       budgetReached: this.budgetReached,
       interrupted: this.recovery,
+      finalReview: this.finalReview,
     };
     const parts = [`${completed.length} completed`];
     if (failed.length > 0) parts.push(`${failed.length} failed`);
     if (skipped.length > 0) parts.push(`${skipped.length} skipped`);
     if (unfinished.length > 0) parts.push(`${unfinished.length} unfinished`);
+    const review = this.finalReview;
+    if (review && review.verdict !== 'skipped') {
+      parts.push(`review ${review.verdict}${review.failed.length > 0 ? `: ${review.failed.join(', ')}` : ''}`);
+    }
     const line = `settled: ${parts.join(', ')}`;
     this.log('run-end', null, line);
     // Always notify on run end: an unattended run finishing cleanly is the
@@ -731,6 +799,249 @@ export class DagRunner {
     } catch {
       return 0;
     }
+  }
+
+  // --- end-of-run review ---------------------------------------------------
+
+  // One reviewer per completed task (needs the per-task diff that worktree
+  // isolation provides), or a single reviewer for the integrated result.
+  // A rejection sends the task back with the review notes as {lastRejection},
+  // bounded by finalReviewRounds; with no rounds left the task fails.
+  private async finalReviewPass(
+    execute: Executor,
+    scope: Set<string> | null,
+    concurrency: number,
+    mode: FinalReviewMode,
+    roundsLeft: number,
+  ): Promise<FinalReviewSummary> {
+    const run = this.state;
+    const isolation = (run.settings.worktree ?? 'none') === 'task';
+    // Without isolation every task's changes are the same working tree, so a
+    // per-task review would review the same thing N times.
+    const effective: FinalReviewMode = mode === 'per-task' && !isolation ? 'run' : mode;
+    if (effective !== mode) {
+      this.log('note', null, 'end-of-run review: per-task needs worktree isolation; reviewing the run as a whole');
+    }
+    const first = Object.values(run.tasks)[0] ?? null;
+    const cmdTemplate = this.reviewCommand(effective === 'per-task' ? first : null);
+    if (!cmdTemplate) {
+      this.log('note', null, 'end-of-run review skipped: no review command (set --final-review-cmd)');
+      return { mode: effective, verdict: 'skipped', reason: 'no review command', reviewed: [], failed: [], requeued: [] };
+    }
+    this.reviewRound += 1;
+    const round = this.reviewRound;
+    const reviewed: string[] = [];
+    const failed: string[] = [];
+    const requeued: string[] = [];
+    const errors: string[] = [];
+
+    const candidates = Object.keys(run.tasks).filter(
+      (id) =>
+        (scope === null || scope.has(id)) &&
+        run.tasks[id].status === 'completed' &&
+        run.tasks[id].finalReview?.verdict !== 'pass',
+    );
+
+    const verdictOf = (output: string): { verdict: 'pass' | 'fail'; reason: string } => {
+      const parsed = parseVerdict(stripAnsi(output));
+      if (parsed.kind === 'pass') return { verdict: 'pass', reason: parsed.reason };
+      return {
+        verdict: 'fail',
+        reason: (parsed.reason || 'no VERDICT line in the review output').slice(0, 400),
+      };
+    };
+
+    if (effective === 'run') {
+      const head =
+        git(this.integration?.path ?? this.repoDir ?? '.', ['rev-parse', 'HEAD']).stdout || null;
+      const base = first?.diffBase ?? this.integrationBase ?? null;
+      const diff = this.writeReviewDiff('run', base, head);
+      // The prompt goes in as {spec}; the diff travels as {diffFile}.
+      const promptTask = { ...(first ?? ({} as Task)), id: first?.id ?? run.id, spec: this.runReviewPrompt(diff.ctx) };
+      this.log('run-review', null, `end-of-run review: whole run (round ${round})`);
+      try {
+        const outcome = await this.runPhase(promptTask, execute, cmdTemplate, 'review', undefined, undefined, diff.ctx);
+        const verdict = verdictOf(outcome.output);
+        if (verdict.verdict === 'pass') {
+          this.log('run-review', null, 'run review passed');
+          return { mode: effective, verdict: 'pass', reason: verdict.reason, reviewed: candidates, failed: [], requeued: [] };
+        }
+        this.log('run-review', null, `run review failed: ${verdict.reason.slice(0, 200)}`);
+        return { mode: effective, verdict: 'fail', reason: verdict.reason, reviewed: candidates, failed: candidates, requeued: [] };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.log('run-review', null, `run review could not run: ${message.slice(0, 200)}`);
+        return { mode: effective, verdict: 'error', reason: message.slice(0, 400), reviewed, failed, requeued };
+      }
+    }
+
+    const reviewOne = async (task: Task): Promise<void> => {
+      const diff = this.writeReviewDiff(task.id, task.diffBase, task.diffHead);
+      const promptTask = { ...task, spec: this.reviewPrompt(task, diff.ctx) };
+      this.log(
+        'task-review-start',
+        task.id,
+        `reviewing ${task.diffBase?.slice(0, 8) ?? '(no base)'}..${task.diffHead?.slice(0, 8) ?? '(no head)'}`,
+      );
+      try {
+        const outcome = await this.runPhase(promptTask, execute, cmdTemplate, 'review', undefined, undefined, diff.ctx);
+        const verdict = verdictOf(outcome.output);
+        reviewed.push(task.id);
+        if (verdict.verdict === 'pass') {
+          task.finalReview = { verdict: 'pass', reason: verdict.reason, at: nowIso(), round };
+          this.log('task-review-pass', task.id, `review passed${verdict.reason ? `: ${verdict.reason.slice(0, 120)}` : ''}`);
+          return;
+        }
+        failed.push(task.id);
+        if (roundsLeft > 0) {
+          // Redo it: the review notes become the fix prompt's {lastRejection}.
+          task.lastRejection = `end-of-run review: ${verdict.reason}`;
+          task.finalReview = null;
+          task.status = 'pending';
+          task.failureKind = null;
+          task.result = 'sent back by the end-of-run review';
+          task.diffBase = null;
+          task.diffHead = null;
+          this.log('task-review-fail', task.id, `review rejected the work; requeued: ${verdict.reason.slice(0, 200)}`);
+          requeued.push(task.id);
+        } else {
+          task.finalReview = { verdict: 'fail', reason: verdict.reason, at: nowIso(), round };
+          task.status = 'failed';
+          task.failureKind = 'review';
+          task.result = `end-of-run review failed: ${verdict.reason}`.slice(0, RESULT_LIMIT);
+          this.log('task-review-fail', task.id, `review failed (no rounds left): ${verdict.reason.slice(0, 200)}`);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        task.finalReview = { verdict: 'error', reason: message.slice(0, 400), at: nowIso(), round };
+        errors.push(`${task.id}: ${message.slice(0, 120)}`);
+        this.log('task-review-fail', task.id, `review could not run: ${message.slice(0, 200)}`);
+      }
+      this.persist();
+    };
+
+    this.log(
+      'run-review',
+      null,
+      `end-of-run review: ${candidates.length} task(s) (round ${round})${roundsLeft > 0 ? '' : ', advisory only'}`,
+    );
+    const queue = [...candidates];
+    const workers = Math.min(concurrency, Math.max(1, queue.length));
+    await Promise.all(
+      Array.from({ length: workers }, async () => {
+        for (;;) {
+          const id = queue.shift();
+          const task = id ? run.tasks[id] : undefined;
+          if (!task || this.stopping) return;
+          await reviewOne(task);
+        }
+      }),
+    );
+
+    if (errors.length > 0 && failed.length === 0) {
+      return {
+        mode: effective,
+        verdict: 'error',
+        reason: errors.join('; ').slice(0, 400),
+        reviewed,
+        failed,
+        requeued,
+      };
+    }
+    return {
+      mode: effective,
+      verdict: failed.length > 0 || errors.length > 0 ? 'fail' : 'pass',
+      reason: failed.length > 0 ? `${failed.length} task(s) rejected by review` : errors.join('; '),
+      reviewed,
+      failed,
+      requeued,
+    };
+  }
+
+  private reviewCommand(task: Task | null): string | null {
+    const explicit = this.state.settings.finalReviewCmd;
+    if (explicit) return explicit;
+    const chain: HarnessCandidate[] =
+      (task?.harnessChain?.length ? task.harnessChain : null) ??
+      (this.state.settings.harnessChain?.length ? this.state.settings.harnessChain : []);
+    const named = task?.harness ?? chain[chain.length - 1]?.harness ?? null;
+    const harness = named ? findHarness(named) : undefined;
+    if (harness?.reviewCmd) return harness.reviewCmd;
+    for (const candidate of ['opencode', 'claude', 'codex', 'cursor-agent', 'gemini']) {
+      const preset = findHarness(candidate);
+      if (preset?.reviewCmd) return preset.reviewCmd;
+    }
+    return null;
+  }
+
+  private reviewPrompt(task: Task, diff: TokenContext): string {
+    return [
+      `Code review of one task from an automated run (task ${task.id}: ${task.title}).`,
+      `The unified diff this task merged is in ${diff.diffFile ?? '(unavailable)'}` +
+        (diff.diffBase && diff.diffHead ? ` (git diff ${diff.diffBase} ${diff.diffHead}).` : '.'),
+      diff.files ? `Files changed:\n${diff.files}` : '',
+      diff.diffStat ? `Change summary:\n${diff.diffStat}` : '',
+      'Read the real files, not just the diff, and judge correctness and whether the spec is met.',
+      'Report concrete findings with file:line. Do not modify any file.',
+      `Spec: ${task.spec || '(none)'}`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  private runReviewPrompt(diff: TokenContext): string {
+    const run = this.state;
+    const tasks = Object.values(run.tasks)
+      .map((t) => `- ${t.id} [${t.status}] ${t.title}`)
+      .join('\n');
+    return [
+      `Code review of a whole automated run (${run.id}: ${run.objective}).`,
+      `The integrated diff is in ${diff.diffFile ?? '(unavailable)'}` +
+        (diff.diffBase && diff.diffHead ? ` (git diff ${diff.diffBase} ${diff.diffHead}).` : '.'),
+      'Judge the work as a whole: correctness, consistency between tasks, obvious gaps.',
+      'Report concrete findings with file:line. Do not modify any file.',
+      'Tasks:',
+      tasks,
+    ].join('\n');
+  }
+
+  // Writes the diff where the reviewer can read it (mirrors {planFile}), and
+  // returns the token context that points at it.
+  private writeReviewDiff(
+    name: string,
+    base: string | null,
+    head: string | null,
+  ): { ctx: TokenContext } {
+    const dir = this.opts.file
+      ? join(runPaths(this.opts.file).dir, 'reviews')
+      : join(tmpdir(), 'dag-reviews');
+    const repo = this.repoDir ?? this.opts.cwd ?? (this.opts.file ? dirname(this.opts.file) : process.cwd());
+    let body = '';
+    let stat = '';
+    let files = '';
+    if (base && head) {
+      const diff = git(repo, ['diff', base, head]);
+      const statRes = git(repo, ['diff', '--stat', base, head]);
+      const names = git(repo, ['diff', '--name-only', base, head]);
+      body = diff.code === 0 ? diff.stdout : `(diff unavailable: ${diff.stderr})`;
+      stat = statRes.code === 0 ? statRes.stdout : '';
+      files = names.code === 0 ? names.stdout : '';
+    } else {
+      const diff = git(repo, ['diff', 'HEAD']);
+      body = [
+        '(no recorded diff for this task: it produced no changes, or the run used no worktree isolation)',
+        diff.code === 0 ? diff.stdout : '',
+      ].join('\n');
+    }
+    const file = join(dir, `${name}.diff`);
+    const limit = 400_000;
+    try {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(file, body.length > limit ? `${body.slice(0, limit)}\n… [truncated]` : `${body}\n`, 'utf8');
+    } catch {
+      // best effort: the reviewer can still inspect the tree
+    }
+    return { ctx: { diffFile: file, diffBase: base ?? '', diffHead: head ?? '', diffStat: stat, files } };
   }
 
   private notify(event: string, taskId: string | null, message: string): void {
@@ -858,7 +1169,7 @@ export class DagRunner {
     label: 'run' | 'review' | 'plan',
     worktreePath?: string,
     planFile?: string,
-    depsContext?: { deps: string; depsAll: string; depsFile?: string },
+    depsContext?: TokenContext,
   ): Promise<ExecOutcome> {
     const timeoutMs = task.timeoutMs ?? this.opts.timeoutMs ?? this.state.settings.timeoutMs;
     const silenceMs = task.silenceMs ?? this.opts.silenceMs ?? this.state.settings.silenceMs;
@@ -954,6 +1265,11 @@ export class DagRunner {
       deps: depsContext?.deps,
       depsAll: depsContext?.depsAll,
       depsFile: depsContext?.depsFile,
+      diffFile: depsContext?.diffFile,
+      diffBase: depsContext?.diffBase,
+      diffHead: depsContext?.diffHead,
+      diffStat: depsContext?.diffStat,
+      files: depsContext?.files,
     };
 
     try {
@@ -1252,6 +1568,7 @@ export class DagRunner {
       const integration = ensureIntegrationWorktree(repoDir, this.state.id, undefined, this.excludes);
       this.repoDir = repoDir;
       this.integration = { path: integration.path, branch: integration.branch };
+      this.integrationBase = integration.base;
       const dirty = isDirty(repoDir, this.excludes);
       this.log(
         'note',
@@ -1303,6 +1620,7 @@ export class DagRunner {
           task.commit = committed.commit;
           this.log('note', task.id, `committed ${committed.files} file(s) as ${committed.commit.slice(0, 8)}`);
         }
+        const before = git(this.integration.path, ['rev-parse', 'HEAD']).stdout;
         const merge = mergeIntoIntegration(this.integration.path, task.branch ?? '', task.id);
         if (!merge.merged) {
           this.log(
@@ -1313,6 +1631,11 @@ export class DagRunner {
               : `merge failed: ${merge.detail}`,
           );
           return { ok: false, conflict: merge.detail };
+        }
+        const after = git(this.integration.path, ['rev-parse', 'HEAD']).stdout;
+        if (before && after && before !== after) {
+          task.diffBase = before;
+          task.diffHead = after;
         }
         return { ok: true };
       } catch (err) {

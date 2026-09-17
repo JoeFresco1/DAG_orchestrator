@@ -444,6 +444,56 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (cmd === 'final-review') {
+    guard(file, rest);
+    const run = loadRun(file);
+    const mode = flag(rest, 'mode') ?? run.settings.finalReview ?? 'off';
+    if (mode !== 'per-task' && mode !== 'run') {
+      throw new Error('nothing to review: use --mode per-task|run (or dag settings --final-review)');
+    }
+    run.settings.finalReview = mode;
+    const rounds = countFlag(rest, 'rounds', 0);
+    if (rounds !== undefined) run.settings.finalReviewRounds = rounds;
+    if (has(rest, 'cmd')) run.settings.finalReviewCmd = flag(rest, 'cmd') ?? null;
+    saveRun(run, file);
+    const runner = new DagRunner(run, {
+      file,
+      persist: (state) => saveRun(state, file),
+      onEvent: (ev) => {
+        const line = `[${ev.ts.slice(11, 19)}] ${ev.type.padEnd(18)} ${ev.taskId ? `${ev.taskId} ` : ''}${ev.message}`;
+        if (wantsJson(rest)) console.error(line);
+        else console.log(line);
+      },
+    });
+    // Review without re-running work: the scope is exactly what already
+    // completed (a task the review sends back is re-executed by the same id).
+    const reviewScope = new Set(
+      Object.keys(run.tasks).filter((id) => run.tasks[id].status === 'completed'),
+    );
+    await runner.start(reviewScope);
+    saveRun(run, file);
+    const summary = runner.result;
+    emit(
+      rest,
+      {
+        runId: run.id,
+        review: summary?.finalReview ?? null,
+        failed: summary?.failed ?? [],
+      },
+      () => {
+        const review = summary?.finalReview;
+        if (!review) return 'no review ran';
+        return `review ${review.verdict}${review.reason ? `: ${review.reason}` : ''}` +
+          `\n  reviewed: ${review.reviewed.join(', ') || '(none)'}` +
+          `\n  failed: ${review.failed.join(', ') || '(none)'}`;
+      },
+    );
+    if (summary?.finalReview && summary.finalReview.verdict !== 'pass' && summary.finalReview.verdict !== 'skipped') {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   if (cmd === 'settings') {
     guard(file, rest);
     const run = loadRun(file);
@@ -486,6 +536,18 @@ async function main(): Promise<void> {
     if (has(rest, 'fail-on-exit')) patch.failOnNonZeroExit = true;
     if (has(rest, 'no-fail-on-exit')) patch.failOnNonZeroExit = false;
     if (has(rest, 'auto-fail-on-exit')) patch.failOnNonZeroExit = null;
+    const finalReview = flag(rest, 'final-review');
+    if (finalReview !== undefined) {
+      if (finalReview !== 'off' && finalReview !== 'per-task' && finalReview !== 'run') {
+        throw new Error(`--final-review must be off|per-task|run (got ${finalReview})`);
+      }
+      patch.finalReview = finalReview;
+    }
+    const finalReviewRounds = countFlag(rest, 'final-review-rounds', 0);
+    if (finalReviewRounds !== undefined) patch.finalReviewRounds = finalReviewRounds;
+    if (has(rest, 'final-review-cmd')) {
+      patch.finalReviewCmd = flag(rest, 'final-review-cmd') ?? null;
+    }
     const model = flag(rest, 'model');
     if (model !== undefined) patch.model = model;
     const variant = flag(rest, 'variant');
@@ -614,6 +676,7 @@ async function main(): Promise<void> {
         unfinished: summary?.unfinished ?? [],
         budgetReached: summary?.budgetReached ?? false,
         interrupted: summary?.interrupted ?? { requeued: [], orphanPids: [] },
+        finalReview: summary?.finalReview ?? null,
       },
       () => summarize(run),
     );
@@ -626,6 +689,10 @@ async function main(): Promise<void> {
       console.error('run did not start; nothing was executed');
       process.exitCode = 1;
       return;
+    }
+    const review = summary.finalReview;
+    if (review && review.verdict !== 'pass' && review.verdict !== 'skipped') {
+      process.exitCode = 1;
     }
     if (summary.failed.length > 0 || summary.unfinished.length > 0) {
       process.exitCode = 1;
@@ -1342,6 +1409,8 @@ usage: dag <cmd> [flags]
   log [-n 40]                  event log (full history)
   logs --id ID [--attempt N]   per-attempt stdout/stderr
   gc [--days 7]                prune old attempt logs
+  final-review [--mode per-task|run] [--rounds N] [--cmd "agent ..."]
+  settings --final-review off|per-task|run   end-of-run code review
   settings [--concurrency N] [--retries N] [--timeout SEC] [--silence SEC]
       [--max-hours H] [--on-dep-failure block|skip] [--gates wait|skip]
       [--notify "command"] [--worktree none|task]

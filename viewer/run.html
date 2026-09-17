@@ -604,6 +604,9 @@ function renderHeader(s) {
     if (r.skipped.length) parts.push(`${r.skipped.length} skipped`);
     if (r.unfinished.length) parts.push(`${r.unfinished.length} unfinished`);
     if (r.budgetReached) parts.push('wall-clock budget reached');
+    if (r.finalReview && r.finalReview.verdict !== 'skipped') {
+      parts.push(`final review ${r.finalReview.verdict}${r.finalReview.failed.length ? `: ${r.finalReview.failed.join(', ')}` : ''}`);
+    }
     note((r.stopped ? 'stopped — ' : '') + parts.join(', '), r.failed.length || r.unfinished.length ? 'error' : 'ok');
   } else note('');
 }
@@ -690,6 +693,7 @@ function renderInspector() {
   if (t.reviewCmd) bits.push(`reviews: ${t.reviews}/${t.reviewRounds + 1}`);
   if (t.planCmd) bits.push(t.plan ? `plan: ${t.plan.length} chars` : 'plan: pending');
   if (t.repairRounds > 0) bits.push(`repairs: ${t.repairs}/${t.repairRounds}`);
+  if (t.finalReview) bits.push(`final review: ${t.finalReview.verdict}`);
   if (t.exitCode !== null) bits.push(`exit: ${t.exitCode}`);
   if (t.failureKind) bits.push(`failure: ${t.failureKind}`);
   if (t.branch) bits.push(`branch: ${t.branch}${t.commit ? ` @ ${t.commit.slice(0, 8)}` : ''}`);
@@ -710,6 +714,7 @@ function renderInspector() {
     ${t.plan ? `<pre>plan output:\n${esc(t.plan)}</pre>` : ''}
     ${t.reviewCmd ? `<pre>review: ${esc(t.reviewCmd)}</pre>` : ''}
     ${t.result ? `<pre>result: ${esc(t.result)}</pre>` : ''}
+    ${t.finalReview ? `<pre>final review (round ${esc(String(t.finalReview.round))}): ${esc(t.finalReview.verdict)}${t.finalReview.reason ? `\n${esc(t.finalReview.reason)}` : ''}</pre>` : ''}
     ${reviewPanel(t)}
   ${t.reviewResult ? `<pre>review: ${esc(t.reviewResult)}</pre>` : ''}
     ${t.lastOutput && t.status === 'running' ? `<pre>live output:\n${esc(t.lastOutput)}</pre>` : ''}
@@ -786,7 +791,7 @@ function detailDisplay(t) {
 }
 
 // ---- events ----
-const EV_CLASS = { 'task-fail': 'fail', 'task-stalled': 'fail', 'task-timeout': 'fail', 'task-done': 'done', 'task-start': 'start', 'run-stop': 'stop', 'task-killed': 'stop', 'task-retry': 'start', 'task-skip': 'skip', 'task-interrupted': 'skip' };
+const EV_CLASS = { 'task-fail': 'fail', 'task-stalled': 'fail', 'task-timeout': 'fail', 'task-done': 'done', 'task-start': 'start', 'run-stop': 'stop', 'task-killed': 'stop', 'task-retry': 'start', 'task-skip': 'skip', 'task-interrupted': 'skip', 'task-review-fail': 'fail', 'task-review-pass': 'done', 'task-review-start': 'start' };
 async function fetchEvents() {
   try {
     const r = await fetch(`${API}/events?since=${latestSeq}`);

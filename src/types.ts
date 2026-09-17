@@ -15,6 +15,15 @@ export const TASK_STATUSES: TaskStatus[] = [
   'skipped',
 ];
 
+export type FinalReviewMode = 'off' | 'per-task' | 'run';
+
+export interface FinalReviewVerdict {
+  verdict: 'pass' | 'fail' | 'error';
+  reason: string;
+  at: string;
+  round: number;
+}
+
 export type TerminalStatus = 'completed' | 'failed' | 'skipped';
 
 // What the UI/CLI show: real status plus two derived states.
@@ -51,6 +60,10 @@ export type EventType =
   | 'task-repair'
   | 'task-plan'
   | 'task-stall-warning'
+  | 'task-review-start'
+  | 'task-review-pass'
+  | 'task-review-fail'
+  | 'run-review'
   | 'notify'
   | 'edit'
   | 'note';
@@ -143,6 +156,10 @@ export interface Task {
   harnessChain: HarnessCandidate[] | null;
   // Tool used by the last attempt, when a chain applied.
   harness: string | null;
+  // End-of-run review: the diff this task merged (integration before/after).
+  diffBase: string | null;
+  diffHead: string | null;
+  finalReview: FinalReviewVerdict | null;
   // Model selection: null = use the run default. Commands reference these as
   // {model} / {variant}, so the UI can retarget tasks without editing text.
   model: string | null;
@@ -187,6 +204,12 @@ export interface RunSettings {
   worktreePrepareCmd: string;
   // Fallback chain for every task that does not define its own; empty = none.
   harnessChain: HarnessCandidate[];
+  // End-of-run review: off, one reviewer per task, or one for the whole run.
+  finalReview: FinalReviewMode;
+  // How many times a failed end-of-run review may send work back.
+  finalReviewRounds: number;
+  // Command override for the end-of-run reviewer (defaults to the preset).
+  finalReviewCmd: string | null;
   // Treat a non-zero work exit as a failure. null = auto: on when a chain is
   // set (a dead tool should hand over), off otherwise (agents lie about codes).
   failOnNonZeroExit: boolean | null;
@@ -216,6 +239,9 @@ export const DEFAULT_SETTINGS: RunSettings = {
   worktreePrepareCmd: '',
   harnessChain: [],
   failOnNonZeroExit: null,
+  finalReview: 'off',
+  finalReviewRounds: 1,
+  finalReviewCmd: null,
   mergeRounds: 2,
 };
 
@@ -289,6 +315,9 @@ export const DYNAMIC_FIELDS = [
   'reviewerVerdicts',
   'lastRejection',
   'harness',
+  'diffBase',
+  'diffHead',
+  'finalReview',
 ] as const;
 
 export const PLAN_LIMIT = 20000;

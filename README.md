@@ -133,6 +133,33 @@ that write files instead of streaming.
 `dag kill-orphans` reaps process trees from a dead run, `dag serve
 --auto-resume` does both at boot.
 
+## End-of-run code review
+
+When the work converges, an agent can review it — one reviewer per task, or one
+for the run as a whole:
+
+```bash
+dag settings --final-review per-task --final-review-rounds 1
+# optional: your own reviewer command (defaults to the harness preset)
+dag settings --final-review-cmd "claude -p --dangerously-skip-permissions \"Review the diff in {diffFile}. End with VERDICT: PASS or VERDICT: FAIL: reason\""
+dag final-review --mode per-task          # or run it after the fact
+```
+
+Each reviewer gets the task's own merged diff (`git diff <base> <head>`), the
+file list and the change summary written to `dag.run.d/reviews/<task>.diff`,
+plus the spec, and must end with the verdict line.
+
+- **A rejection fixes something.** With rounds left, the task is requeued with
+  the review notes as `{lastRejection}`, so the next attempt is a fix pass; with
+  no rounds left it fails with kind `review`. A passing task is not re-reviewed.
+- **Per-task needs isolation** (`--worktree task`), because that is what makes a
+  diff attributable to one task. Without it the run is reviewed as a whole.
+- **Run-level verdicts are advisory**: one reviewer cannot be attributed to one
+  task, so a failing verdict is reported and the run exits non-zero rather than
+  silently redoing everything.
+- `{diffFile}`, `{diffBase}`, `{diffHead}`, `{diffStat}`, `{files}` are
+  available in the review command for a custom reviewer.
+
 ## Tokens
 
 Usable in any task command (`cmd`, `planCmd`, `reviewCmd`):
@@ -143,6 +170,8 @@ Usable in any task command (`cmd`, `planCmd`, `reviewCmd`):
 | `{plan}` `{planFile}` | planner output, inline / as a file |
 | `{deps}` | what each direct dependency actually produced (result, verdict, branch@commit) |
 | `{depsAll}` `{depsFile}` | transitive roll-up, inline / as a file |
+| `{lastRejection}` | why the previous attempt was rejected |
+| `{diffFile}` `{diffBase}` `{diffHead}` `{diffStat}` `{files}` | end-of-run review: the merged diff, its range, its summary |
 | `{model}` `{variant}` | effective model/effort: task override → run default; unset removes the flag |
 
 ## One host, many projects
@@ -208,6 +237,7 @@ retry --id X [--cascade]     requeue a failed task (and its failed subtree)
 retry-failed                 requeue everything that failed
 resume · kill-orphans · skip-blocked · gc · settings · set · models
 harness [list|show] · set --harness NAME · set --harness-chain "a:x,b" · models
+final-review [--mode per-task|run] [--rounds N] [--cmd C]   end-of-run code review
 review --of a,b --cmd "check"        scaffold an integration node (repairs upstream)
 review --id X --review-cmd "check"   attach a reviewer postcondition
 gate · approve · reject · heartbeat · dot · serve · launch · schedule · scheduler
@@ -227,7 +257,7 @@ vis-network; nothing is fetched from the network.
 ## Tests
 
 ```bash
-pnpm test        # 93 tests: graph semantics, scheduling, watchdogs, retries,
+pnpm test        # 98 tests: graph semantics, scheduling, watchdogs, retries,
                  # review/verdict protocol, worktree isolation + conflicts,
                  # harness chains + fallback, locks, recovery, migration
 ```

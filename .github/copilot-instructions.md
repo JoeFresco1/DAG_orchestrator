@@ -233,6 +233,29 @@ dag add --title "Implement parser" --spec "..." \
   --review-rounds 2 --json
 ```
 
+## End-of-run code review
+
+Reviewers above judge one task while it runs. An **end-of-run review** happens
+after the whole run converges: one reviewer agent per completed task (or one
+for the entire run), looking at the merged diff with fresh eyes.
+
+```bash
+dag settings --final-review per-task --final-review-rounds 1
+dag settings --final-review-cmd "opencode run --auto \"Review the diff in {diffFile}. End with VERDICT: PASS or VERDICT: FAIL: reason\""   # optional
+dag final-review --mode per-task        # run (or re-run) it after the fact
+```
+
+- The diff, file list and change summary land in
+  `dag.run.d/reviews/<taskId>.diff`; the reviewer must end with the verdict line.
+- A FAIL with rounds left requeues the task with the review notes as
+  `{lastRejection}` - a real fix attempt; with no rounds left the task fails
+  with kind `review`. Passing tasks are not re-reviewed.
+- Per-task review needs `--worktree task` (that is what makes a diff
+  attributable). Without isolation the whole run is reviewed instead.
+- A run-level verdict is advisory: reported, and the run exits non-zero.
+- Extra tokens for a custom reviewer: `{diffFile}` `{diffBase}` `{diffHead}`
+  `{diffStat}` `{files}`.
+
 ## Integration agents (repair upstream)
 
 An integration node depends on several tasks and checks that their outputs

@@ -633,6 +633,139 @@ describe('hardening', () => {
   });
 });
 
+describe('end-of-run review', () => {
+  it('is off by default: no extra agent runs', async () => {
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    run.tasks[a.id].cmd = 'work';
+    const ran: string[] = [];
+    const runner = new DagRunner(run, {
+      executor: async (_t, _c, cmd) => {
+        ran.push(cmd ?? '');
+        return { output: 'ok', exitCode: 0 };
+      },
+    });
+    await runner.start();
+    assert.deepEqual(ran, ['work']);
+    assert.equal(runner.result?.finalReview, null);
+  });
+
+  it('reviews each completed task and sends a rejected one back once', async () => {
+    const { run, a, b } = make(['a', 'b']) as { run: Run; a: Task; b: Task };
+    run.tasks[a.id].cmd = 'work-a';
+    run.tasks[b.id].cmd = 'work-b';
+    run.tasks[a.id].diffBase = 'base1';
+    run.tasks[a.id].diffHead = 'head1';
+    run.tasks[b.id].diffBase = 'base2';
+    run.tasks[b.id].diffHead = 'head2';
+    run.settings.worktree = 'task';
+    run.settings.finalReview = 'per-task';
+    run.settings.finalReviewCmd = 'review {diffFile}';
+    const reviews = new Map<string, number>();
+    const prompts: string[] = [];
+    const runner = new DagRunner(run, {
+      executor: async (task, _c, cmd) => {
+        if (cmd?.startsWith('review')) {
+          reviews.set(task.id, (reviews.get(task.id) ?? 0) + 1);
+          prompts.push(task.spec ?? '');
+          const first = (reviews.get(task.id) ?? 0) === 1;
+          return {
+            output: first && task.id === b.id ? 'why: missing test\nVERDICT: FAIL: no test for the new branch' : 'VERDICT: PASS',
+            exitCode: 0,
+          };
+        }
+        return { output: 'ok', exitCode: 0 };
+      },
+    });
+    await runner.start();
+    assert.equal(run.tasks[a.id].finalReview?.verdict, 'pass');
+    assert.equal(run.tasks[b.id].finalReview?.verdict, 'pass', 'the rejected task is reviewed again after the fix');
+    assert.equal(reviews.get(b.id), 2);
+    assert.equal(run.tasks[b.id].attempts, 2, 'the fix is a real second attempt');
+    // The review notes reached the redo prompt.
+    assert.match(run.tasks[b.id].result ?? '', /ok|no output/i);
+    assert.ok(run.events.some((e) => /end-of-run review/.test(e.message ?? '')));
+    assert.ok(prompts.some((p) => p.includes('Code review of one task')));
+    assert.equal(runner.result?.finalReview?.verdict, 'pass');
+    // The final pass saw nothing failing: b was fixed and re-reviewed.
+    assert.deepEqual(runner.result?.finalReview?.failed, []);
+    assert.ok(run.events.some((e) => /review rejected the work; requeued/.test(e.message ?? '')));
+  });
+
+  it('fails the task when a rejection has no rounds left', async () => {
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    run.tasks[a.id].cmd = 'work';
+    run.tasks[a.id].diffBase = 'base';
+    run.tasks[a.id].diffHead = 'head';
+    run.settings.worktree = 'task';
+    run.settings.finalReview = 'per-task';
+    run.settings.finalReviewRounds = 0;
+    run.settings.finalReviewCmd = 'review {diffFile}';
+    const runner = new DagRunner(run, {
+      executor: async (_t, _c, cmd) =>
+        cmd?.startsWith('review')
+          ? { output: 'VERDICT: FAIL: the migration is not reversible', exitCode: 0 }
+          : { output: 'ok', exitCode: 0 },
+    });
+    await runner.start();
+    assert.equal(run.tasks[a.id].status, 'failed');
+    assert.equal(run.tasks[a.id].failureKind, 'review');
+    assert.match(run.tasks[a.id].result ?? '', /end-of-run review failed/);
+    assert.equal(runner.result?.finalReview?.verdict, 'fail');
+    assert.deepEqual(runner.result?.finalReview?.failed, [a.id]);
+    assert.deepEqual(runner.result?.finalReview?.requeued, []);
+  });
+
+  it('reviews the whole run when isolation is off', async () => {
+    const { run, a, b } = make(['a', 'b']) as { run: Run; a: Task; b: Task };
+    run.tasks[a.id].cmd = 'work-a';
+    run.tasks[b.id].cmd = 'work-b';
+    run.settings.worktree = 'none';
+    run.settings.finalReview = 'per-task';
+    run.settings.finalReviewCmd = 'review {diffFile}';
+    const calls: string[] = [];
+    const runner = new DagRunner(run, {
+      executor: async (_t, _c, cmd) => {
+        calls.push(cmd ?? '');
+        return cmd?.startsWith('review') ? { output: 'VERDICT: PASS', exitCode: 0 } : { output: 'ok', exitCode: 0 };
+      },
+    });
+    await runner.start();
+    // One run-level reviewer, not one per task.
+    assert.equal(calls.filter((c) => c.startsWith('review')).length, 1);
+    assert.equal(runner.result?.finalReview?.mode, 'run');
+    assert.ok(run.events.some((e) => /reviewing the run as a whole/.test(e.message ?? '')));
+  });
+
+  it('honours an explicit review command and writes the diff where the reviewer can read it', async () => {
+    const dir = tempDir();
+    const file = join(dir, 'dag.run.json');
+    const run = newRun('review-cmd');
+    const a = addTask(run, { title: 'work', spec: 'do the thing', cmd: 'work' });
+    run.tasks[a.id].diffBase = 'base';
+    run.tasks[a.id].diffHead = 'head';
+    run.settings.finalReview = 'per-task';
+    run.settings.finalReviewCmd = 'my-reviewer {diffFile} {files}';
+    saveRun(run, file);
+    let seen = '';
+    const runner = new DagRunner(run, {
+      file,
+      persist: (state) => saveRun(state, file),
+      executor: async (_task, _c, cmd) => {
+        seen = cmd ?? '';
+        if (cmd?.startsWith('my-reviewer')) {
+          return { output: 'VERDICT: PASS', exitCode: 0 };
+        }
+        return { output: 'ok', exitCode: 0 };
+      },
+    });
+    await runner.start();
+    assert.match(seen, /my-reviewer /);
+    // No worktree isolation here, so the review covers the run as a whole.
+    assert.ok(existsSync(join(runPaths(file).dir, 'reviews', 'run.diff')), 'diff file written');
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
 describe('projects and scheduling', () => {
   it('registers projects with stable ids and default names', () => {
     const dir = tempDir();
