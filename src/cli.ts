@@ -42,6 +42,7 @@ import { DagRunner } from './runner.js';
 import { startServer } from './server.js';
 import { parseWhen, type Reviewer } from './review-policy.js';
 import { HARNESSES, findHarness, harnessCommands } from './harnesses.js';
+import { parseHarnessChain } from './harness-chain.js';
 import { activeRunFile, archiveRun, findRun, listRuns, projectOf, startNewRun } from './runs.js';
 import { listAgentModels } from './agent-models.js';
 import { resolveCommand } from './command-resolution.js';
@@ -395,7 +396,7 @@ async function main(): Promise<void> {
   if (cmd === 'settings') {
     guard(file, rest);
     const run = loadRun(file);
-    const patch: Record<string, number | string> = {};
+    const patch: Parameters<typeof setSettings>[1] = {};
     const concurrency = flag(rest, 'concurrency');
     if (concurrency !== undefined) patch.concurrency = Number(concurrency);
     const maxAttempts = retriesToMaxAttempts(flag(rest, 'retries'));
@@ -424,6 +425,11 @@ async function main(): Promise<void> {
     }
     const prepare = flag(rest, 'worktree-prepare');
     if (prepare !== undefined) patch.worktreePrepareCmd = prepare;
+    const chain = flag(rest, 'harness-chain');
+    if (chain !== undefined) patch.harnessChain = chain ? parseHarnessChain(chain) : [];
+    if (has(rest, 'fail-on-exit')) patch.failOnNonZeroExit = true;
+    if (has(rest, 'no-fail-on-exit')) patch.failOnNonZeroExit = false;
+    if (has(rest, 'auto-fail-on-exit')) patch.failOnNonZeroExit = null;
     const model = flag(rest, 'model');
     if (model !== undefined) patch.model = model;
     const variant = flag(rest, 'variant');
@@ -480,12 +486,19 @@ async function main(): Promise<void> {
     }
 
     const candidates = only === null ? Object.keys(run.tasks) : [...only];
+    // A harness chain supplies the command at run time, so it counts as runnable.
+    const runnable = (id: string): boolean =>
+      Boolean(
+        run.tasks[id].cmd ||
+          run.tasks[id].harnessChain?.length ||
+          run.settings.harnessChain?.length,
+      );
     const manual = candidates.filter(
       (id) =>
-        !run.tasks[id].cmd &&
+        !runnable(id) &&
         (run.tasks[id].status === 'pending' || run.tasks[id].status === 'ready'),
     );
-    const scope = candidates.filter((id) => run.tasks[id].cmd);
+    const scope = candidates.filter((id) => runnable(id));
     if (scope.length === 0) {
       console.log(
         manual.length > 0
@@ -1013,6 +1026,10 @@ async function main(): Promise<void> {
     const run = loadRun(file);
     const patch: Parameters<typeof setTasks>[1] = {};
     if (rest.includes('--cmd')) patch.cmd = flag(rest, 'cmd') ?? null;
+    const chainText = flag(rest, 'harness-chain');
+    if (chainText !== undefined) {
+      patch.harnessChain = chainText ? parseHarnessChain(chainText) : null;
+    }
     const harnessName = flag(rest, 'harness');
     if (harnessName !== undefined) {
       const harness = findHarness(harnessName);
@@ -1025,6 +1042,8 @@ async function main(): Promise<void> {
           withReview: has(rest, 'with-review'),
         }),
       );
+      // An explicit single tool supersedes a stale fallback chain.
+      if (chainText === undefined) patch.harnessChain = null;
       // Model ids are provider-specific: carrying one across harnesses sends a
       // name the new tool cannot resolve, so clear it unless set in this call.
       if (!rest.includes('--model')) patch.model = null;
@@ -1217,6 +1236,8 @@ usage: dag <cmd> [flags]
   harness [list|show --name N]  agent CLI presets (opencode, claude, codex, …)
   models [--harness N] [--refresh]   models available to that agent CLI
   set --harness NAME            retarget tasks at another agent CLI
+  set --harness-chain "a:x,b"   ordered fallback: attempt 1 uses a, 2 uses b
+  settings --fail-on-exit       non-zero work exit fails the task (default: auto)
       [--with-review] [--no-plan]
   new-run --objective "..."     archive the active run, start a fresh one
   runs [list] | runs show --id ID | runs archive

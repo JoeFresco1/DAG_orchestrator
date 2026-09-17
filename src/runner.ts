@@ -14,6 +14,7 @@ import {
   worktreeRoot,
 } from './git-worktree.js';
 import { depsMet, describeDeps, gateBlocks, isTerminal, topoSort } from './graph.js';
+import { attemptsForChain, planAttempt, type HarnessCandidate } from './harness-chain.js';
 import {
   decideReviewers,
   summarizeVerdicts,
@@ -798,19 +799,18 @@ export class DagRunner {
     worktreePath?: string,
     planFile?: string,
     depsContext?: { deps: string; depsAll: string; depsFile?: string },
+    cmdOverride?: string | null,
   ): Promise<'ok' | 'fail'> {
     this.log('task-plan', task.id, 'planning phase starting');
     this.appendLog(task.id, '\n--- plan ---\n');
     let outcome: ExecOutcome;
     try {
-      outcome = await this.runPhase(task, execute, task.planCmd, 'plan', worktreePath, planFile, depsContext);
+      outcome = await this.runPhase(task, execute, cmdOverride ?? task.planCmd, 'plan', worktreePath, planFile, depsContext);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      task.status = 'failed';
-      task.failureKind = 'plan';
-      task.result = `planning failed: ${truncate(message, RESULT_LIMIT)}`;
-      this.log('task-fail', task.id, `failed (plan): ${truncate(message, 200)}`);
-      return 'fail';
+      // Rethrow so the attempt's retry/fallback logic sees it: a broken planner
+      // tool is exactly when the next harness in the chain should get a turn.
+      this.reasons.set(task.id, 'plan');
+      throw err;
     }
     task.plan = truncate(stripAnsi(outcome.output).trim(), PLAN_LIMIT) || '(empty plan)';
     this.log('task-plan', task.id, `plan ready (${task.plan.length} chars)`);
@@ -1366,6 +1366,39 @@ export class DagRunner {
     }
   }
 
+  private effectiveChain(task: Task): HarnessCandidate[] | null {
+    if (task.harnessChain && task.harnessChain.length > 0) return task.harnessChain;
+    if (this.state.settings.harnessChain?.length) return this.state.settings.harnessChain;
+    return null;
+  }
+
+  // A chain of N tools means N attempts at least, so a fallback can happen.
+  private maxAttemptsFor(task: Task): number {
+    return attemptsForChain(task.maxAttempts, this.effectiveChain(task));
+  }
+
+  // A chain overrides the task's own command for the current attempt: the
+  // preset owns the command, the candidate owns the model.
+  private applyHarnessChain(task: Task, attempt: number): { cmd: string | null; planCmd: string | null } {
+    const chain = this.effectiveChain(task);
+    const plan = planAttempt(chain, attempt);
+    if (!plan) return { cmd: task.cmd, planCmd: task.planCmd };
+    task.harness = plan.candidate.harness;
+    if (plan.candidate.model !== undefined) task.model = plan.candidate.model;
+    if (plan.candidate.variant !== undefined) task.variant = plan.candidate.variant;
+    this.log(
+      'task-start',
+      task.id,
+      plan.fellBack
+        ? `falling back to ${plan.candidate.harness} (candidate ${plan.index}/${chain?.length})`
+        : `using harness ${plan.candidate.harness}`,
+    );
+    return {
+      cmd: plan.harness.cmd,
+      planCmd: plan.harness.planCmd ?? task.planCmd,
+    };
+  }
+
   private async executeTask(
     task: Task,
     execute: Executor,
@@ -1398,7 +1431,7 @@ export class DagRunner {
         task.reviewCmd ? `\n# review: ${task.reviewCmd}` : ''
       }\n`,
     );
-    this.log('task-start', task.id, `attempt ${attempt}/${task.maxAttempts}: ${task.title}`);
+    this.log('task-start', task.id, `attempt ${attempt}/${this.maxAttemptsFor(task)}: ${task.title}`);
     this.persist();
 
     let worktreePath: string | null = null;
@@ -1421,7 +1454,8 @@ export class DagRunner {
     if (worktreePath) {
       this.log('note', task.id, `worktree ${task.branch} at ${worktreePath}`);
     }
-    const planFile = task.planCmd ? this.planFilePath(task, attempt) : undefined;
+    const chained = this.applyHarnessChain(task, attempt);
+    const planFile = chained.planCmd ? this.planFilePath(task, attempt) : undefined;
     // Upstream evidence for {deps} / {depsAll} / {depsFile}: deps are complete
     // by the time a task runs, so this is the real graph state, not a promise.
     const depsFile = task.deps.length > 0 ? this.depsFilePath(task, attempt) : undefined;
@@ -1451,11 +1485,12 @@ export class DagRunner {
         if (this.tokens.get(task.id) !== token) return;
         task.status = 'failed';
         this.salvageWorktree(task.id, 'setup failed');
-        const retryable = task.attempts < task.maxAttempts;
+        const budget = this.maxAttemptsFor(task);
+        const retryable = task.attempts < budget;
         if (retryable) {
           task.status = 'pending';
           task.failureKind = null;
-          this.log('task-retry', task.id, `worktree prepare failed; attempt ${task.attempts}/${task.maxAttempts}`);
+          this.log('task-retry', task.id, `worktree prepare failed; attempt ${task.attempts}/${budget}`);
         } else if (!this.tryRepair(task, scope)) {
           this.notify('task-fail', task.id, 'worktree prepare failed');
         }
@@ -1464,8 +1499,15 @@ export class DagRunner {
       }
 
       // Planning phase first: the work command follows {plan} / {planFile}.
-      if (task.planCmd) {
-        const planned = await this.plan(task, execute, worktreePath ?? undefined, planFile);
+      if (chained.planCmd) {
+        const planned = await this.plan(
+          task,
+          execute,
+          worktreePath ?? undefined,
+          planFile,
+          depsContext,
+          chained.planCmd,
+        );
         if (this.tokens.get(task.id) !== token) return;
         if (planned !== 'ok') {
           this.dropWorktree(task.id);
@@ -1481,7 +1523,7 @@ export class DagRunner {
         }
       }
 
-      const outcome = await this.runPhase(task, execute, task.cmd, 'run', worktreePath ?? undefined, planFile, depsContext);
+      const outcome = await this.runPhase(task, execute, chained.cmd, 'run', worktreePath ?? undefined, planFile, depsContext);
       if (this.tokens.get(task.id) !== token) return;
 
       if (this.reviewersFor(task).length > 0) {
@@ -1520,6 +1562,20 @@ export class DagRunner {
         }
       }
 
+      // A dead agent CLI usually exits non-zero (rate limit, auth, crash).
+      // Verdicts are the better judge when they exist; without them the exit
+      // code is the only signal, so it decides — which is what lets a chain
+      // hand over to the next tool.
+      const judges = (task.reviewers?.length ?? 0) > 0 || Boolean(task.reviewCmd);
+      const failOnExit =
+        this.state.settings.failOnNonZeroExit ?? this.effectiveChain(task) !== null;
+      if (failOnExit && !judges && outcome.exitCode !== null && outcome.exitCode !== 0) {
+        throw Object.assign(new Error(`exit ${outcome.exitCode}`), {
+          kind: 'exit' as const,
+          exitCode: outcome.exitCode,
+        });
+      }
+
       task.status = 'completed';
       task.exitCode = outcome.exitCode;
       task.result = truncateTail(stripAnsi(outcome.output).trim(), RESULT_LIMIT) || '(ok, no output)';
@@ -1548,7 +1604,8 @@ export class DagRunner {
 
       // Everything except a deliberate stop or a missing command is
       // retryable while attempts remain. Stall and timeout included.
-      const retryable = reason !== 'manual' && task.attempts < task.maxAttempts;
+      const budget = this.maxAttemptsFor(task);
+      const retryable = reason !== 'manual' && task.attempts < budget;
       if (this.stopping) {
         task.status = 'pending';
         task.failureKind = 'killed';
@@ -1562,7 +1619,7 @@ export class DagRunner {
         this.log(
           'task-retry',
           task.id,
-          `attempt ${task.attempts}/${task.maxAttempts} failed (${reason}: ${truncate(message, 120)}); backing off`,
+          `attempt ${task.attempts}/${budget} failed (${reason}: ${truncate(message, 120)}); backing off`,
         );
         const delay = Math.min(60_000, 1000 * 2 ** Math.max(0, task.attempts - 1));
         await this.backoff(delay * (0.5 + Math.random() * 0.5));

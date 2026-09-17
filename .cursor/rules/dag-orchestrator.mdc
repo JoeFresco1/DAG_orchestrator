@@ -132,6 +132,32 @@ dag add --title "Implement auth" --spec "..." --cmd "opencode run \"Implement au
 Keep commands non-interactive; the runner detects output silence and kills at
 the timeout. `--model` / agent flags belong inside the command.
 
+### Fallback across tools (chains)
+
+Instead of hand-writing a command, point a task at a harness preset and give it
+an ordered chain — attempt 1 uses the first tool, attempt 2 the next:
+
+```bash
+dag harness list                                       # what is installed
+dag set --all --harness-chain "opencode:provider/model:xhigh,codex,claude:sonnet"
+dag settings --harness-chain "opencode,codex"          # run-wide default
+```
+
+- The chain owns the command: presets supply `cmd`/`planCmd`, each candidate
+  supplies its own model (`harness:model:variant`; model ids are
+  provider-specific, so never reuse one across tools).
+- The chain length sets the attempt budget: 3 candidates = at least 3 attempts,
+  even if `--retries` says 1.
+- An attempt hands over on a thrown failure (spawn/timeout/stall), a review
+  rejection, or a non-zero exit. Exit codes count as failures when a chain is
+  set (`failOnNonZeroExit` auto) unless a reviewer/`--review-cmd` is judging
+  the work, because agents often exit non-zero after doing the work.
+- `dag settings --fail-on-exit | --no-fail-on-exit | --auto-fail-on-exit`
+  overrides that policy. Prefer a reviewer with `verdict: exit-code` when exit
+  codes must be decisive.
+- `dag show` and the viewer mark which candidate the last attempt used
+  (`harness`), so a fallback is visible in the run's history.
+
 ## Worktree isolation (parallel agents)
 
 Parallel tasks editing one working tree will collide. `--worktree task` gives

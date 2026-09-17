@@ -20,6 +20,7 @@ import { hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { assertNoCycle, isTerminal, topoSort, transitiveBlocked } from './graph.js';
 import type { Reviewer } from './review-policy.js';
+import type { HarnessCandidate } from './harness-chain.js';
 import {
   DEFAULT_SETTINGS,
   DEFINITION_FIELDS,
@@ -426,6 +427,8 @@ function normalizeTask(raw: Partial<Task>, run: Run, index: number): Task {
     planCmd: raw.planCmd ?? null,
     plan: raw.plan ?? null,
     prepareCmd: raw.prepareCmd ?? null,
+    harnessChain: raw.harnessChain ?? null,
+    harness: raw.harness ?? null,
     reviewers: Array.isArray(raw.reviewers) ? raw.reviewers : [],
     reviewerVerdicts: raw.reviewerVerdicts ?? {},
     lastRejection: raw.lastRejection ?? null,
@@ -556,6 +559,7 @@ export interface AddTaskInput {
   variant?: string | null;
   reviewers?: Reviewer[];
   prepareCmd?: string | null;
+  harnessChain?: HarnessCandidate[] | null;
 }
 
 export function addTask(run: Run, input: AddTaskInput): Task {  const deps = input.deps ?? [];
@@ -599,6 +603,8 @@ export function addTask(run: Run, input: AddTaskInput): Task {  const deps = inp
     planCmd: input.planCmd ?? null,
     plan: null,
     prepareCmd: input.prepareCmd ?? null,
+    harnessChain: input.harnessChain ?? null,
+    harness: null,
     reviewers: input.reviewers ?? [],
     reviewerVerdicts: {},
     lastRejection: null,
@@ -630,6 +636,7 @@ export interface EditTaskInput {
   variant?: string | null;
   reviewers?: Reviewer[];
   prepareCmd?: string | null;
+  harnessChain?: HarnessCandidate[] | null;
 }
 
 export function editTask(run: Run, id: string, patch: EditTaskInput): Task {
@@ -650,6 +657,7 @@ export function editTask(run: Run, id: string, patch: EditTaskInput): Task {
   if (patch.variant !== undefined) task.variant = patch.variant;
   if (patch.reviewers !== undefined) task.reviewers = patch.reviewers;
   if (patch.prepareCmd !== undefined) task.prepareCmd = patch.prepareCmd;
+  if (patch.harnessChain !== undefined) task.harnessChain = patch.harnessChain;
   if (patch.reviewRounds !== undefined) task.reviewRounds = Math.max(0, patch.reviewRounds);
   if (patch.repairRounds !== undefined) task.repairRounds = Math.max(0, patch.repairRounds);
   if (patch.deps !== undefined) {
@@ -870,6 +878,7 @@ export interface TaskPatch {
   variant?: string | null;
   reviewers?: Reviewer[];
   prepareCmd?: string | null;
+  harnessChain?: HarnessCandidate[] | null;
   reviewRounds?: number;
   repairRounds?: number;
   maxAttempts?: number;
@@ -911,6 +920,7 @@ export function setTasks(run: Run, patch: TaskPatch, selector: TaskSelector): st
       task.maxAttempts,
       task.timeoutMs,
       task.silenceMs,
+      task.harnessChain,
     ]);
     if (patch.cmd !== undefined) task.cmd = patch.cmd;
     if (patch.reviewCmd !== undefined) task.reviewCmd = patch.reviewCmd;
@@ -919,7 +929,7 @@ export function setTasks(run: Run, patch: TaskPatch, selector: TaskSelector): st
     if (patch.variant !== undefined) task.variant = patch.variant;
     if (patch.reviewers !== undefined) task.reviewers = patch.reviewers;
     if (patch.prepareCmd !== undefined) task.prepareCmd = patch.prepareCmd;
-  if (patch.prepareCmd !== undefined) task.prepareCmd = patch.prepareCmd;
+    if (patch.harnessChain !== undefined) task.harnessChain = patch.harnessChain;
     if (patch.reviewRounds !== undefined) task.reviewRounds = Math.max(0, patch.reviewRounds);
     if (patch.repairRounds !== undefined) task.repairRounds = Math.max(0, patch.repairRounds);
     if (patch.maxAttempts !== undefined) task.maxAttempts = Math.max(1, patch.maxAttempts);
@@ -937,6 +947,7 @@ export function setTasks(run: Run, patch: TaskPatch, selector: TaskSelector): st
       task.maxAttempts,
       task.timeoutMs,
       task.silenceMs,
+      task.harnessChain,
     ]);
     if (before === after) continue;
     changed.push(task.id);

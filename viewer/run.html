@@ -694,6 +694,12 @@ function renderInspector() {
   if (t.failureKind) bits.push(`failure: ${t.failureKind}`);
   if (t.branch) bits.push(`branch: ${t.branch}${t.commit ? ` @ ${t.commit.slice(0, 8)}` : ''}`);
   bits.push('model: ' + (t.model || runModel() || '(none)') + (t.variant ? ' / ' + t.variant : ''));
+  const chain = t.harnessChain || (run && run.settings && run.settings.harnessChain) || [];
+  if (chain.length) {
+    const used = chain.findIndex((c) => c.harness === t.harness);
+    const tag = (i) => (i === used ? '◀' : '');
+    bits.push('chain: ' + chain.map((c, i) => c.harness + (c.model ? ':' + c.model.split('/').pop() : '') + tag(i)).join(' → '));
+  } else if (t.harness) bits.push('harness: ' + t.harness);
   if (t.pid) bits.push(`pid: ${t.pid}`);
   inspectorEl.innerHTML = `
     <h3>${esc(t.title)}</h3>

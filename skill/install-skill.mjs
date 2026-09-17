@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Install the agent instructions where each tool looks for them, so any agent
 // CLI (or a teammate's) can drive this orchestrator without being told how.
-import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -71,7 +71,7 @@ export function installSkill(tool, projectDir) {
     return target;
   }
 
-  if (existsSync(target.path)) copyFileSync(target.path, `${target.path}.bak`);
+  // These copies are generated from skill/SKILL.md, so overwriting is expected.
   writeFileSync(target.path, content.endsWith('\n') ? content : `${content}\n`);
   return target;
 }

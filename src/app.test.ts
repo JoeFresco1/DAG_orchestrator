@@ -33,6 +33,7 @@ import {
   transitiveBlocked,
 } from './graph.js';
 import { DagRunner, parseVerdict, renderTokens, resolveHarness, shellExecutor, sleep, type ExecContext } from './runner.js';
+import { parseHarnessChain } from './harness-chain.js';
 import { describeDeps } from './graph.js';
 import { decideReviewers, globMatches, parseWhen, type Reviewer } from './review-policy.js';
 import { resolveCommand } from './command-resolution.js';
@@ -214,6 +215,79 @@ describe('watchdog and failures', () => {
     assert.equal(run.tasks[a.id].status, 'completed');
     assert.equal(run.tasks[a.id].attempts, 2);
     assert.ok(run.events.some((e) => e.type === 'task-retry'));
+  });
+
+  it('falls back to the next harness when an attempt fails', async () => {
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    run.tasks[a.id].cmd = 'echo hand-written';
+    run.tasks[a.id].harnessChain = parseHarnessChain('opencode,codex');
+    const cmds: (string | undefined)[] = [];
+    const runner = new DagRunner(run, {
+      executor: async (_task, _ctx, cmdOverride) => {
+        cmds.push(cmdOverride);
+        // Presets run a plan phase first, so the 2nd call is attempt 1's work.
+        // A non-zero exit is only recorded, so fail the way a broken CLI does:
+        if (cmds.length === 2) throw new Error('spawn failed');
+        return { output: 'ok', exitCode: 0 };
+      },
+    });
+    await runner.start();
+    // maxAttempts defaults to 1; the chain itself buys the second attempt.
+    assert.equal(cmds.length, 4);
+    assert.match(cmds[1] ?? '', /opencode run/);
+    assert.match(cmds[2] ?? '', /codex exec/);
+    assert.match(cmds[3] ?? '', /codex exec/);
+    assert.equal(run.tasks[a.id].status, 'completed');
+    assert.equal(run.tasks[a.id].attempts, 2);
+    assert.equal(run.tasks[a.id].harness, 'codex');
+    assert.ok(run.events.some((e) => /falling back to codex/.test(e.message ?? '')));
+  });
+
+  it('uses the run-level chain when the task has none', async () => {
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    run.settings.harnessChain = parseHarnessChain('codex:gpt-5-codex');
+    let cmd = '';
+    const runner = new DagRunner(run, {
+      executor: async (_task, _ctx, cmdOverride) => {
+        cmd = cmdOverride ?? '';
+        return { output: 'ok', exitCode: 0 };
+      },
+    });
+    await runner.start();
+    assert.match(cmd, /codex exec/);
+    assert.match(cmd, /gpt-5-codex/);
+    assert.equal(run.tasks[a.id].harness, 'codex');
+    assert.equal(run.tasks[a.id].model, 'gpt-5-codex');
+  });
+
+  it('falls back when a tool dies with a non-zero exit and nothing judges it', async () => {
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    run.tasks[a.id].harnessChain = parseHarnessChain('opencode,codex');
+    run.tasks[a.id].planCmd = null;
+    const runner = new DagRunner(run, {
+      executor: async () => ({ output: 'rate limited', exitCode: 1 }),
+    });
+    await runner.start();
+    // Auto: the chain makes exit codes decisive, so both candidates get a turn.
+    assert.equal(run.tasks[a.id].status, 'failed');
+    assert.equal(run.tasks[a.id].attempts, 2);
+    assert.equal(run.tasks[a.id].failureKind, 'exit');
+  });
+
+  it('leaves a non-zero exit alone when a reviewer is judging', async () => {
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    run.tasks[a.id].harnessChain = parseHarnessChain('opencode,codex');
+    run.tasks[a.id].planCmd = null;
+    run.tasks[a.id].reviewCmd = 'judge';
+    const runner = new DagRunner(run, {
+      executor: async (_t, _c, command) =>
+        command === 'judge'
+          ? { output: 'VERDICT: PASS', exitCode: 0 }
+          : { output: 'done, exit 1 on cleanup', exitCode: 1 },
+    });
+    await runner.start();
+    assert.equal(run.tasks[a.id].status, 'completed');
+    assert.equal(run.tasks[a.id].attempts, 1);
   });
 
   it('records exit kind via the real shell executor', async () => {

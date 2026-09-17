@@ -56,6 +56,7 @@ export interface DagEvent {
 }
 
 import type { Reviewer } from './review-policy.js';
+import type { HarnessCandidate } from './harness-chain.js';
 
 export interface ReviewerVerdict {
   verdict: 'pass' | 'fail' | 'skipped' | 'error';
@@ -128,6 +129,11 @@ export interface Task {
   // Reviewers for this task: each emits its own verdict, and the task passes
   // only if every applicable one passes. `when` decides applicability.
   reviewers: Reviewer[];
+  // Fallback chain: each attempt advances to the next tool. Null = inherit
+  // the run default; [] = no chain (use cmd as written).
+  harnessChain: HarnessCandidate[] | null;
+  // Tool used by the last attempt, when a chain applied.
+  harness: string | null;
   // Model selection: null = use the run default. Commands reference these as
   // {model} / {variant}, so the UI can retarget tasks without editing text.
   model: string | null;
@@ -170,6 +176,11 @@ export interface RunSettings {
   // install, …). Without it a suite reviewer in a fresh checkout has no
   // environment to run in. Non-zero exit fails the task as `setup`.
   worktreePrepareCmd: string;
+  // Fallback chain for every task that does not define its own; empty = none.
+  harnessChain: HarnessCandidate[];
+  // Treat a non-zero work exit as a failure. null = auto: on when a chain is
+  // set (a dead tool should hand over), off otherwise (agents lie about codes).
+  failOnNonZeroExit: boolean | null;
   // 'task' gives every task its own git worktree on a per-run integration
   // branch; 'none' runs agents directly in the project directory.
   worktree: 'none' | 'task';
@@ -194,6 +205,8 @@ export const DEFAULT_SETTINGS: RunSettings = {
   variant: '',
   worktree: 'none',
   worktreePrepareCmd: '',
+  harnessChain: [],
+  failOnNonZeroExit: null,
   mergeRounds: 2,
 };
 
@@ -242,6 +255,7 @@ export const DEFINITION_FIELDS = [
   'variant',
   'reviewers',
   'prepareCmd',
+  'harnessChain',
 ] as const;
 
 export const DYNAMIC_FIELDS = [
@@ -265,6 +279,7 @@ export const DYNAMIC_FIELDS = [
   'plan',
   'reviewerVerdicts',
   'lastRejection',
+  'harness',
 ] as const;
 
 export const PLAN_LIMIT = 20000;

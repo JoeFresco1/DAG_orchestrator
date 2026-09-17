@@ -81,6 +81,24 @@ fails the task — the work never runs unplanned. A reviewer that rejects sends
 the work back, bounded by `--review-rounds`. A reviewer that *crashes* fails as
 infrastructure, not as a verdict.
 
+**Any tool can do the work, and they back each other up.** A task can name a
+harness preset instead of a raw command, and an ordered chain of them:
+
+```bash
+dag harness list
+dag set --all --harness-chain "opencode:provider/model:xhigh,codex,claude:sonnet"
+```
+
+Attempt 1 uses `opencode`, and if it dies (spawn failure, timeout, stall, a
+review rejection, or a non-zero exit) attempt 2 runs the same task on `codex`.
+The chain length raises the attempt budget, so the handover happens without
+extra configuration; the last candidate sticks for any remaining attempts.
+Presets supply `cmd`/`planCmd`, each candidate supplies its own model, and the
+run records which tool the last attempt used. When a reviewer or
+`--review-cmd` is judging the work, verdicts decide and exit codes do not
+trigger a fallback (agents routinely exit non-zero after succeeding);
+`--fail-on-exit` / `--no-fail-on-exit` overrides that.
+
 **Verdicts are machine-readable.** Agent harnesses exit 0 whatever they
 conclude, so a reviewer must end with:
 
@@ -189,6 +207,7 @@ run [--only a,b] [--concurrency N] [--on-dep-failure block|skip] [--max-hours H]
 retry --id X [--cascade]     requeue a failed task (and its failed subtree)
 retry-failed                 requeue everything that failed
 resume · kill-orphans · skip-blocked · gc · settings · set · models
+harness [list|show] · set --harness NAME · set --harness-chain "a:x,b" · models
 review --of a,b --cmd "check"        scaffold an integration node (repairs upstream)
 review --id X --review-cmd "check"   attach a reviewer postcondition
 gate · approve · reject · heartbeat · dot · serve · launch · schedule · scheduler
@@ -208,9 +227,9 @@ vis-network; nothing is fetched from the network.
 ## Tests
 
 ```bash
-pnpm test        # 66 tests: graph semantics, scheduling, watchdogs, retries,
+pnpm test        # 82 tests: graph semantics, scheduling, watchdogs, retries,
                  # review/verdict protocol, worktree isolation + conflicts,
-                 # locks, recovery, migration
+                 # harness chains + fallback, locks, recovery, migration
 ```
 
 ## Notes
