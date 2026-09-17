@@ -199,6 +199,18 @@ async function load() {
   try {
     const data = await api('/api/projects');
     projects = data.projects || [];
+    // An older hub answers with a different shape: say so instead of painting
+    // empty cards over it.
+    const incompatible = projects.some((p) => !Array.isArray(p.runs) || typeof p.dir !== 'string');
+    if (incompatible) {
+      projects = [];
+      banner(
+        `<b>This hub is running an older build.</b> Its API does not match this page — restart it: <code>dag serve</code>`,
+      );
+      $('meta').textContent = location.host;
+      render();
+      return;
+    }
     banner('');
     render();
   } catch (err) {
