@@ -755,6 +755,7 @@ describe('end-of-run review', () => {
   });
 
   it('reviews each completed task and sends a rejected one back once', async () => {
+    const repo = gitRepo();
     const { run, a, b } = make(['a', 'b']) as { run: Run; a: Task; b: Task };
     run.tasks[a.id].cmd = 'work-a';
     run.tasks[b.id].cmd = 'work-b';
@@ -768,6 +769,7 @@ describe('end-of-run review', () => {
     const reviews = new Map<string, number>();
     const prompts: string[] = [];
     const runner = new DagRunner(run, {
+      cwd: repo,
       executor: async (task, _c, cmd) => {
         if (cmd?.startsWith('review')) {
           reviews.set(task.id, (reviews.get(task.id) ?? 0) + 1);
@@ -794,9 +796,11 @@ describe('end-of-run review', () => {
     // The final pass saw nothing failing: b was fixed and re-reviewed.
     assert.deepEqual(runner.result?.finalReview?.failed, []);
     assert.ok(run.events.some((e) => /review rejected the work; requeued/.test(e.message ?? '')));
+    rmSync(repo, { recursive: true, force: true });
   });
 
   it('fails the task when a rejection has no rounds left', async () => {
+    const repo = gitRepo();
     const { run, a } = make(['a']) as { run: Run; a: Task };
     run.tasks[a.id].cmd = 'work';
     run.tasks[a.id].diffBase = 'base';
@@ -806,6 +810,7 @@ describe('end-of-run review', () => {
     run.settings.finalReviewRounds = 0;
     run.settings.finalReviewCmd = 'review {diffFile}';
     const runner = new DagRunner(run, {
+      cwd: repo,
       executor: async (_t, _c, cmd) =>
         cmd?.startsWith('review')
           ? { output: 'VERDICT: FAIL: the migration is not reversible', exitCode: 0 }
@@ -818,6 +823,7 @@ describe('end-of-run review', () => {
     assert.equal(runner.result?.finalReview?.verdict, 'fail');
     assert.deepEqual(runner.result?.finalReview?.failed, [a.id]);
     assert.deepEqual(runner.result?.finalReview?.requeued, []);
+    rmSync(repo, { recursive: true, force: true });
   });
 
   it('reviews the whole run when isolation is off', async () => {
