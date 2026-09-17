@@ -17,6 +17,17 @@ export const TASK_STATUSES: TaskStatus[] = [
 
 export type FinalReviewMode = 'off' | 'per-task' | 'run';
 
+// Facts about the tasks a chain-review task covers, gathered when it runs.
+export interface TaskCoverage {
+  dir: string;
+  manifest: string;
+  base: string | null;
+  head: string | null;
+  stat: string;
+  files: string;
+  tasks: string[];
+}
+
 export interface FinalReviewVerdict {
   verdict: 'pass' | 'fail' | 'error';
   reason: string;
@@ -160,6 +171,11 @@ export interface Task {
   diffBase: string | null;
   diffHead: string | null;
   finalReview: FinalReviewVerdict | null;
+  // A task whose subject is other tasks ("review the chain"): the ids it
+  // covers. Its spec is a template, rendered with the covered tasks' facts
+  // when it runs (see {coverage} tokens), and its verdict decides its status.
+  covers: string[] | null;
+  coverage: TaskCoverage | null;
   // Model selection: null = use the run default. Commands reference these as
   // {model} / {variant}, so the UI can retarget tasks without editing text.
   model: string | null;
@@ -291,6 +307,7 @@ export const DEFINITION_FIELDS = [
   'reviewers',
   'prepareCmd',
   'harnessChain',
+  'covers',
 ] as const;
 
 export const DYNAMIC_FIELDS = [
@@ -318,6 +335,7 @@ export const DYNAMIC_FIELDS = [
   'diffBase',
   'diffHead',
   'finalReview',
+  'coverage',
 ] as const;
 
 export const PLAN_LIMIT = 20000;

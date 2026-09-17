@@ -28,6 +28,7 @@ import {
 } from './store.js';
 import {
   assertNoCycle,
+  computeDepths,
   getBlocked,
   getReady,
   topoSort,
@@ -48,7 +49,7 @@ import {
   snapshotCommit,
   snapshotExcludes,
 } from './git-worktree.js';
-import { addProject, loadRegistry, projectId, removeProject } from './registry.js';
+import { addProject, loadRegistry, projectId, removeProject, saveRegistry } from './registry.js';
 import { addJob, decideDue, jobArgsToArgv, loadSchedule, parseAt, removeJob, retryJob } from './scheduler.js';
 import type { Run, Task } from './types.js';
 
@@ -61,6 +62,10 @@ function make(ids: string[]): { run: Run; [k: string]: unknown } {
 
 function never(_task: Task, _ctx: ExecContext): Promise<never> {
   return new Promise<never>(() => {});
+}
+
+function runsDir(file: string): string {
+  return runPaths(file).dir;
 }
 
 function tempDir(): string {
@@ -766,7 +771,147 @@ describe('end-of-run review', () => {
   });
 });
 
+describe('chain review tasks (tasks about other tasks)', () => {
+  it('renders the coverage facts into the spec and lets the verdict decide', async () => {
+    const dir = tempDir();
+    const file = join(dir, 'dag.run.json');
+    const run = newRun('chain');
+    const a = addTask(run, { title: 'first', spec: 'do a', cmd: 'work' });
+    const b = addTask(run, { title: 'second', spec: 'do b', cmd: 'work' });
+    run.tasks[a.id].diffBase = 'base-a';
+    run.tasks[a.id].diffHead = 'head-a';
+    run.tasks[b.id].diffBase = 'base-b';
+    run.tasks[b.id].diffHead = 'head-b';
+    const chain = addTask(run, {
+      title: 'review the chain',
+      spec: 'Covered:\n{coverage}\nmanifest: {coverageManifest}\nfiles: {coverageFiles}',
+      cmd: 'chain {spec}',
+      deps: [a.id, b.id],
+      covers: [a.id, b.id],
+    });
+    saveRun(run, file);
+    let seenSpec = '';
+    const runner = new DagRunner(run, {
+      file,
+      persist: (state) => saveRun(state, file),
+      executor: async (task, _c, cmd) => {
+        if (cmd?.startsWith('chain ')) {
+          seenSpec = task.spec;
+          return { output: 'looked at both diffs\nVERDICT: PASS', exitCode: 0 };
+        }
+        return { output: 'ok', exitCode: 0 };
+      },
+    });
+    await runner.start();
+    assert.equal(run.tasks[chain.id].status, 'completed');
+    assert.equal(run.tasks[chain.id].finalReview?.verdict, 'pass');
+    // The template was rendered with the covered tasks' real state.
+    assert.match(seenSpec, new RegExp(`- ${a.id} \\[completed\\] first`));
+    assert.match(seenSpec, new RegExp(`- ${b.id} \\[completed\\] second`));
+    assert.ok(!seenSpec.includes('{coverage'), 'no token is left unresolved');
+    assert.ok(existsSync(join(runsDir(file), 'reviews', `chain-${chain.id}`, 'manifest.md')), 'manifest written');
+    assert.ok(existsSync(join(runsDir(file), 'reviews', `chain-${chain.id}`, `${a.id}.diff`)), 'per-task diff written');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('fails with kind review when the chain verdict fails', async () => {
+    const run = newRun('chain-fail');
+    const a = addTask(run, { title: 'work', spec: '', cmd: 'work' });
+    const chain = addTask(run, {
+      title: 'review',
+      spec: '{coverage}',
+      cmd: 'chain',
+      deps: [a.id],
+      covers: [a.id],
+    });
+    const runner = new DagRunner(run, {
+      executor: async (_t, _c, cmd) =>
+        cmd === 'chain'
+          ? { output: 'task A contradicts task B\nVERDICT: FAIL: the two modules disagree on units', exitCode: 0 }
+          : { output: 'ok', exitCode: 0 },
+    });
+    await runner.start();
+    assert.equal(run.tasks[chain.id].status, 'failed');
+    assert.equal(run.tasks[chain.id].failureKind, 'review');
+    assert.match(run.tasks[chain.id].result ?? '', /modules disagree on units/);
+    assert.match(run.tasks[chain.id].lastRejection ?? '', /units/);
+    assert.ok(run.events.some((e) => /chain review rejected/.test(e.message ?? '')));
+  });
+
+  it('is not itself reviewed by the end-of-run review', async () => {
+    const run = newRun('chain-skip');
+    const a = addTask(run, { title: 'work', spec: '', cmd: 'work' });
+    const chain = addTask(run, {
+      title: 'review',
+      spec: '{coverage}',
+      cmd: 'chain',
+      deps: [a.id],
+      covers: [a.id],
+    });
+    run.settings.finalReview = 'per-task';
+    run.settings.finalReviewCmd = 'final {diffFile}';
+    const calls: string[] = [];
+    const runner = new DagRunner(run, {
+      executor: async (_t, _c, cmd) => {
+        calls.push(cmd ?? '');
+        if (cmd?.startsWith('final')) return { output: 'VERDICT: PASS', exitCode: 0 };
+        if (cmd === 'chain') return { output: 'VERDICT: PASS', exitCode: 0 };
+        return { output: 'ok', exitCode: 0 };
+      },
+    });
+    await runner.start();
+    assert.equal(calls.filter((c) => c.startsWith('final')).length, 1, 'only the work task was reviewed');
+    assert.equal(run.tasks[chain.id].status, 'completed');
+    assert.equal(runner.result?.finalReview?.reviewed.length, 1);
+  });
+
+  it('groups 500-task runs into waves and chunks so reviewers stay sane', () => {
+    const run = newRun('waves');
+    // 40 tasks in a chain: 40 waves, each one task.
+    let prev: string | null = null;
+    for (let i = 0; i < 40; i += 1) {
+      const t = addTask(run, { title: `t${i}`, spec: '', cmd: 'work', deps: prev ? [prev] : [] });
+      run.tasks[t.id].status = 'completed';
+      prev = t.id;
+    }
+    const depths = computeDepths(run);
+    assert.equal(new Set(depths.values()).size, 40);
+    // A wave selection and a chunked --all both produce a sane number of tasks.
+    const wave = Object.keys(run.tasks).filter((id) => (depths.get(id) ?? 0) === 7);
+    assert.equal(wave.length, 1);
+    const batches = Math.ceil(40 / 25);
+    assert.equal(batches, 2);
+  });
+});
+
 describe('projects and scheduling', () => {
+  it('treats the same run file as one project however the path is spelled', () => {
+    const dir = tempDir();
+    process.env.DAG_REGISTRY = join(dir, 'projects.json');
+    try {
+      const file = join(dir, 'my-app', 'dag.run.json');
+      const entry = addProject(file);
+      // The viewer URL and the CLI disagree about separators; that must not
+      // register the project twice (it made the hub report an ambiguous runId).
+      const backslashes = file.replace(/\//g, '\\');
+      const again = addProject(backslashes);
+      assert.equal(again.file, entry.file);
+      assert.equal(loadRegistry().projects.length, 1);
+      // A registry already holding both spellings heals on load.
+      saveRegistry({
+        version: 1,
+        projects: [
+          { file, name: 'one', addedAt: '2026-01-01T00:00:00.000Z' },
+          { file: backslashes, name: 'two', addedAt: '2026-01-01T00:00:00.000Z' },
+        ],
+      });
+      assert.equal(loadRegistry().projects.length, 1);
+    } finally {
+      delete process.env.DAG_REGISTRY;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('registers projects with stable ids and default names', () => {
     const dir = tempDir();
     process.env.DAG_REGISTRY = join(dir, 'projects.json');

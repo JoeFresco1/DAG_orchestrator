@@ -64,7 +64,10 @@ let listeningPort = 0;
 let singleRunMode = false;
 
 function projectDirs(): string[] {
-  return loadRegistry().projects.map((p) => p.file).map((f) => projectOf(f));
+  // One project, one directory: two entries can point at the same folder (a
+  // run file and its archived sibling), which must not look like two projects.
+  const dirs = loadRegistry().projects.map((p) => projectOf(p.file));
+  return [...new Map(dirs.map((d) => [resolve(d).toLowerCase(), d])).values()];
 }
 
 function runtimeFor(runId: string): RunRuntime | null {

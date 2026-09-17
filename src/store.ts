@@ -462,10 +462,12 @@ function normalizeTask(raw: Partial<Task>, run: Run, index: number): Task {
     plan: raw.plan ?? null,
     prepareCmd: raw.prepareCmd ?? null,
     harnessChain: raw.harnessChain ?? null,
+    covers: raw.covers && raw.covers.length > 0 ? [...new Set(raw.covers)] : null,
     harness: raw.harness ?? null,
     diffBase: raw.diffBase ?? null,
     diffHead: raw.diffHead ?? null,
     finalReview: raw.finalReview ?? null,
+    coverage: raw.coverage ?? null,
     reviewers: Array.isArray(raw.reviewers) ? raw.reviewers : [],
     reviewerVerdicts: raw.reviewerVerdicts ?? {},
     lastRejection: raw.lastRejection ?? null,
@@ -629,6 +631,7 @@ export interface AddTaskInput {
   reviewers?: Reviewer[];
   prepareCmd?: string | null;
   harnessChain?: HarnessCandidate[] | null;
+  covers?: string[] | null;
 }
 
 export function addTask(run: Run, input: AddTaskInput): Task {
@@ -675,10 +678,12 @@ export function addTask(run: Run, input: AddTaskInput): Task {
     plan: null,
     prepareCmd: input.prepareCmd ?? null,
     harnessChain: input.harnessChain ?? null,
+    covers: input.covers && input.covers.length > 0 ? [...new Set(input.covers)] : null,
     harness: null,
     diffBase: null,
     diffHead: null,
     finalReview: null,
+    coverage: null,
     reviewers: input.reviewers ?? [],
     reviewerVerdicts: {},
     lastRejection: null,
@@ -968,6 +973,7 @@ export interface TaskPatch {
   reviewers?: Reviewer[];
   prepareCmd?: string | null;
   harnessChain?: HarnessCandidate[] | null;
+  covers?: string[] | null;
   reviewRounds?: number;
   repairRounds?: number;
   maxAttempts?: number;
@@ -1010,6 +1016,7 @@ export function setTasks(run: Run, patch: TaskPatch, selector: TaskSelector): st
       task.timeoutMs,
       task.silenceMs,
       task.harnessChain,
+      task.covers,
     ]);
     if (patch.cmd !== undefined) task.cmd = patch.cmd;
     if (patch.reviewCmd !== undefined) task.reviewCmd = patch.reviewCmd;
@@ -1019,6 +1026,7 @@ export function setTasks(run: Run, patch: TaskPatch, selector: TaskSelector): st
     if (patch.reviewers !== undefined) task.reviewers = patch.reviewers;
     if (patch.prepareCmd !== undefined) task.prepareCmd = patch.prepareCmd;
     if (patch.harnessChain !== undefined) task.harnessChain = patch.harnessChain;
+    if (patch.covers !== undefined) task.covers = patch.covers;
     if (patch.reviewRounds !== undefined) task.reviewRounds = Math.max(0, patch.reviewRounds);
     if (patch.repairRounds !== undefined) task.repairRounds = Math.max(0, patch.repairRounds);
     if (patch.maxAttempts !== undefined) task.maxAttempts = Math.max(1, patch.maxAttempts);
@@ -1037,6 +1045,7 @@ export function setTasks(run: Run, patch: TaskPatch, selector: TaskSelector): st
       task.timeoutMs,
       task.silenceMs,
       task.harnessChain,
+      task.covers,
     ]);
     if (before === after) continue;
     changed.push(task.id);

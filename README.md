@@ -133,6 +133,41 @@ that write files instead of streaming.
 `dag kill-orphans` reaps process trees from a dead run, `dag serve
 --auto-resume` does both at boot.
 
+## Tasks about tasks (chain reviews)
+
+Not every task has a spec to implement. Some tasks are *about* other tasks:
+"review everything these forty tasks did". A chain-review task covers a set of
+tasks, and its instruction is generated from their real state when it runs:
+
+```bash
+dag layers                                  # the dependency waves in this run
+dag chain-review --of a,b,c                 # an explicit set
+dag chain-review --wave 3 --batch 10        # one wave, 10 tasks per reviewer
+dag chain-review --from task_9f2 --depth 2  # the dependency cone of one task
+dag chain-review --all --batch 25           # a 500-task run: 20 reviewers
+```
+
+- The task **depends on** what it covers, so it runs after them, and it is
+  itself a node in the graph (visible in the DAG, skippable, retryable).
+- Its spec is a **template**: `{coverage}`, `{coverageManifest}`,
+  `{coverageDir}`, `{coverageStat}`, `{coverageFiles}` are filled in when it
+  runs. Before it starts, the runner writes a bundle to
+  `dag.run.d/reviews/chain-<taskId>/`: a manifest describing every covered task
+  (spec, result, verdict, commit, diff range) plus one diff file per task, so a
+  reviewer reads incrementally instead of swallowing a megabyte of diff.
+- Its **verdict decides**: `VERDICT: PASS` completes it, `VERDICT: FAIL: reason`
+  fails it with kind `review` and the reason becomes `{lastRejection}` for a
+  retry. (With its own `--review-cmd` configured, that reviewer decides instead.)
+- Chain tasks are excluded from the end-of-run review — reviewing a review is
+  not useful.
+
+This is the layer per-task reviews cannot see: each task locally correct, the
+combination wrong. The smoke test for it builds a ledger in three steps where
+`deposit` and `withdraw` are individually fine and `balance` ignores
+withdrawals; a real reviewer reading the bundle reports exactly that:
+"balance() ignores withdrawals (returns 100 instead of 70 after deposit 100 +
+withdraw 30)".
+
 ## End-of-run code review
 
 When the work converges, an agent can review it — one reviewer per task, or one
@@ -238,6 +273,8 @@ retry-failed                 requeue everything that failed
 resume · kill-orphans · skip-blocked · gc · settings · set · models
 harness [list|show] · set --harness NAME · set --harness-chain "a:x,b" · models
 final-review [--mode per-task|run] [--rounds N] [--cmd C]   end-of-run code review
+layers                       dependency waves (who could review whom)
+chain-review --of a,b | --wave N | --from ID | --all [--batch N] [--cmd C]
 review --of a,b --cmd "check"        scaffold an integration node (repairs upstream)
 review --id X --review-cmd "check"   attach a reviewer postcondition
 gate · approve · reject · heartbeat · dot · serve · launch · schedule · scheduler
@@ -257,7 +294,7 @@ vis-network; nothing is fetched from the network.
 ## Tests
 
 ```bash
-pnpm test        # 98 tests: graph semantics, scheduling, watchdogs, retries,
+pnpm test        # 102 tests: graph semantics, scheduling, watchdogs, retries,
                  # review/verdict protocol, worktree isolation + conflicts,
                  # harness chains + fallback, locks, recovery, migration
 ```

@@ -236,6 +236,32 @@ dag add --title "Implement parser" --spec "..." \
   --review-rounds 2 --json
 ```
 
+## Tasks about tasks (chain reviews)
+
+Some work is not "implement X" but "review what those tasks did". A chain
+review task covers other tasks; its instruction is generated from their real
+state when it runs.
+
+```bash
+dag layers                                   # dependency waves in this run
+dag chain-review --wave 3 --batch 10         # one wave, 10 tasks per reviewer
+dag chain-review --from <id> --depth 2       # a task and its dependency cone
+dag chain-review --all --batch 25            # 500 tasks -> 20 reviewers
+```
+
+- It depends on what it covers (so it runs after them) and is a normal graph
+  node: visible, retryable, skippable.
+- The spec is a template rendered at run time: `{coverage}`,
+  `{coverageManifest}`, `{coverageDir}`, `{coverageStat}`,
+  `{coverageFiles}`. A bundle with a manifest and one diff per covered task is
+  written to `dag.run.d/reviews/chain-<id>/` so a reviewer can work
+  incrementally.
+- Its VERDICT decides: FAIL fails it with kind `review` and feeds the reason
+  into `{lastRejection}` for a retry. Chain tasks are never themselves
+  reviewed by the end-of-run review.
+
+Use it for cross-task problems: each task locally right, the combination wrong.
+
 ## End-of-run code review
 
 Reviewers above judge one task while it runs. An **end-of-run review** happens

@@ -30,7 +30,13 @@ export function loadRegistry(): Registry {
   if (!existsSync(path)) return { version: 1, projects: [] };
   try {
     const raw = JSON.parse(readFileSync(path, 'utf8')) as Registry;
-    return { version: 1, projects: Array.isArray(raw.projects) ? raw.projects : [] };
+    const projects = Array.isArray(raw.projects) ? raw.projects : [];
+    // Heal registries written before paths were compared like paths.
+    const seen: ProjectEntry[] = [];
+    for (const entry of projects) {
+      if (!seen.some((p) => samePath(p.file, entry.file))) seen.push(entry);
+    }
+    return { version: 1, projects: seen };
   } catch {
     return { version: 1, projects: [] };
   }
@@ -59,10 +65,19 @@ export function resolveRunFile(target: string): string {
   return join(abs, 'dag.run.json');
 }
 
+// The same run file reaches the registry as "C:/x/dag.run.json",
+// "C:\x\dag.run.json" or with different casing; comparing raw strings made
+// each spelling a separate project (and a duplicate directory in the hub).
+export function samePath(a: string, b: string): boolean {
+  const norm = (p: string): string => resolve(p).replace(/\\/g, '/').replace(/\/+$/, '');
+  const [x, y] = [norm(a), norm(b)];
+  return process.platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y;
+}
+
 export function addProject(target: string, name?: string): ProjectEntry {
   const file = resolveRunFile(target);
   const registry = loadRegistry();
-  const existing = registry.projects.find((p) => p.file === file);
+  const existing = registry.projects.find((p) => samePath(p.file, file));
   if (existing) {
     if (name) existing.name = name;
     saveRegistry(registry);
@@ -82,7 +97,7 @@ export function removeProject(idOrPath: string): boolean {
   const registry = loadRegistry();
   const before = registry.projects.length;
   registry.projects = registry.projects.filter(
-    (p) => projectId(p.file) !== idOrPath && p.file !== resolve(idOrPath) && p.name !== idOrPath,
+    (p) => projectId(p.file) !== idOrPath && !samePath(p.file, idOrPath) && p.name !== idOrPath,
   );
   if (registry.projects.length === before) return false;
   saveRegistry(registry);
@@ -94,14 +109,14 @@ export function findProject(idOrPath: string): ProjectEntry | null {
   const abs = resolve(idOrPath);
   return (
     registry.projects.find(
-      (p) => projectId(p.file) === idOrPath || p.file === abs || p.name === idOrPath,
+      (p) => projectId(p.file) === idOrPath || samePath(p.file, abs) || p.name === idOrPath,
     ) ?? null
   );
 }
 
 export function setProjectPort(file: string, port: number): ProjectEntry | null {
   const registry = loadRegistry();
-  const entry = registry.projects.find((p) => p.file === resolve(file));
+  const entry = registry.projects.find((p) => samePath(p.file, file));
   if (!entry) return null;
   entry.port = port;
   saveRegistry(registry);

@@ -48,6 +48,7 @@ import {
   type FailureKind,
   type FinalReviewMode,
   type GatePolicy,
+  type TaskCoverage,
   type Run,
   type Task,
 } from './types.js';
@@ -64,6 +65,12 @@ const refuseMessage = (file: string): string =>
 
 export interface TokenContext {
   planFile?: string;
+  // Chain review: facts about the tasks this task covers.
+  coverage?: string;
+  coverageManifest?: string;
+  coverageDir?: string;
+  coverageStat?: string;
+  coverageFiles?: string;
   // End-of-run review: where the diff is, and the range it covers.
   diffFile?: string;
   diffBase?: string;
@@ -229,6 +236,11 @@ export function renderTokens(token: string, task: Task, ctx?: TokenContext): str
     diffHead: ctx?.diffHead ?? '',
     diffStat: ctx?.diffStat ?? '',
     files: ctx?.files ?? '',
+    coverage: ctx?.coverage ?? '',
+    coverageManifest: ctx?.coverageManifest ?? '',
+    coverageDir: ctx?.coverageDir ?? '',
+    coverageStat: ctx?.coverageStat ?? '',
+    coverageFiles: ctx?.coverageFiles ?? '',
     deps: ctx?.deps ?? '(no dependencies)',
     depsAll: ctx?.depsAll ?? '(no upstream tasks)',
     depsFile: ctx?.depsFile ?? '',
@@ -389,6 +401,7 @@ export class DagRunner {
   private reviewRound = 0;
   private reviewRounds = 0;
   private finalReview: FinalReviewSummary | null = null;
+  private coverageCache = new Map<string, TaskCoverage | null>();
 
   constructor(
     readonly state: Run,
@@ -839,6 +852,8 @@ export class DagRunner {
       (id) =>
         (scope === null || scope.has(id)) &&
         run.tasks[id].status === 'completed' &&
+        // Chain-review tasks are reviews: reviewing them reviews the reviewer.
+        !run.tasks[id].covers &&
         run.tasks[id].finalReview?.verdict !== 'pass',
     );
 
@@ -1079,7 +1094,7 @@ export class DagRunner {
     execute: Executor,
     worktreePath?: string,
     planFile?: string,
-    depsContext?: { deps: string; depsAll: string; depsFile?: string },
+    depsContext?: TokenContext,
   ): Promise<'ok' | 'fail' | 'skipped'> {
     const cmd = task.prepareCmd ?? this.state.settings.worktreePrepareCmd ?? '';
     if (!cmd.trim()) return 'skipped';
@@ -1118,7 +1133,7 @@ export class DagRunner {
     execute: Executor,
     worktreePath?: string,
     planFile?: string,
-    depsContext?: { deps: string; depsAll: string; depsFile?: string },
+    depsContext?: TokenContext,
     cmdOverride?: string | null,
   ): Promise<'ok' | 'fail'> {
     this.log('task-plan', task.id, 'planning phase starting');
@@ -1170,6 +1185,7 @@ export class DagRunner {
     worktreePath?: string,
     planFile?: string,
     depsContext?: TokenContext,
+    specOverride?: string,
   ): Promise<ExecOutcome> {
     const timeoutMs = task.timeoutMs ?? this.opts.timeoutMs ?? this.state.settings.timeoutMs;
     const silenceMs = task.silenceMs ?? this.opts.silenceMs ?? this.state.settings.silenceMs;
@@ -1262,6 +1278,11 @@ export class DagRunner {
       cwd: worktreePath,
       planFile,
       lastRejection: task.lastRejection,
+      coverage: depsContext?.coverage,
+      coverageManifest: depsContext?.coverageManifest,
+      coverageDir: depsContext?.coverageDir,
+      coverageStat: depsContext?.coverageStat,
+      coverageFiles: depsContext?.coverageFiles,
       deps: depsContext?.deps,
       depsAll: depsContext?.depsAll,
       depsFile: depsContext?.depsFile,
@@ -1274,7 +1295,9 @@ export class DagRunner {
 
     try {
       const resolved = cmd === null ? null : resolveHarness(cmd, task, this.state.settings);
-      const execPromise = execute(task, ctx, resolved ?? undefined);
+      // A rendered spec rides in on a copy: the real task keeps its template.
+      const tokenTask = specOverride === undefined ? task : { ...task, spec: specOverride };
+      const execPromise = execute(tokenTask, ctx, resolved ?? undefined);
       execPromise.catch(() => {
         // losing branch of the race; the winner reports it
       });
@@ -1331,7 +1354,7 @@ export class DagRunner {
     scope: Set<string> | null,
     worktreePath?: string,
     planFile?: string,
-    depsContext?: { deps: string; depsAll: string; depsFile?: string },
+    depsContext?: TokenContext,
   ): Promise<'pass' | 'requeue' | 'fail'> {
     const round = task.reviews + 1;
     const total = task.reviewRounds + 1;
@@ -1548,6 +1571,111 @@ export class DagRunner {
       `repair round ${task.repairs}/${task.repairRounds}: requeued upstream ${requeued.join(', ')}`,
     );
     return true;
+  }
+
+  // --- chain coverage (tasks whose subject is other tasks) ----------------
+
+  // Gathers what a chain-review task needs to see: one diff per covered task,
+  // a manifest describing them, and the rolled-up file list. Written once per
+  // attempt so the reviewer can work incrementally instead of reading one
+  // enormous blob.
+  private materializeCoverage(task: Task): TaskCoverage | null {
+    const covers = task.covers;
+    if (!covers || covers.length === 0) return null;
+    const cached = this.coverageCache.get(task.id);
+    if (cached !== undefined) return cached;
+    const run = this.state;
+    const covered = covers.filter((id) => run.tasks[id]);
+    const dir = this.opts.file
+      ? join(runPaths(this.opts.file).dir, 'reviews', `chain-${task.id}`)
+      : join(tmpdir(), 'dag-reviews', `chain-${task.id}`);
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {
+      // best effort
+    }
+    const repo = this.repoDir ?? this.opts.cwd ?? (this.opts.file ? dirname(this.opts.file) : process.cwd());
+    const manifest: string[] = [
+      `Chain review bundle for ${task.id} "${task.title}"`,
+      `Covered tasks: ${covered.length}`,
+      '',
+    ];
+    const files = new Set<string>();
+    const stats: string[] = [];
+    let base: string | null = null;
+    let head: string | null = null;
+    const oneLine = (s: string, n: number): string => {
+      const flat = s.replace(/\s+/g, ' ').trim();
+      return flat.length > n ? `${flat.slice(0, n)}…` : flat;
+    };
+    for (const id of covered) {
+      const t = run.tasks[id];
+      manifest.push(`## ${id} — ${t.title} [${t.status}]`);
+      manifest.push(`spec: ${oneLine(t.spec || '(none)', 400)}`);
+      if (t.finalReview) manifest.push(`final review: ${t.finalReview.verdict} ${oneLine(t.finalReview.reason, 200)}`);
+      if (t.failureKind) manifest.push(`failure: ${t.failureKind} ${oneLine(t.result ?? '', 200)}`);
+      else if (t.result) manifest.push(`result: ${oneLine(t.result, 300)}`);
+      if (t.diffBase && t.diffHead) {
+        const diff = git(repo, ['diff', t.diffBase, t.diffHead]);
+        const names = git(repo, ['diff', '--name-only', t.diffBase, t.diffHead]);
+        const stat = git(repo, ['diff', '--stat', t.diffBase, t.diffHead]);
+        const file = join(dir, `${id}.diff`);
+        try {
+          writeFileSync(file, diff.code === 0 ? `${diff.stdout}\n` : `(diff unavailable: ${diff.stderr})\n`, 'utf8');
+        } catch {
+          // best effort
+        }
+        if (names.code === 0) for (const f of names.stdout.split('\n').filter(Boolean)) files.add(f);
+        if (stat.code === 0 && stat.stdout) stats.push(`${id}: ${oneLine(stat.stdout, 200)}`);
+        manifest.push(`diff: ${file}  (git diff ${t.diffBase} ${t.diffHead})`);
+        if (!base) base = t.diffBase;
+        head = t.diffHead;
+      } else {
+        manifest.push('diff: (none recorded — it produced no changes, or ran without isolation)');
+      }
+      if (t.commit) manifest.push(`commit: ${t.commit}`);
+      manifest.push('');
+    }
+    const manifestFile = join(dir, 'manifest.md');
+    try {
+      writeFileSync(manifestFile, `${manifest.join('\n')}\n`, 'utf8');
+    } catch {
+      // best effort
+    }
+    const coverage: TaskCoverage = {
+      dir,
+      manifest: manifestFile,
+      base,
+      head,
+      stat: stats.join('\n'),
+      files: [...files].sort().join('\n'),
+      tasks: covered,
+    };
+    this.coverageCache.set(task.id, coverage);
+    this.log('note', task.id, `chain bundle written: ${manifestFile} (${covered.length} task(s), ${files.size} file(s))`);
+    return coverage;
+  }
+
+  // The spec of a chain task is a template: it is rendered here, with the
+  // covered tasks' facts, before the command is rendered — so {coverage*}
+  // tokens work inside the spec itself.
+  private renderCoverageSpec(task: Task, coverage: TaskCoverage | null): string {
+    if (!coverage) return task.spec;
+    const template = task.spec;
+    if (!template.includes('{')) return template;
+    const values: Record<string, string> = {
+      coverage: coverage.tasks
+        .map((id) => {
+          const t = this.state.tasks[id];
+          return `- ${id} [${t.status}] ${t.title}`;
+        })
+        .join('\n'),
+      coverageManifest: coverage.manifest,
+      coverageDir: coverage.dir,
+      coverageStat: coverage.stat,
+      coverageFiles: coverage.files,
+    };
+    return template.replace(/\{(\w+)\}/g, (match, name: string) => (name in values ? values[name] : match));
   }
 
   // --- worktree isolation -------------------------------------------------
@@ -1805,11 +1933,27 @@ export class DagRunner {
     // Upstream evidence for {deps} / {depsAll} / {depsFile}: deps are complete
     // by the time a task runs, so this is the real graph state, not a promise.
     const depsFile = task.deps.length > 0 ? this.depsFilePath(task, attempt) : undefined;
-    const depsContext = {
+    const depsContext: TokenContext = {
       deps: describeDeps(this.state, task),
       depsAll: describeDeps(this.state, task, { transitive: true }),
       depsFile,
     };
+    // Chain-review tasks: the covered tasks are done, so their facts are real.
+    let specOverride: string | undefined;
+    if (task.covers && task.covers.length > 0) {
+      const coverage = this.materializeCoverage(task);
+      task.coverage = coverage;
+      specOverride = this.renderCoverageSpec(task, coverage);
+      if (coverage) {
+        depsContext.coverage = coverage.tasks
+          .map((id) => `- ${id} [${this.state.tasks[id].status}] ${this.state.tasks[id].title}`)
+          .join('\n');
+        depsContext.coverageManifest = coverage.manifest;
+        depsContext.coverageDir = coverage.dir;
+        depsContext.coverageStat = coverage.stat;
+        depsContext.coverageFiles = coverage.files;
+      }
+    }
     if (depsFile) {
       try {
         writeFileSync(
@@ -1869,8 +2013,42 @@ export class DagRunner {
         }
       }
 
-      const outcome = await this.runPhase(task, execute, chained.cmd, 'run', worktreePath ?? undefined, planFile, depsContext);
+      const outcome = await this.runPhase(
+        task,
+        execute,
+        chained.cmd,
+        'run',
+        worktreePath ?? undefined,
+        planFile,
+        depsContext,
+        specOverride,
+      );
       if (this.tokens.get(task.id) !== token) return;
+
+      // A chain-review task produces a judgement, not code: its VERDICT line
+      // decides whether it passed. (With its own reviewer configured, the
+      // reviewer panel owns that decision instead.)
+      if (
+        task.covers &&
+        task.covers.length > 0 &&
+        this.reviewersFor(task).length === 0 &&
+        !task.reviewCmd
+      ) {
+        const verdict = parseVerdict(stripAnsi(outcome.output));
+        if (verdict.kind !== 'pass') {
+          const reason = verdict.reason || 'no VERDICT line in the review output';
+          task.lastRejection = `chain review: ${reason}`;
+          this.log('task-review-fail', task.id, `chain review rejected the covered work: ${reason.slice(0, 200)}`);
+          throw Object.assign(new Error(`chain review failed: ${reason}`), { kind: 'review' as const });
+        }
+        task.finalReview = {
+          verdict: 'pass',
+          reason: verdict.reason,
+          at: nowIso(),
+          round: attempt,
+        };
+        this.log('task-review-pass', task.id, `chain review passed${verdict.reason ? `: ${verdict.reason.slice(0, 120)}` : ''}`);
+      }
 
       if (this.reviewersFor(task).length > 0) {
         const verdict = await this.reviewPass(task, execute, scope, worktreePath ?? undefined, planFile, depsContext);

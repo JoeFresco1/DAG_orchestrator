@@ -31,12 +31,14 @@ import {
 } from './store.js';
 import {
   deriveStatus,
+  computeDepths,
   describeStuck,
   evaluateConvergence,
   getBlocked,
   getReady,
   summarize,
   topoSort,
+  transitiveDepIds,
 } from './graph.js';
 import { DagRunner } from './runner.js';
 import { startServer } from './server.js';
@@ -64,7 +66,7 @@ import {
   type JobArgs,
 } from './scheduler.js';
 import type { DepFailurePolicy, GatePolicy, TaskStatus } from './types.js';
-import { MAX_CONCURRENCY, TASK_STATUSES } from './types.js';
+import { MAX_CONCURRENCY, TASK_STATUSES, type Task } from './types.js';
 
 const wantsJson = (argv: string[]): boolean => argv.includes('--json');
 const emit = (argv: string[], data: unknown, human: () => string): void => {
@@ -440,6 +442,128 @@ async function main(): Promise<void> {
       rows.length === 0
         ? 'no projects registered; add one with: dag projects add --dir <folder>'
         : rows.map((r) => `${r.id}  ${r.exists ? ' ' : '!'} ${r.name}\t${r.file}`).join('\n'),
+    );
+    return;
+  }
+
+  if (cmd === 'layers') {
+    const run = loadRun(file);
+    const depths = computeDepths(run);
+    const waves = new Map<number, Task[]>();
+    for (const task of Object.values(run.tasks)) {
+      const d = depths.get(task.id) ?? 0;
+      const list = waves.get(d) ?? [];
+      list.push(task);
+      waves.set(d, list);
+    }
+    const rows = [...waves.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([depth, list]) => ({
+        wave: depth,
+        tasks: list.length,
+        ids: list.map((t) => t.id),
+        titles: list.map((t) => t.title),
+      }));
+    emit(rest, { waves: rows }, () =>
+      rows
+        .map((r) => `wave ${r.wave}: ${r.tasks} task(s) — ${r.titles.slice(0, 4).join(' | ')}${r.titles.length > 4 ? ' | …' : ''}`)
+        .join('\n'),
+    );
+    return;
+  }
+
+  if (cmd === 'chain-review') {
+    guard(file, rest);
+    const run = loadRun(file);
+    const depths = computeDepths(run);
+    const all = Object.values(run.tasks);
+
+    // Which tasks are covered: an explicit list, one wave, or everything.
+    let covered: Task[];
+    const of = parseList(flag(rest, 'of'));
+    const wave = countFlag(rest, 'wave', 0);
+    const from = flag(rest, 'from');
+    const depth = countFlag(rest, 'depth', 1) ?? 1;
+    if (of.length > 0) {
+      const unknown = of.filter((id) => !run.tasks[id]);
+      if (unknown.length > 0) throw new Error(`unknown task(s): ${unknown.join(', ')}`);
+      covered = of.map((id) => run.tasks[id]);
+    } else if (wave !== undefined) {
+      covered = all.filter((t) => (depths.get(t.id) ?? 0) === wave);
+      if (covered.length === 0) throw new Error(`no tasks in wave ${wave}; try: dag layers`);
+    } else if (from !== undefined) {
+      if (!run.tasks[from]) throw new Error(`unknown task ${from}`);
+      const subtree = new Set([from, ...transitiveDepIds(run, from)]);
+      // Cover the dependency cone of the anchor, in topological order.
+      covered = topoSort(run).filter((t) => subtree.has(t.id));
+      if (depth > 1) covered = covered.filter((t) => (depths.get(t.id) ?? 0) <= (depths.get(from) ?? 0));
+    } else if (has(rest, 'all')) {
+      covered = topoSort(run);
+    } else {
+      throw new Error('choose what to review: --of a,b | --wave N | --from <id> | --all');
+    }
+    const done = covered.filter((t) => t.status === 'completed' && !t.covers);
+    if (done.length === 0) {
+      throw new Error('nothing to review: none of the selected tasks completed (chain tasks are not reviewed twice)');
+    }
+    // 500 tasks is not one reviewer's job: chunk by --batch (default keeps one
+    // task per chunk for an explicit --of, and 25 otherwise).
+    const batch = countFlag(rest, 'batch', 1) ?? (of.length > 0 ? done.length : 25);
+    const chunks: Task[][] = [];
+    for (let i = 0; i < done.length; i += batch) chunks.push(done.slice(i, i + batch));
+
+    const cmd =
+      flag(rest, 'cmd') ??
+      (run.settings.harnessChain?.length
+        ? findHarness(run.settings.harnessChain[run.settings.harnessChain.length - 1].harness)?.cmd
+        : undefined) ??
+      findHarness('opencode')?.cmd;
+    if (!cmd) throw new Error('no command for the reviewer; pass --cmd');
+
+    const created: string[] = [];
+    for (const chunk of chunks) {
+      const titleBase = flag(rest, 'title') ?? 'chain review';
+      const title =
+        chunks.length === 1
+          ? `${titleBase}: ${chunk.length} task(s)`
+          : `${titleBase}: ${chunk.length} task(s) [${created.length + 1}/${chunks.length}]`;
+      const spec = [
+        'Review the combined work of the tasks listed at the end of this prompt.',
+        'This is a review, not an implementation: do not modify files.',
+        '',
+        'Facts about the covered work:',
+        '- covered tasks:',
+        '{coverage}',
+        '- one diff per task, plus a manifest, live in: {coverageDir}',
+        '  (the manifest is {coverageManifest}; each entry names its task, spec, result and diff file)',
+        '- changed files across the chain:',
+        '{coverageFiles}',
+        '- change summary:',
+        '{coverageStat}',
+        '',
+        'Do this:',
+        '1. Read the manifest, then the per-task diffs. For each task, check the code actually satisfies its spec - not just that the task ran.',
+        '2. Look for what per-task reviews cannot see: tasks contradicting each other, a later task undoing an earlier one, changes that only work in isolation, gaps between tasks, broken integration.',
+        '3. Verify with the repository own checks where cheap (build, tests, lint), and say what you ran.',
+        '4. Report concrete findings with file:line and the task that caused them.',
+        '',
+        'End with exactly one line: VERDICT: PASS or VERDICT: FAIL: <reason>',
+      ].join('\n');
+      const task = addTask(run, {
+        title,
+        spec,
+        cmd,
+        deps: chunk.map((t) => t.id),
+        covers: chunk.map((t) => t.id),
+      });
+      created.push(task.id);
+    }
+    saveRun(run, file);
+    emit(
+      rest,
+      { created, covered: done.map((t) => t.id), chunks: chunks.map((c) => c.length) },
+      () =>
+        `created ${created.length} chain review task(s) over ${done.length} task(s): ${created.join(', ')}`,
     );
     return;
   }
@@ -1411,6 +1535,9 @@ usage: dag <cmd> [flags]
   gc [--days 7]                prune old attempt logs
   final-review [--mode per-task|run] [--rounds N] [--cmd "agent ..."]
   settings --final-review off|per-task|run   end-of-run code review
+  layers                       dependency waves in this run
+  chain-review --of a,b | --wave N | --from ID | --all [--batch N] [--cmd C]
+                               review tasks that review the work of other tasks
   settings [--concurrency N] [--retries N] [--timeout SEC] [--silence SEC]
       [--max-hours H] [--on-dep-failure block|skip] [--gates wait|skip]
       [--notify "command"] [--worktree none|task]
