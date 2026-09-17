@@ -50,6 +50,7 @@ import {
   snapshotExcludes,
 } from './git-worktree.js';
 import { addProject, loadRegistry, projectId, removeProject, saveRegistry } from './registry.js';
+import { validateSettingsPatch } from './types.js';
 import { addJob, decideDue, jobArgsToArgv, loadSchedule, parseAt, removeJob, retryJob } from './scheduler.js';
 import type { Run, Task } from './types.js';
 
@@ -305,6 +306,105 @@ describe('watchdog and failures', () => {
     await runner.start();
     assert.equal(run.tasks[a.id].status, 'failed');
     assert.equal(run.tasks[a.id].failureKind, 'spawn');
+  });
+
+  it('keeps the output tail, so a late verdict outvotes an early one', async () => {
+    // 75k of filler puts the transcript well past the 64 KiB capture window:
+    // the early PASS must not survive while the real answer is dropped.
+    const script = `process.stdout.write('VERDICT: PASS\\n'); process.stdout.write('x'.repeat(75000)); process.stdout.write('\\nVERDICT: FAIL: the migration drops rows\\n');`;
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    run.tasks[a.id].cmd = `"${process.execPath}" -e "${script}"`;
+    run.tasks[a.id].reviewCmd = `"${process.execPath}" -e "console.log('VERDICT: FAIL: the migration drops rows')"`;
+    const runner = new DagRunner(run, {
+      executor: shellExecutor(),
+    });
+    await runner.start();
+    assert.equal(run.tasks[a.id].status, 'failed', 'a truncated PASS must not win');
+    assert.match(JSON.stringify(run.tasks[a.id].reviewerVerdicts), /drops rows/);
+  });
+
+  it('fails closed when the verdict is missing entirely', async () => {
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    run.tasks[a.id].cmd = `"${process.execPath}" -e "console.log('I looked at the code and it seems fine')"`;
+    run.tasks[a.id].reviewCmd = `"${process.execPath}" -e "console.log('I looked at the code and it seems fine')"`;
+    const runner = new DagRunner(run, { executor: shellExecutor() });
+    await runner.start();
+    assert.equal(run.tasks[a.id].status, 'failed');
+    assert.equal(run.tasks[a.id].failureKind, 'review');
+  });
+
+  it('applies the exit policy the same way for real and mocked executors', async () => {
+    const real = (cmd: string, settings: Partial<Run['settings']>): Promise<Run> => {
+      const { run, a } = make(['a']) as { run: Run; a: Task };
+      run.tasks[a.id].cmd = cmd;
+      run.tasks[a.id].maxAttempts = 1;
+      Object.assign(run.settings, settings);
+      return new DagRunner(run, { executor: shellExecutor() }).start().then(() => run);
+    };
+    const exiting = (code: number): string =>
+      `"${process.execPath}" -e "process.exit(${code})"`;
+
+    // Strict by default when nothing judges the work.
+    const strict = await real(exiting(1), {});
+    assert.equal(strict.tasks[Object.keys(strict.tasks)[0]].status, 'failed');
+    assert.equal(strict.tasks[Object.keys(strict.tasks)[0]].failureKind, 'exit');
+
+    // An explicit opt-out is honoured by the real executor too.
+    const lax = await real(exiting(1), { failOnNonZeroExit: false });
+    assert.equal(lax.tasks[Object.keys(lax.tasks)[0]].status, 'completed');
+    assert.equal(lax.tasks[Object.keys(lax.tasks)[0]].exitCode, 1);
+
+    // With a judge, the verdict decides and the reviewer actually runs.
+    let reviewed = 0;
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    run.tasks[a.id].cmd = exiting(1);
+    run.tasks[a.id].reviewCmd = 'verify {spec}';
+    run.settings.failOnNonZeroExit = null;
+    const runner = new DagRunner(run, {
+      executor: async (task, ctx, cmd) => {
+        if (cmd?.startsWith('verify')) {
+          reviewed += 1;
+          return { output: 'VERDICT: PASS', exitCode: 0 };
+        }
+        return shellExecutor()(task, ctx, cmd);
+      },
+    });
+    await runner.start();
+    assert.equal(reviewed, 1, 'the reviewer runs despite the nonzero exit');
+    assert.equal(run.tasks[a.id].status, 'completed');
+    assert.equal(run.tasks[a.id].exitCode, 1, 'the exit is still recorded');
+  });
+
+  it('does not land work whose exit policy rejected it', async () => {
+    const repo = gitRepo();
+    try {
+      mkdirSync(join(repo, 'sub'), { recursive: true });
+      writeFileSync(join(repo, 'tracked.txt'), 'base\n');
+      git(repo, ['add', '-A']);
+      git(repo, ['commit', '-qm', 'base2']);
+      const base = git(repo, ['rev-parse', 'HEAD']).stdout;
+      const { run, a } = make(['a']) as { run: Run; a: Task };
+      // No shell here: '&&' would be an argv token, not an operator.
+      run.tasks[a.id].cmd = `"${process.execPath}" -e "require('node:fs').writeFileSync('rejected.txt','nope');process.exit(1)"`;
+      run.tasks[a.id].maxAttempts = 1;
+      run.settings.worktree = 'task';
+      const runner = new DagRunner(run, {
+        cwd: repo,
+        executor: shellExecutor(),
+      });
+      await runner.start();
+      assert.equal(run.tasks[a.id].status, 'failed');
+      // Salvage keeps the WIP on the task branch (that is intentional), but the
+      // rejected change must never reach the integration branch.
+      const integration = `dag/${run.id}`;
+      if (git(repo, ['rev-parse', '--verify', integration]).code === 0) {
+        const landed = git(repo, ['show', `${integration}:rejected.txt`]).code === 0;
+        assert.equal(landed, false, 'rejected work reached the integration branch');
+      }
+      assert.equal(git(repo, ['rev-parse', 'HEAD']).stdout, base, 'no branch moved');
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 });
 
@@ -778,10 +878,13 @@ describe('chain review tasks (tasks about other tasks)', () => {
     const run = newRun('chain');
     const a = addTask(run, { title: 'first', spec: 'do a', cmd: 'work' });
     const b = addTask(run, { title: 'second', spec: 'do b', cmd: 'work' });
-    run.tasks[a.id].diffBase = 'base-a';
-    run.tasks[a.id].diffHead = 'head-a';
-    run.tasks[b.id].diffBase = 'base-b';
-    run.tasks[b.id].diffHead = 'head-b';
+    // The covered work is already done: the chain task is what runs here, and
+    // a fresh attempt on a covered task would (correctly) drop its old range.
+    for (const t of [a, b]) {
+      run.tasks[t.id].status = 'completed';
+      run.tasks[t.id].diffBase = `base-${t.title}`;
+      run.tasks[t.id].diffHead = `head-${t.title}`;
+    }
     const chain = addTask(run, {
       title: 'review the chain',
       spec: 'Covered:\n{coverage}\nmanifest: {coverageManifest}\nfiles: {coverageFiles}',
@@ -881,6 +984,152 @@ describe('chain review tasks (tasks about other tasks)', () => {
     assert.equal(wave.length, 1);
     const batches = Math.ceil(40 / 25);
     assert.equal(batches, 2);
+  });
+});
+
+describe('stale work and approvals', () => {
+  it('redoes completed descendants when an upstream task is repaired', async () => {
+    const run = newRun('invalidate');
+    const a = addTask(run, { title: 'a', spec: '', cmd: 'work-a' });
+    const b = addTask(run, { title: 'b', spec: '', cmd: 'work-b', deps: [a.id] });
+    const c = addTask(run, { title: 'c', spec: '', cmd: 'work-c', deps: [a.id] });
+    run.tasks[c.id].reviewCmd = 'judge-c';
+    run.tasks[c.id].repairRounds = 1;
+    run.tasks[a.id].maxAttempts = 3;
+    run.tasks[b.id].maxAttempts = 3;
+    run.tasks[c.id].maxAttempts = 3;
+    let cReviews = 0;
+    const runner = new DagRunner(run, {
+      executor: async (_task, _ctx, cmd) => {
+        if (cmd === 'judge-c') {
+          cReviews += 1;
+          return cReviews === 1
+            ? { output: 'VERDICT: FAIL: the ledger does not match the spec', exitCode: 0 }
+            : { output: 'VERDICT: PASS', exitCode: 0 };
+        }
+        return { output: 'ok', exitCode: 0 };
+      },
+    });
+    await runner.start();
+    assert.equal(run.tasks[c.id].status, 'completed');
+    // A was redone by the repair, so B's earlier completion is void: it was
+    // verified against an upstream output that no longer exists.
+    assert.equal(run.tasks[a.id].attempts, 2, 'upstream redone');
+    assert.equal(run.tasks[b.id].attempts, 2, 'stale descendant redone');
+    assert.equal(run.tasks[c.id].attempts, 2, 'the repaired task redone');
+    assert.ok(run.events.some((e) => /inputs changed: 1 completed downstream/.test(e.message ?? '')));
+  });
+
+  it('a retry must earn a fresh approval', async () => {
+    // The run file lives in a git repo: per-task review needs a real worktree.
+    const dir = gitRepo();
+    const file = join(dir, 'dag.run.json');
+    const run = newRun('fresh-approval');
+    const a = addTask(run, { title: 'a', spec: '', cmd: 'work' });
+    // Per-task review needs a per-task diff, which needs isolation.
+    run.tasks[a.id].diffBase = 'base';
+    run.tasks[a.id].diffHead = 'head';
+    run.settings.worktree = 'task';
+    saveRun(run, file);
+    let reviews = 0;
+    const runner = new DagRunner(run, {
+      file,
+      persist: (state) => saveRun(state, file),
+      executor: async (_task, _ctx, cmd) => {
+        if (cmd?.startsWith('judge')) {
+          reviews += 1;
+          return { output: 'VERDICT: PASS', exitCode: 0 };
+        }
+        return { output: 'ok', exitCode: 0 };
+      },
+    });
+    run.settings.finalReview = 'per-task';
+    run.settings.finalReviewCmd = 'judge {diffFile}';
+    await runner.start();
+    assert.equal(run.tasks[a.id].finalReview?.verdict, 'pass');
+    assert.equal(reviews, 1);
+
+    // Retry: the approval belonged to the previous output.
+    retryTask(run, a.id);
+    assert.equal(run.tasks[a.id].finalReview, null, 'retry clears the approval');
+    await runner.start();
+    assert.equal(reviews, 2, 'the retried work is reviewed again');
+    assert.equal(run.tasks[a.id].finalReview?.verdict, 'pass');
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('settings validation', () => {
+  it('rejects wrong values, not just unknown keys', () => {
+    const bad = validateSettingsPatch({
+      concurrency: 'banana',
+      worktree: 'typo',
+      finalReview: 'sometimes',
+      timeoutMs: -5,
+      failOnNonZeroExit: 'yes',
+      model: 42,
+    });
+    const fields = bad.map((p) => p.field).sort();
+    assert.deepEqual(fields, [
+      'concurrency',
+      'failOnNonZeroExit',
+      'finalReview',
+      'model',
+      'timeoutMs',
+      'worktree',
+    ]);
+    // A valid patch is clean, and so are the defaults.
+    assert.deepEqual(validateSettingsPatch({ concurrency: 4, worktree: 'task', model: null }), []);
+    assert.deepEqual(
+      validateSettingsPatch(newRun('ok').settings as unknown as Record<string, unknown>),
+      [],
+    );
+  });
+
+  it('refuses to run a file whose stored policy is corrupt', async () => {
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    run.tasks[a.id].cmd = 'work';
+    // Hand-edited or written by an older version: an unknown isolation mode
+    // must not quietly become "no isolation".
+    (run.settings as unknown as Record<string, unknown>).worktree = 'typo';
+    const runner = new DagRunner(run, {
+      executor: async () => ({ output: 'ok', exitCode: 0 }),
+    });
+    await runner.start();
+    assert.equal(run.tasks[a.id].status, 'pending', 'nothing ran');
+    assert.ok(run.events.some((e) => /invalid settings.*worktree/.test(e.message ?? '')));
+    assert.equal(runner.result?.scope.length, 0);
+  });
+});
+
+describe('scheduling throughput', () => {
+  it('refills a freed slot immediately instead of waiting for the batch', async () => {
+    // The probe that found this: with concurrency 2, [slow, fast] ran and the
+    // third task waited for the slow one. A freed slot must be refilled.
+    const run = newRun('slots');
+    const slow = addTask(run, { title: 'slow', spec: '', cmd: 'slow' });
+    const fast = addTask(run, { title: 'fast', spec: '', cmd: 'fast' });
+    const next = addTask(run, { title: 'next', spec: '', cmd: 'next' });
+    const startedAt = new Map<string, number>();
+    const finishedAt = new Map<string, number>();
+    const runner = new DagRunner(run, {
+      concurrency: 2,
+      executor: async (task) => {
+        startedAt.set(task.id, Date.now());
+        await sleep(task.id === slow.id ? 600 : task.id === fast.id ? 50 : 20);
+        finishedAt.set(task.id, Date.now());
+        return { output: 'ok', exitCode: 0 };
+      },
+    });
+    await runner.start();
+    const fastDone = finishedAt.get(fast.id) ?? 0;
+    const nextStart = startedAt.get(next.id) ?? Number.MAX_SAFE_INTEGER;
+    assert.ok(
+      nextStart - fastDone < 200,
+      `the third task started ${nextStart - fastDone}ms after the fast one finished (batch barrier)`,
+    );
+    assert.equal(run.tasks[next.id].status, 'completed');
+    assert.ok((startedAt.get(next.id) ?? 0) >= (startedAt.get(slow.id) ?? 0));
   });
 });
 

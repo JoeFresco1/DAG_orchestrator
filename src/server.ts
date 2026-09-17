@@ -41,7 +41,14 @@ import {
   projectOf,
   startNewRun,
 } from './runs.js';
-import type { DepFailurePolicy, GatePolicy, Run, Task } from './types.js';
+import {
+  describeSettingsProblems,
+  validateSettingsPatch,
+  type DepFailurePolicy,
+  type GatePolicy,
+  type Run,
+  type Task,
+} from './types.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -82,7 +89,13 @@ function projectDirs(): string[] {
 
 function runtimeFor(runId: string): RunRuntime | null {
   const existing = runtimes.get(runId);
-  if (existing) return existing;
+  if (existing) {
+    // The file behind a runtime can move (archived by a CLI in another
+    // process) or be replaced (a new run): re-resolve instead of answering
+    // from a cache that points at a file nobody has any more.
+    if (existsSync(existing.file)) return existing;
+    runtimes.delete(runId);
+  }
   const matches: { dir: string; found: NonNullable<ReturnType<typeof findRun>> }[] = [];
   for (const dir of projectDirs()) {
     const found = findRun(dir, runId);
@@ -174,6 +187,8 @@ function readBody(req: import('node:http').IncomingMessage): Promise<string> {
 }
 
 const MAX_BODY_BYTES = 1024 * 1024;
+
+const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // Malformed JSON is the caller's fault, not a server error.
 function parseBody(req: import('node:http').IncomingMessage, raw: string): Record<string, unknown> {
@@ -424,11 +439,27 @@ async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult
     if (manual.length > 0) {
       logEvent(run, 'note', null, `skipped ${manual.length} manual task(s) without cmd: ${manual.join(', ')}`);
     }
+    // A runner that cannot even set up (no git repo for isolation, bad graph)
+    // refuses synchronously and finishes instantly. Report that instead of
+    // claiming the run started and leaving the UI looking idle.
+    const eventsBefore = run.events.length;
     void rt.runner.start(new Set(scope)).finally(() => {
       rt.releaseLock?.();
       rt.releaseLock = null;
       saveRun(run, rt.file);
     });
+    await sleepMs(60);
+    if (!rt.runner.isRunning && rt.runner.result) {
+      const refusal = run.events
+        .slice(eventsBefore)
+        .reverse()
+        .find((e) => e.type === 'note' && e.message.startsWith('not starting:'));
+      if (refusal) {
+        rt.runner = null;
+        rt.activeScope = null;
+        return { started: false, error: refusal.message.replace(/^not starting:\s*/, ''), code: 409 };
+      }
+    }
     return { started: true, scope, skippedManual: manual };
   } catch (err) {
     if (lock && !rt.releaseLock) lock();
@@ -944,6 +975,13 @@ export function startServer(opts: ServeOptions): void {
       const unknown = Object.keys(body).filter((k) => !allowed.has(k));
       if (unknown.length > 0) {
         json(res, 400, { error: `cannot set: ${unknown.join(', ')}` });
+        return;
+      }
+      // Keys are not values: "banana" for a concurrency and "typo" for an
+      // isolation mode used to be accepted and persisted.
+      const problems = validateSettingsPatch(body);
+      if (problems.length > 0) {
+        json(res, 400, { error: describeSettingsProblems(problems), problems });
         return;
       }
       if (rt.runner?.isRunning) {

@@ -18,7 +18,8 @@
     "build": "tsc -p tsconfig.json && node scripts/vendor-viewer.mjs",
     "test": "npm run build && node --test dist/**/*.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "dag": "tsx src/cli.ts"
+    "dag": "tsx src/cli.ts",
+    "smoke:viewer": "node scripts/smoke-viewer.mjs"
   },
   "keywords": [
     "dag",

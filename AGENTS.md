@@ -146,9 +146,10 @@ dag settings --harness-chain "opencode,codex"          # run-wide default
 - The chain length sets the attempt budget: 3 candidates = at least 3 attempts,
   even if `--retries` says 1.
 - An attempt hands over on a thrown failure (spawn/timeout/stall), a review
-  rejection, or a non-zero exit. Exit codes count as failures when a chain is
-  set (`failOnNonZeroExit` auto) unless a reviewer/`--review-cmd` is judging
-  the work, because agents often exit non-zero after doing the work.
+  rejection, or a non-zero exit. Exit codes count as failures unless a
+  reviewer/`--review-cmd` is judging the work (agents often exit non-zero after
+  doing the work); `failOnNonZeroExit` overrides, and the policy is applied
+  once, before reviewers and before anything merges.
 - `dag settings --fail-on-exit | --no-fail-on-exit | --auto-fail-on-exit`
   overrides that policy. Prefer a reviewer with `verdict: exit-code` when exit
   codes must be decisive.

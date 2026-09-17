@@ -66,7 +66,13 @@ import {
   type JobArgs,
 } from './scheduler.js';
 import type { DepFailurePolicy, GatePolicy, TaskStatus } from './types.js';
-import { MAX_CONCURRENCY, TASK_STATUSES, type Task } from './types.js';
+import {
+  MAX_CONCURRENCY,
+  TASK_STATUSES,
+  describeSettingsProblems,
+  validateSettingsPatch,
+  type Task,
+} from './types.js';
 
 const wantsJson = (argv: string[]): boolean => argv.includes('--json');
 const emit = (argv: string[], data: unknown, human: () => string): void => {
@@ -693,6 +699,10 @@ async function main(): Promise<void> {
       throw new Error(
         'nothing to set; use --concurrency, --retries, --timeout, --silence, --max-hours, --worktree, --model, ...',
       );
+    }
+    const problems = validateSettingsPatch(patch as Record<string, unknown>);
+    if (problems.length > 0) {
+      throw new Error(`invalid settings: ${describeSettingsProblems(problems)}`);
     }
     const settings = setSettings(run, patch);
     saveRun(run, file);

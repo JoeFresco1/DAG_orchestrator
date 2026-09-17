@@ -110,6 +110,25 @@ const $ = (id) => document.getElementById(id);
 let projects = [];
 let currentDir = null;
 
+// Every mutation goes through here: the server (rightly) requires JSON, and a
+// missing content-type is a 415 that looks like "the button does nothing".
+async function jsonFetch(url, method, body) {
+  const res = await fetch(url, {
+    method,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body ?? {}),
+  });
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = { error: text.slice(0, 200) };
+  }
+  if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
+  return data;
+}
+
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }

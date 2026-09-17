@@ -16,7 +16,14 @@ import {
   worktreeRoot,
   type SnapshotExcludes,
 } from './git-worktree.js';
-import { depsMet, describeDeps, gateBlocks, isTerminal, topoSort } from './graph.js';
+import {
+  depsMet,
+  describeDeps,
+  gateBlocks,
+  isTerminal,
+  topoSort,
+  transitiveDependentIds,
+} from './graph.js';
 import { attemptsForChain, planAttempt, type HarnessCandidate } from './harness-chain.js';
 import { findHarness } from './harnesses.js';
 import {
@@ -48,6 +55,8 @@ import {
   type FailureKind,
   type FinalReviewMode,
   type GatePolicy,
+  describeSettingsProblems,
+  validateSettingsPatch,
   type TaskCoverage,
   type Run,
   type Task,
@@ -286,10 +295,14 @@ export function shellExecutor(cwd?: string): Executor {
       }
       ctx.setPid(child.pid ?? null);
       ctx.registerKill(() => killTree(child));
+      // Keep a rolling window of the tail, never the head: verdicts and failure
+      // reasons are at the end of the output, and a head-truncated transcript
+      // let an early "VERDICT: PASS" outvote a late "VERDICT: FAIL".
       let output = '';
       const onData = (buf: Buffer): void => {
         const chunk = buf.toString();
-        output = truncate(output + chunk, 64 * 1024);
+        output += chunk;
+        if (output.length > CAPTURE_LIMIT * 2) output = output.slice(-CAPTURE_LIMIT * 2);
         ctx.onOutput(chunk);
       };
       child.stdout?.on('data', onData);
@@ -300,28 +313,37 @@ export function shellExecutor(cwd?: string): Executor {
       });
       child.on('close', (code, signal) => {
         ctx.setPid(null);
+        const captured =
+          output.length > CAPTURE_LIMIT
+            ? truncateTail(output, CAPTURE_LIMIT)
+            : output;
         if (ctx.aborted()) {
           reject(Object.assign(new Error('aborted'), { kind: 'killed' as FailureKind }));
           return;
         }
-        if (code !== 0) {
-          // Include the output tail: "exit 1" alone hides why (bad flags,
-          // auth failures, usage text) and costs a debugging round-trip.
-          const tail = output.trim();
+        if (code === null || signal) {
+          // Died by signal: infrastructure, not a task outcome; the exit policy
+          // never sees it and the attempt is retried like any other failure.
           reject(
-            Object.assign(
-              new Error(`exit ${code ?? signal ?? 'unknown'}${tail ? `\n${truncate(tail, 600)}` : ''}`),
-              {
-                kind: 'exit' as FailureKind,
-                exitCode: code,
-              },
-            ),
+            Object.assign(new Error(`killed by ${signal ?? 'unknown signal'}${tailOf(captured)}`), {
+              kind: 'exit' as FailureKind,
+              signal: signal ?? null,
+            }),
           );
           return;
         }
-        resolve({ output, exitCode: code });
+        // Ordinary termination — including a nonzero exit — is an outcome. The
+        // exit policy is applied once, by the runner, before anything lands.
+        resolve({ output: captured, exitCode: code });
       });
     });
+}
+
+const CAPTURE_LIMIT = 64 * 1024;
+
+function tailOf(output: string): string {
+  const tail = output.trim();
+  return tail ? `\n${truncateTail(tail, 600)}` : '';
 }
 
 export interface RunnerOptions {
@@ -427,6 +449,33 @@ export class DagRunner {
   // Resolves when the run settles or stops. Never rejects.
   async start(scope: Set<string> | null = null): Promise<void> {
     if (this.active) return this.loopPromise ?? Promise.resolve();
+
+    // A run file can be hand-edited or written by an older version: an
+    // invalid policy must refuse execution instead of silently changing the
+    // execution model (an unknown isolation mode used to mean "unisolated").
+    {
+      const problems = validateSettingsPatch(
+        this.state.settings as unknown as Record<string, unknown>,
+      );
+      if (problems.length > 0) {
+        this.log('note', null, `not starting: invalid settings — ${describeSettingsProblems(problems)}`);
+        this.summary = {
+          scope: [],
+          completed: [],
+          failed: [],
+          skipped: [],
+          unfinished: [],
+          stopped: true,
+          budgetReached: false,
+          interrupted: { requeued: [], orphanPids: [] },
+          finalReview: null,
+        };
+        this.active = false;
+        this.stopping = false;
+        this.flush();
+        return;
+      }
+    }
 
     // One runner owns the file. If the caller (CLI, server) already holds the
     // lock we reuse it; otherwise take it here so programmatic use is safe too.
@@ -722,13 +771,23 @@ export class DagRunner {
     deadline: number,
   ): Promise<void> {
     const run = this.state;
-    while (true) {
+    // Completion-driven: a slot freed by a fast task is refilled immediately
+    // instead of waiting for its whole batch (which used to idle workers).
+    const running = new Set<Promise<void>>();
+    const launch = (task: Task): void => {
+      const promise = this.executeTask(task, execute, scope).finally(() => {
+        running.delete(promise);
+      });
+      running.add(promise);
+    };
+
+    for (;;) {
       if (deadline > 0 && Date.now() > deadline) {
         this.budgetReached = true;
         this.log('note', null, 'wall clock budget reached; not launching more tasks');
         break;
       }
-      if (this.stopping && this.inFlight.size === 0) break;
+      if (this.stopping && running.size === 0 && this.inFlight.size === 0) break;
 
       // Apply failure policy before deciding what to launch; skipping may
       // unlock convergence for this iteration or a later one.
@@ -737,32 +796,34 @@ export class DagRunner {
         continue;
       }
 
-      const batch: Task[] = [];
       if (!this.stopping) {
+        // topoSort gives a deterministic order (depth, then seq), so tasks
+        // that become ready together start together in the same order.
         for (const task of topoSort(run)) {
-          if (batch.length + this.inFlight.size >= concurrency) break;
+          if (running.size >= concurrency) break;
           if (scope !== null && !scope.has(task.id)) continue;
           if (task.status !== 'pending' && task.status !== 'ready') continue;
           if (this.inFlight.has(task.id)) continue;
           if (gateBlocks(task) || !depsMet(task, run.tasks)) continue;
-          if (task.deps.some((d) => {
-            const dep = run.tasks[d];
-            return !dep || dep.status === 'failed' || dep.status === 'skipped';
-          })) {
+          if (
+            task.deps.some((d) => {
+              const dep = run.tasks[d];
+              return !dep || dep.status === 'failed' || dep.status === 'skipped';
+            })
+          ) {
             continue;
           }
-          batch.push(task);
+          launch(task);
         }
       }
 
-      if (batch.length === 0) {
+      if (running.size === 0) {
         if (this.inFlight.size === 0) break;
         await sleep(50);
         continue;
       }
-      await Promise.all(batch.map((task) => this.executeTask(task, execute, scope)));
+      await Promise.race([...running]);
     }
-
   }
 
   private summarize(scope: Set<string> | null): void {
@@ -1565,6 +1626,50 @@ export class DagRunner {
     task.failureKind = null;
     task.result = null;
     task.exitCode = null;
+
+    // Work that already completed against the old upstream output is stale:
+    // B consumed A v1, so when A is redone B must not stay "verified". This is
+    // deliberately conservative — everything downstream of a repaired task is
+    // redone, in depth order — because without input versioning we cannot tell
+    // which descendants actually depend on what changed.
+    const stale: string[] = [];
+    for (const upstreamId of requeued) {
+      for (const dependentId of transitiveDependentIds(this.state, upstreamId)) {
+        if (dependentId === task.id || requeued.includes(dependentId)) continue;
+        if (scope !== null && !scope.has(dependentId)) continue;
+        const dependent = this.state.tasks[dependentId];
+        if (dependent.status !== 'completed') continue;
+        dependent.status = 'pending';
+        dependent.result = null;
+        dependent.failureKind = null;
+        dependent.exitCode = null;
+        dependent.startedAt = null;
+        dependent.finishedAt = null;
+        dependent.lastOutputAt = null;
+        dependent.lastOutput = null;
+        dependent.pid = null;
+        dependent.diffBase = null;
+        dependent.diffHead = null;
+        dependent.coverage = null;
+        // Its approval was for the old inputs.
+        dependent.finalReview = null;
+        stale.push(dependent.id);
+      }
+    }
+    for (const upstream of requeued) {
+      const t = this.state.tasks[upstream];
+      t.diffBase = null;
+      t.diffHead = null;
+      t.coverage = null;
+      t.finalReview = null;
+    }
+    if (stale.length > 0) {
+      this.log(
+        'task-repair',
+        task.id,
+        `inputs changed: ${stale.length} completed downstream task(s) requeued (${stale.join(', ')})`,
+      );
+    }
     this.log(
       'task-repair',
       task.id,
@@ -1682,7 +1787,10 @@ export class DagRunner {
 
   private async setupIsolation(): Promise<void> {
     const setting = this.state.settings.worktree ?? 'none';
-    if (setting !== 'task') return;
+    if (setting === 'none') return;
+    if (setting !== 'task') {
+      throw new Error(`unknown worktree mode "${setting}" — refusing to run unisolated`);
+    }
     const repoDir = this.opts.cwd ?? (this.opts.file ? dirname(this.opts.file) : process.cwd());
     if (!isGitRepo(repoDir)) {
       throw new Error(`worktree isolation requested but ${repoDir} is not a git repository`);
@@ -1898,6 +2006,12 @@ export class DagRunner {
     task.lastOutputAt = task.startedAt;
     task.lastOutput = null;
     task.pid = null;
+    // This attempt produces a new output, so any approval earned by an earlier
+    // one is void: it must be reviewed again before it counts as verified.
+    task.finalReview = null;
+    task.diffBase = null;
+    task.diffHead = null;
+    task.coverage = null;
     // Header first: every attempt gets a log file even with no output.
     this.appendLog(
       task.id,
@@ -2050,6 +2164,21 @@ export class DagRunner {
         this.log('task-review-pass', task.id, `chain review passed${verdict.reason ? `: ${verdict.reason.slice(0, 120)}` : ''}`);
       }
 
+      // The exit policy is applied once, here, before reviewers and before
+      // anything lands: rejected work must not reach the integration branch.
+      // A judge (reviewer/verdict) owns the decision when one exists — agents
+      // routinely exit non-zero after doing the work. `failOnNonZeroExit`
+      // overrides both ways; unset means "strict unless a judge is present".
+      const judges = this.reviewersFor(task).length > 0 || Boolean(task.reviewCmd);
+      const policy = this.state.settings.failOnNonZeroExit;
+      const failOnExit = policy === null || policy === undefined ? !judges : policy;
+      if (failOnExit && outcome.exitCode !== null && outcome.exitCode !== 0) {
+        throw Object.assign(
+          new Error(`exit ${outcome.exitCode}${tailOf(stripAnsi(outcome.output))}`),
+          { kind: 'exit' as const, exitCode: outcome.exitCode },
+        );
+      }
+
       if (this.reviewersFor(task).length > 0) {
         const verdict = await this.reviewPass(task, execute, scope, worktreePath ?? undefined, planFile, depsContext);
         if (this.tokens.get(task.id) !== token) return;
@@ -2084,20 +2213,6 @@ export class DagRunner {
           }
           return;
         }
-      }
-
-      // A dead agent CLI usually exits non-zero (rate limit, auth, crash).
-      // Verdicts are the better judge when they exist; without them the exit
-      // code is the only signal, so it decides — which is what lets a chain
-      // hand over to the next tool.
-      const judges = (task.reviewers?.length ?? 0) > 0 || Boolean(task.reviewCmd);
-      const failOnExit =
-        this.state.settings.failOnNonZeroExit ?? this.effectiveChain(task) !== null;
-      if (failOnExit && !judges && outcome.exitCode !== null && outcome.exitCode !== 0) {
-        throw Object.assign(new Error(`exit ${outcome.exitCode}`), {
-          kind: 'exit' as const,
-          exitCode: outcome.exitCode,
-        });
       }
 
       task.status = 'completed';

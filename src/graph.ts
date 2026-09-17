@@ -101,6 +101,27 @@ export function transitiveDepIds(run: Run, id: string): string[] {
   return [...seen].sort((a, b) => (depths.get(a) ?? 0) - (depths.get(b) ?? 0));
 }
 
+// Every task that (transitively) depends on this one, shallowest first:
+// the other direction of transitiveDepIds. Used to invalidate work whose
+// inputs changed when an upstream task is repaired or retried.
+export function transitiveDependentIds(run: Run, id: string): string[] {
+  const seen = new Set<string>([id]);
+  for (let pass = 0; pass < Object.keys(run.tasks).length; pass += 1) {
+    let grew = false;
+    for (const task of Object.values(run.tasks)) {
+      if (seen.has(task.id)) continue;
+      if (task.deps.some((d) => seen.has(d))) {
+        seen.add(task.id);
+        grew = true;
+      }
+    }
+    if (!grew) break;
+  }
+  seen.delete(id);
+  const depths = computeDepths(run);
+  return [...seen].sort((a, b) => (depths.get(a) ?? 0) - (depths.get(b) ?? 0));
+}
+
 // Evidence from upstream tasks, for `{deps}` / `{depsAll}` / `{depsFile}`.
 // This is what makes an integration check grade claims against the graph
 // instead of vibes: the reviewer sees what each dependency actually produced.

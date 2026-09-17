@@ -74,7 +74,9 @@ export function runPaths(file: string): RunPaths {
 
 function atomicWrite(path: string, data: string): void {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
+  // Unique per writer: two processes writing the same file (the registry is
+  // not run-locked) must not share one temp name and interleave.
+  const tmp = `${path}.tmp-${process.pid}-${randomUUID().slice(0, 8)}`;
   const fd = openSync(tmp, 'w');
   try {
     writeSync(fd, data);
@@ -116,6 +118,70 @@ const eventLogSizes = new Map<string, number>();
 // write as run files: concurrent `dag` processes can't leave them corrupt.
 export function atomicWriteJson(path: string, value: unknown): void {
   atomicWrite(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+// The registry and the schedule are global files touched by every CLI
+// invocation: unsynchronized read-modify-write loses updates even though each
+// write is atomic. Same primitive as the run lock, on an arbitrary path.
+export function acquirePathLock(lockPath: string, note: string, force = false): () => void {
+  mkdirSync(dirname(lockPath), { recursive: true });
+  const mine: LockInfo = {
+    pid: process.pid,
+    host: hostname(),
+    startedAt: new Date().toISOString(),
+    note,
+  };
+  const read = (): LockInfo | null => {
+    try {
+      return JSON.parse(readFileSync(lockPath, 'utf8')) as LockInfo;
+    } catch {
+      return null;
+    }
+  };
+  let held = false;
+  let emptySince: number | null = null;
+  for (let attempt = 0; attempt < 60 && !held; attempt += 1) {
+    try {
+      writeFileSync(lockPath, `${JSON.stringify(mine, null, 2)}\n`, { flag: 'wx' });
+      held = true;
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+    const cur = read();
+    if (!cur) {
+      if (emptySince === null) emptySince = Date.now();
+      if (Date.now() - emptySince < 1000) {
+        syncSleep(25);
+        continue;
+      }
+      rmSync(lockPath, { force: true });
+      continue;
+    }
+    emptySince = null;
+    if (cur.pid === process.pid) {
+      writeFileSync(lockPath, `${JSON.stringify(mine, null, 2)}\n`);
+      held = true;
+      break;
+    }
+    const stale = cur.host === hostname() && !isProcessAlive(cur.pid);
+    if (!stale && !force) {
+      throw new Error(
+        `${lockPath} is locked by pid ${cur.pid} (${cur.note}); pass --force or retry`,
+      );
+    }
+    rmSync(lockPath, { force: true });
+  }
+  if (!held) throw new Error(`could not acquire ${lockPath} (contended)`);
+  return () => {
+    const cur = read();
+    if (cur?.pid === process.pid) rmSync(lockPath, { force: true });
+  };
+}
+
+// Read a JSON file the same way run files are read: primary, then backup.
+export function readJsonFileWithBackup<T>(path: string): T | null {
+  return readJsonWithBackup<T>(path);
 }
 
 function appendEventLine(paths: RunPaths, ev: DagEvent): void {
@@ -786,6 +852,11 @@ export function retryTask(run: Run, id: string, cascade = false): string[] {
     // task that exhausted its rounds could never run again.
     t.plan = null;
     t.reviewerVerdicts = {};
+    // Approval was for the previous output: a retry must earn a fresh verdict.
+    t.finalReview = null;
+    t.diffBase = null;
+    t.diffHead = null;
+    t.coverage = null;
     t.lastRejection = null;
     t.reviews = 0;
     t.reviewResult = null;

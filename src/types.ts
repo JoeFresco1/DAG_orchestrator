@@ -188,6 +188,77 @@ export type DepFailurePolicy = 'block' | 'skip';
 // What happens to tasks sitting on an unapproved gate.
 export type GatePolicy = 'wait' | 'skip';
 
+// Settings that arrive from an API body, a CLI flag or a hand-edited file
+// are validated in one place: a wrong value must not silently change the
+// execution model (an unknown isolation mode used to mean "no isolation").
+export interface SettingsProblem {
+  field: string;
+  reason: string;
+}
+
+const PROBLEM = (field: string, reason: string): SettingsProblem => ({ field, reason });
+
+export function validateSettingsPatch(patch: Record<string, unknown>): SettingsProblem[] {
+  const problems: SettingsProblem[] = [];
+  const num = (field: string, min: number, max: number, integer = true): void => {
+    const value = patch[field];
+    if (value === undefined || value === null) return;
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      problems.push(PROBLEM(field, 'must be a finite number'));
+      return;
+    }
+    if (integer && !Number.isInteger(value)) problems.push(PROBLEM(field, 'must be an integer'));
+    if (value < min || value > max) problems.push(PROBLEM(field, `must be between ${min} and ${max}`));
+  };
+  const oneOf = (field: string, allowed: readonly string[]): void => {
+    const value = patch[field];
+    if (value === undefined || value === null) return;
+    if (typeof value !== 'string' || !allowed.includes(value)) {
+      problems.push(PROBLEM(field, `must be one of ${allowed.join('|')}`));
+    }
+  };
+  const text = (field: string, maxLength: number, allowNull = true): void => {
+    const value = patch[field];
+    if (value === undefined) return;
+    if (value === null) {
+      if (!allowNull) problems.push(PROBLEM(field, 'cannot be null'));
+      return;
+    }
+    if (typeof value !== 'string') problems.push(PROBLEM(field, 'must be a string'));
+    else if (value.length > maxLength) problems.push(PROBLEM(field, `must be at most ${maxLength} characters`));
+  };
+
+  num('concurrency', 1, 64);
+  num('maxAttempts', 1, 100);
+  num('timeoutMs', 0, 24 * 3600_000);
+  num('silenceMs', 0, 24 * 3600_000);
+  num('maxWallClockMs', 0, 30 * 24 * 3600_000);
+  num('finalReviewRounds', 0, 50);
+  num('reviewRounds', 0, 50);
+  num('repairRounds', 0, 50);
+  oneOf('worktree', ['none', 'task']);
+  oneOf('finalReview', ['off', 'per-task', 'run']);
+  oneOf('silenceAction', ['warn', 'kill']);
+  oneOf('onDepFailure', ['block', 'skip']);
+  oneOf('onGateBlocked', ['wait', 'skip']);
+  // null is meaningful (auto) for the exit policy.
+  if (patch.failOnNonZeroExit !== undefined && patch.failOnNonZeroExit !== null &&
+      typeof patch.failOnNonZeroExit !== 'boolean') {
+    problems.push(PROBLEM('failOnNonZeroExit', 'must be true, false or null'));
+  }
+  text('model', 300);
+  text('variant', 100);
+  text('notifyCmd', 4000);
+  text('finalReviewCmd', 8000);
+  text('worktreePrepareCmd', 4000);
+  // harnessChain is an array of candidates, validated by parseHarnessChain.
+  return problems;
+}
+
+export function describeSettingsProblems(problems: SettingsProblem[]): string {
+  return problems.map((p) => `${p.field}: ${p.reason}`).join('; ');
+}
+
 export interface RunSettings {
   concurrency: number;
   timeoutMs: number;

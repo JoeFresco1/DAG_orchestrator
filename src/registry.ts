@@ -1,8 +1,7 @@
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
-import { atomicWriteJson } from './store.js';
+import { acquirePathLock, atomicWriteJson, readJsonFileWithBackup } from './store.js';
 
 // One hub serves many projects. The registry is the hub's memory of them,
 // stored per-user so `dag hub` works from any directory.
@@ -27,9 +26,8 @@ export function registryPath(): string {
 
 export function loadRegistry(): Registry {
   const path = registryPath();
-  if (!existsSync(path)) return { version: 1, projects: [] };
-  try {
-    const raw = JSON.parse(readFileSync(path, 'utf8')) as Registry;
+  const raw = readJsonFileWithBackup<Registry>(path);
+  if (raw) {
     const projects = Array.isArray(raw.projects) ? raw.projects : [];
     // Heal registries written before paths were compared like paths.
     const seen: ProjectEntry[] = [];
@@ -37,8 +35,18 @@ export function loadRegistry(): Registry {
       if (!seen.some((p) => samePath(p.file, entry.file))) seen.push(entry);
     }
     return { version: 1, projects: seen };
-  } catch {
-    return { version: 1, projects: [] };
+  }
+  return { version: 1, projects: [] };
+}
+
+// Every writer of the registry takes this first: atomic replacement does not
+// prevent two dag processes from losing each other's edit.
+export function withRegistryLock<T>(fn: () => T, force = false): T {
+  const release = acquirePathLock(`${registryPath()}.lock`, 'registry write', force);
+  try {
+    return fn();
+  } finally {
+    release();
   }
 }
 
@@ -89,21 +97,23 @@ export function samePath(a: string, b: string): boolean {
 
 export function addProject(target: string, name?: string): ProjectEntry {
   const file = resolveRunFile(target);
-  const registry = loadRegistry();
+  return withRegistryLock(() => {
+    const registry = loadRegistry();
   const existing = registry.projects.find((p) => samePath(p.file, file));
-  if (existing) {
-    if (name) existing.name = name;
+    if (existing) {
+      if (name) existing.name = name;
+      saveRegistry(registry);
+      return existing;
+    }
+    const entry: ProjectEntry = {
+      file,
+      name: name ?? defaultProjectName(file),
+      addedAt: new Date().toISOString(),
+    };
+    registry.projects.push(entry);
     saveRegistry(registry);
-    return existing;
-  }
-  const entry: ProjectEntry = {
-    file,
-    name: name ?? defaultProjectName(file),
-    addedAt: new Date().toISOString(),
-  };
-  registry.projects.push(entry);
-  saveRegistry(registry);
-  return entry;
+    return entry;
+  });
 }
 
 export function removeProject(idOrPath: string): boolean {

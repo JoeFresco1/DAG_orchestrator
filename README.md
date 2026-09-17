@@ -97,10 +97,11 @@ Presets supply `cmd`/`planCmd`, each candidate supplies its own model, and the
 run records which tool the last attempt used. When a reviewer or
 `--review-cmd` is judging the work, verdicts decide and exit codes do not
 trigger a fallback (agents routinely exit non-zero after succeeding);
-`--fail-on-exit` / `--no-fail-on-exit` overrides that.
+`--fail-on-exit` / `--no-fail-on-exit` overrides that, and the same rule
+applies to real and mocked executors alike.
 
-**Verdicts are machine-readable.** Agent harnesses exit 0 whatever they
-conclude, so a reviewer must end with:
+**Verdicts are machine-readable and read from the output tail.** Agent
+harnesses exit 0 whatever they conclude, so a reviewer must end with:
 
 ```
 VERDICT: PASS
@@ -296,6 +297,33 @@ gate · approve · reject · heartbeat · dot · serve · launch · schedule · 
 
 Run `dag --help` for the full surface. Every command accepts `--json`.
 
+## Guarantees the runner keeps
+
+- **Exit policy in one place.** A process that terminates normally — including
+  a nonzero exit — is an *outcome*, not an exception. The policy is applied
+  once per attempt, before reviewers run and before anything lands in the
+  integration branch: strict by default, verdicts decide when a reviewer is
+  configured, `failOnNonZeroExit` overrides both ways. Spawn failures, signals,
+  timeouts and cancellation stay distinct infrastructure outcomes.
+- **Approvals do not outlive their work.** Every new attempt clears the
+  previous end-of-run verdict, its diff range and its coverage. A manual retry
+  must earn a fresh review.
+- **Repair invalidates downstream work.** Redoing an upstream task requeues the
+  work that already completed against it (in depth order) instead of leaving it
+  "verified" against inputs that no longer exist.
+- **Slots are refilled on completion.** Workers are not held behind a batch
+  barrier, so a task that finishes early frees its slot immediately.
+- **Settings are validated by value**, not just by key: enums, numeric bounds
+  and lengths are checked at the API, in the CLI and for loaded files. An
+  invalid isolation mode refuses execution — it never quietly means "run
+  unisolated".
+- **Global files are written under a lock** (registry, schedule) with unique
+  temp names and backup-aware readers, since every CLI invocation touches them.
+
+`pnpm smoke:viewer` drives the real pages in headless Edge: run, stop, retry,
+gate approval, settings, and the archived-run restriction. It skips when no
+browser is installed, so `pnpm test` stays hermetic.
+
 ## Viewer
 
 `dag serve --open`. Left-to-right DAG colored by status; queue with checkboxes
@@ -308,7 +336,7 @@ vis-network; nothing is fetched from the network.
 ## Tests
 
 ```bash
-pnpm test        # 102 tests: graph semantics, scheduling, watchdogs, retries,
+pnpm test        # 112 tests: graph semantics, scheduling, watchdogs, retries,
                  # review/verdict protocol, worktree isolation + conflicts,
                  # harness chains + fallback, locks, recovery, migration
 ```

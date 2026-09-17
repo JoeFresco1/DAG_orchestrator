@@ -1,10 +1,10 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
+import { appendFileSync, closeSync, mkdirSync, openSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { cliPath } from './launcher.js';
 import { resolveRunFile } from './registry.js';
-import { atomicWriteJson } from './store.js';
+import { atomicWriteJson, readJsonFileWithBackup } from './store.js';
 
 // Jobs run sequentially, on a clock and/or after another job. That is the
 // "this run first, then that run" feature without a workflow engine.
@@ -50,14 +50,9 @@ export function schedulePath(): string {
 }
 
 export function loadSchedule(): ScheduleFile {
-  const path = schedulePath();
-  if (!existsSync(path)) return { version: 1, jobs: [] };
-  try {
-    const raw = JSON.parse(readFileSync(path, 'utf8')) as ScheduleFile;
-    return { version: 1, jobs: Array.isArray(raw.jobs) ? raw.jobs : [] };
-  } catch {
-    return { version: 1, jobs: [] };
-  }
+  const raw = readJsonFileWithBackup<ScheduleFile>(schedulePath());
+  if (raw) return { version: 1, jobs: Array.isArray(raw.jobs) ? raw.jobs : [] };
+  return { version: 1, jobs: [] };
 }
 
 export function saveSchedule(schedule: ScheduleFile): void {

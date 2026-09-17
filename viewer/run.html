@@ -254,7 +254,7 @@ aside {
   <div class="pills" id="pills"></div>
   <div class="progress" id="progress"><i id="pbar-done" class="pbar-done"></i><i id="pbar-fail" class="pbar-fail"></i><i id="pbar-skip" class="pbar-skip"></i><i id="pbar-run" class="pbar-run"></i></div>
   <div class="actions">
-    <button class="primary" id="runBtn" disabled>Run</button>
+    <button class="primary" id="runBtn" title="Run the checked tasks, or every runnable task when none are checked" disabled>Run</button>
     <button class="danger" id="stopBtn" disabled>Stop</button>
     <button id="retryBtn" disabled>Retry failed</button>
     <button id="skipBtn">Skip blocked</button>
@@ -499,10 +499,44 @@ function applySettings(def) {
   }
 }
 
+// Every mutation goes through here: the server (rightly) requires JSON, and a
+// missing content-type is a 415 that looks like "the button does nothing".
+async function jsonFetch(url, method, body) {
+  const res = await fetch(url, {
+    method,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body ?? {}),
+  });
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = { error: text.slice(0, 200) };
+  }
+  if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
+  return data;
+}
+
 function note(msg, cls) {
   const el = $('jobnote');
   el.textContent = msg || '';
   el.className = 'jobnote' + (cls ? ' ' + cls : '');
+  // A message that only lives in the toolbar is easy to miss — a start that
+  // was refused must also show up where the operator is already looking.
+  if (msg && cls === 'error') {
+    pushEventLine({ ts: new Date().toISOString(), type: 'note', message: msg });
+  }
+}
+
+// Minimal event row renderer, reused for client-side notices.
+function pushEventLine(ev) {
+  if (!logEl) return;
+  logEl.insertAdjacentHTML(
+    'afterbegin',
+    `<div class="ev ${EV_CLASS[ev.type] || 'fail'}"><b>${ev.ts.slice(11, 19)}</b> ${esc(ev.type)} ${esc(ev.message)}</div>`,
+  );
+  while (logEl.childElementCount > 300) logEl.removeChild(logEl.lastChild);
 }
 
 function sig(t) { return `${t.display}|${t.attempts}|${t.failureKind || ''}|${t.lastOutputAt ? t.lastOutputAt.slice(0, 17) : ''}`; }
@@ -595,7 +629,8 @@ function renderHeader(s) {
 
   const running = job.running;
   const external = job.external;
-  $('runBtn').disabled = running || job.stopping || !!external || checked.size === 0;
+  // Nothing checked means "run everything runnable", so the button stays live.
+  $('runBtn').disabled = running || job.stopping || !!external;
   $('runBtn').textContent = job.stopping ? 'Stopping…' : running ? `Running (${job.current.length})` : 'Run';
   $('stopBtn').disabled = !running || job.stopping;
   $('retryBtn').disabled = running || !!external || !c.failed;
@@ -823,24 +858,27 @@ async function fetchEvents() {
 
 // ---- mutations ----
 async function patch(id, body) {
-  const r = await fetch(`${API}/tasks/${id}`, { method: 'POST', body: JSON.stringify(body) });
+  const r = await fetch(`${API}/tasks/${id}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   if (!r.ok) note(await r.text(), 'error');
   await poll();
   await fetchDetail(id);
   renderInspector();
 }
 async function retry(ids) {
-  const r = await fetch(`${API}/retry`, { method: 'POST', body: JSON.stringify({ ids }) });
+  const r = await fetch(`${API}/retry`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ids }) });
   if (!r.ok) note((await r.json()).error || 'retry failed', 'error');
   await poll();
 }
 
 $('runBtn').onclick = async () => {
   note('');
+  // Nothing checked means "run everything runnable", the same as `dag run`.
+  // An empty id list would be an empty selection and fail with 400.
   const r = await fetch(`${API}/run/start`, {
     method: 'POST',
+    headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      ids: [...checked],
+      ids: checked.size > 0 ? [...checked] : null,
       concurrency: Number($('concurrency').value) || 4,
       timeoutMs: (Number($('timeout').value) || 0) * 1000,
       silenceMs: (Number($('silence').value) || 0) * 1000,
@@ -861,17 +899,24 @@ $('runBtn').onclick = async () => {
   else if (data.skippedManual?.length) note(`skipped manual task(s): ${data.skippedManual.join(', ')}`);
   await poll();
 };
-$('stopBtn').onclick = async () => { await fetch(`${API}/run/stop`, { method: 'POST' }); await poll(); };
+$('stopBtn').onclick = async () => {
+  try {
+    await jsonFetch(`${API}/run/stop`, 'POST');
+  } catch (err) {
+    note(String(err.message), 'error');
+  }
+  await poll();
+};
 $('retryBtn').onclick = () => retry(null);
 $('skipBtn').onclick = async () => {
-  const r = await fetch(`${API}/skip-blocked`, { method: 'POST' });
+  const r = await fetch(`${API}/skip-blocked`, { method: 'POST', headers: { 'content-type': 'application/json' } });
   const data = await r.json();
   if (!r.ok) note(data.error || 'skip failed', 'error');
   else note(`skipped ${data.skipped.length} task(s)`, 'ok');
   await poll();
 };
 $('orphanBtn').onclick = async () => {
-  const r = await fetch(`${API}/kill-orphans`, { method: 'POST' });
+  const r = await fetch(`${API}/kill-orphans`, { method: 'POST', headers: { 'content-type': 'application/json' } });
   const data = await r.json();
   if (!r.ok) note(data.error || 'kill-orphans failed', 'error');
   else note(`orphans: ${data.killed.length === 0 ? 'none recorded' : data.killed.map((k) => `${k.pid} ${k.killed ? 'killed' : 'gone'}`).join(', ')}`, 'ok');
