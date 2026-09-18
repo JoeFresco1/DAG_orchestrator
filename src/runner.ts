@@ -631,6 +631,8 @@ export class DagRunner {
     this.flush();
   }
 
+  // Kills one task's process tree and remembers why, so the settlement path
+  // reports the right failure kind.
   private killTask(id: string, reason: FailureKind): void {
     this.reasons.set(id, reason);
     const kill = this.kills.get(id);
@@ -643,6 +645,7 @@ export class DagRunner {
     }
   }
 
+  // Records an event on the run and forwards it to the live viewer, if any.
   private log(type: DagEvent['type'], taskId: string | null, message: string): void {
     const ev = logEvent(this.state, type, taskId, message);
     this.opts.onEvent?.(ev);
@@ -658,16 +661,20 @@ export class DagRunner {
     }, this.opts.persistThrottleMs ?? 200);
   }
 
+  // Persists the current state now; the coalesced form is `persist`.
   private flush(): void {
     this.dirty = false;
     this.state.updatedAt = nowIso();
     this.opts.persist?.(this.state);
   }
 
+  // Retry delay that also wakes early when stop() is called.
   private async backoff(ms: number): Promise<void> {
     await Promise.race([sleep(ms), this.stopGate.catch(() => undefined)]);
   }
 
+  // Streams a chunk to the task's attempt log, opening the file lazily and
+  // enforcing the byte cap (once capped, later output is dropped).
   private appendLog(taskId: string, chunk: string): void {
     const file = this.opts.file;
     if (!file) return;
@@ -702,6 +709,7 @@ export class DagRunner {
     entry.stream.write(chunk);
   }
 
+  // Closes and forgets one task's attempt-log stream.
   private closeLog(taskId: string): void {
     const entry = this.logs.get(taskId);
     if (!entry) return;
@@ -713,10 +721,13 @@ export class DagRunner {
     }
   }
 
+  // Closes every open attempt log (run teardown).
   private closeAllLogs(): void {
     for (const id of [...this.logs.keys()]) this.closeLog(id);
   }
 
+  // Applies the run's dep-failure/gate policy and returns how many tasks were
+  // skipped. Scope-restricted: a scoped run must not skip outside its scope.
   private policySkip(scope: Set<string> | null): number {
     const run = this.state;
     const dep = this.opts.onDepFailure ?? run.settings.onDepFailure ?? 'block';
@@ -729,6 +740,8 @@ export class DagRunner {
     return skipped;
   }
 
+  // The outer driver: run the graph to convergence, then repeat if the
+  // end-of-run review sends completed work back for fixes.
   private async loop(scope: Set<string> | null): Promise<void> {
     const run = this.state;
     // Agents run in the run file's directory unless the caller overrides it,
@@ -764,6 +777,9 @@ export class DagRunner {
     this.summarize(scope);
   }
 
+  // The scheduler: launches ready tasks up to the concurrency limit and refills
+  // slots as soon as any finishes, honoring the wall-clock budget and the
+  // dep-failure policy.
   private async runTasks(
     execute: Executor,
     scope: Set<string> | null,
@@ -826,6 +842,7 @@ export class DagRunner {
     }
   }
 
+  // Builds the final RunSummary, logs it, and fires the run-end notification.
   private summarize(scope: Set<string> | null): void {
     const run = this.state;
     const scoped =
@@ -1034,6 +1051,8 @@ export class DagRunner {
     };
   }
 
+  // The command used for the end-of-run review: an explicit setting wins, then
+  // the named task/run harness preset, then any known reviewer preset.
   private reviewCommand(task: Task | null): string | null {
     const explicit = this.state.settings.finalReviewCmd;
     if (explicit) return explicit;
@@ -1050,6 +1069,7 @@ export class DagRunner {
     return null;
   }
 
+  // The prompt for a per-task end-of-run review, pointing at the written diff.
   private reviewPrompt(task: Task, diff: TokenContext): string {
     return [
       `Code review of one task from an automated run (task ${task.id}: ${task.title}).`,
@@ -1065,6 +1085,7 @@ export class DagRunner {
       .join('\n');
   }
 
+  // The prompt for a whole-run review, listing every task and the integrated diff.
   private runReviewPrompt(diff: TokenContext): string {
     const run = this.state;
     const tasks = Object.values(run.tasks)
@@ -1120,6 +1141,8 @@ export class DagRunner {
     return { ctx: { diffFile: file, diffBase: base ?? '', diffHead: head ?? '', diffStat: stat, files } };
   }
 
+  // Fires the configured notify command, detached, with DAG_* env vars. A
+  // broken notify command must never take the run down.
   private notify(event: string, taskId: string | null, message: string): void {
     const cmd = this.state.settings.notifyCmd;
     if (!cmd) return;
@@ -1213,6 +1236,7 @@ export class DagRunner {
     return 'ok';
   }
 
+  // Where this attempt's captured plan is written (for the {planFile} token).
   private planFilePath(task: Task, attempt: number): string | undefined {
     const file = this.opts.file;
     if (!file) return undefined;
@@ -1225,6 +1249,7 @@ export class DagRunner {
     return join(dir, `${task.id}.${attempt}.md`);
   }
 
+  // Where the upstream evidence for {depsFile} is written.
   private depsFilePath(task: Task, attempt: number): string | undefined {
     const file = this.opts.file;
     if (!file) return undefined;
@@ -1566,6 +1591,8 @@ export class DagRunner {
     return this.handleRejection(task, `${rejected.name}: ${rejected.reason}`, scope);
   }
 
+  // A reviewer rejected the work: redo it while review rounds remain, otherwise
+  // fail it and give an integration node the chance to repair its upstream.
   private handleRejection(task: Task, message: string, scope: Set<string> | null): 'requeue' | 'fail' {
     task.reviews += 1;
     if (task.reviews <= task.reviewRounds) {
@@ -1785,6 +1812,8 @@ export class DagRunner {
 
   // --- worktree isolation -------------------------------------------------
 
+  // Establishes worktree isolation up front. If it was requested but cannot be
+  // set up, this throws so the run refuses to start rather than run in place.
   private async setupIsolation(): Promise<void> {
     const setting = this.state.settings.worktree ?? 'none';
     if (setting === 'none') return;
@@ -1936,6 +1965,7 @@ export class DagRunner {
     this.integration = null;
   }
 
+  // Removes one task's worktree from disk and forgets its bookkeeping.
   private dropWorktree(taskId: string): void {
     const path = this.worktrees.get(taskId);
     if (!path || !this.repoDir) return;
@@ -1948,6 +1978,7 @@ export class DagRunner {
     }
   }
 
+  // The harness chain that governs this task: its own, else the run's, else none.
   private effectiveChain(task: Task): HarnessCandidate[] | null {
     if (task.harnessChain && task.harnessChain.length > 0) return task.harnessChain;
     if (this.state.settings.harnessChain?.length) return this.state.settings.harnessChain;
@@ -1981,106 +2012,34 @@ export class DagRunner {
     };
   }
 
+  // Runs one attempt end to end: attempt bookkeeping, worktree, prepare/plan
+  // phases, the work command, verdict/exit policy, reviewers, landing, then
+  // either completion or the failure/retry path. Each step is delegated to a
+  // named helper so this method reads as the attempt's shape.
   private async executeTask(
     task: Task,
     execute: Executor,
     scope: Set<string> | null,
   ): Promise<void> {
     if (this.stopping) return;
-
-    const token = (this.tokens.get(task.id) ?? 0) + 1;
-    this.tokens.set(task.id, token);
-    this.inFlight.add(task.id);
-
-    const attempt = task.attempts + 1;
-    task.attempts = attempt;
-    this.attemptByTask.set(task.id, attempt);
-    task.status = 'running';
-    task.startedAt = nowIso();
-    task.finishedAt = null;
-    task.exitCode = null;
-    task.failureKind = null;
-    task.result = null;
-    task.reviewResult = null;
-    task.reviewExitCode = null;
-    task.lastOutputAt = task.startedAt;
-    task.lastOutput = null;
-    task.pid = null;
-    // This attempt produces a new output, so any approval earned by an earlier
-    // one is void: it must be reviewed again before it counts as verified.
-    task.finalReview = null;
-    task.diffBase = null;
-    task.diffHead = null;
-    task.coverage = null;
-    // Header first: every attempt gets a log file even with no output.
-    this.appendLog(
-      task.id,
-      `# attempt ${attempt} started ${task.startedAt}\n# cmd: ${task.cmd ?? '(manual)'}${
-        task.reviewCmd ? `\n# review: ${task.reviewCmd}` : ''
-      }\n`,
-    );
-    this.log('task-start', task.id, `attempt ${attempt}/${this.maxAttemptsFor(task)}: ${task.title}`);
-    this.persist();
+    const token = this.beginAttempt(task);
 
     let worktreePath: string | null = null;
     try {
       worktreePath = this.makeTaskWorktree(task);
     } catch (err) {
-      // Isolation is on: refuse to run the agent in the real working tree.
-      task.status = 'failed';
-      task.failureKind = 'worktree';
-      task.result = `worktree create failed: ${err instanceof Error ? err.message : String(err)}`;
-      this.log('task-fail', task.id, `failed (worktree): ${truncate(task.result, 200)}`);
-      this.notify('task-fail', task.id, 'worktree create failed');
-      this.dropWorktree(task.id);
-      this.inFlight.delete(task.id);
-      this.tokens.delete(task.id);
-      this.closeLog(task.id);
-      this.persist();
+      // Isolation was explicitly requested: refuse to run the agent in the
+      // real working tree.
+      this.failWorktreeSetup(task, err);
       return;
     }
     if (worktreePath) {
       this.log('note', task.id, `worktree ${task.branch} at ${worktreePath}`);
     }
-    const chained = this.applyHarnessChain(task, attempt);
-    const planFile = chained.planCmd ? this.planFilePath(task, attempt) : undefined;
-    // Upstream evidence for {deps} / {depsAll} / {depsFile}: deps are complete
-    // by the time a task runs, so this is the real graph state, not a promise.
-    const depsFile = task.deps.length > 0 ? this.depsFilePath(task, attempt) : undefined;
-    const depsContext: TokenContext = {
-      deps: describeDeps(this.state, task),
-      depsAll: describeDeps(this.state, task, { transitive: true }),
-      depsFile,
-    };
-    // Chain-review tasks: the covered tasks are done, so their facts are real.
-    let specOverride: string | undefined;
-    if (task.covers && task.covers.length > 0) {
-      const coverage = this.materializeCoverage(task);
-      task.coverage = coverage;
-      specOverride = this.renderCoverageSpec(task, coverage);
-      if (coverage) {
-        depsContext.coverage = coverage.tasks
-          .map((id) => `- ${id} [${this.state.tasks[id].status}] ${this.state.tasks[id].title}`)
-          .join('\n');
-        depsContext.coverageManifest = coverage.manifest;
-        depsContext.coverageDir = coverage.dir;
-        depsContext.coverageStat = coverage.stat;
-        depsContext.coverageFiles = coverage.files;
-      }
-    }
-    if (depsFile) {
-      try {
-        writeFileSync(
-          depsFile,
-          `# Upstream evidence for ${task.id} "${task.title}"\n\n` +
-            `## Direct dependencies\n${depsContext.deps}\n\n` +
-            `## All upstream tasks\n${depsContext.depsAll}\n`,
-          'utf8',
-        );
-      } catch {
-        // the inline tokens still carry the evidence
-      }
-    }
+    const { chained, planFile, depsContext, specOverride } = this.attemptContext(
+      task,
+      task.attempts,
+    );
 
     try {
       // Environment first: nothing else can run without it.
@@ -2139,45 +2098,9 @@ export class DagRunner {
       );
       if (this.tokens.get(task.id) !== token) return;
 
-      // A chain-review task produces a judgement, not code: its VERDICT line
-      // decides whether it passed. (With its own reviewer configured, the
-      // reviewer panel owns that decision instead.)
-      if (
-        task.covers &&
-        task.covers.length > 0 &&
-        this.reviewersFor(task).length === 0 &&
-        !task.reviewCmd
-      ) {
-        const verdict = parseVerdict(stripAnsi(outcome.output));
-        if (verdict.kind !== 'pass') {
-          const reason = verdict.reason || 'no VERDICT line in the review output';
-          task.lastRejection = `chain review: ${reason}`;
-          this.log('task-review-fail', task.id, `chain review rejected the covered work: ${reason.slice(0, 200)}`);
-          throw Object.assign(new Error(`chain review failed: ${reason}`), { kind: 'review' as const });
-        }
-        task.finalReview = {
-          verdict: 'pass',
-          reason: verdict.reason,
-          at: nowIso(),
-          round: attempt,
-        };
-        this.log('task-review-pass', task.id, `chain review passed${verdict.reason ? `: ${verdict.reason.slice(0, 120)}` : ''}`);
-      }
+      this.applyChainReviewVerdict(task, outcome, task.attempts);
 
-      // The exit policy is applied once, here, before reviewers and before
-      // anything lands: rejected work must not reach the integration branch.
-      // A judge (reviewer/verdict) owns the decision when one exists — agents
-      // routinely exit non-zero after doing the work. `failOnNonZeroExit`
-      // overrides both ways; unset means "strict unless a judge is present".
-      const judges = this.reviewersFor(task).length > 0 || Boolean(task.reviewCmd);
-      const policy = this.state.settings.failOnNonZeroExit;
-      const failOnExit = policy === null || policy === undefined ? !judges : policy;
-      if (failOnExit && outcome.exitCode !== null && outcome.exitCode !== 0) {
-        throw Object.assign(
-          new Error(`exit ${outcome.exitCode}${tailOf(stripAnsi(outcome.output))}`),
-          { kind: 'exit' as const, exitCode: outcome.exitCode },
-        );
-      }
+      this.enforceExitPolicy(task, outcome);
 
       if (this.reviewersFor(task).length > 0) {
         const verdict = await this.reviewPass(task, execute, scope, worktreePath ?? undefined, planFile, depsContext);
@@ -2193,94 +2116,281 @@ export class DagRunner {
       if (worktreePath) {
         const landed = await this.landWorktree(task);
         if (!landed.ok) {
-          const budget = this.state.settings.mergeRounds ?? 2;
-          if (task.mergeRetries < budget) {
-            task.mergeRetries += 1;
-            task.status = 'pending';
-            task.failureKind = null;
-            task.result = `merge conflict with the integration base; redoing on top of it (${task.mergeRetries}/${budget})`;
-            this.log(
-              'task-retry',
-              task.id,
-              `merge conflict; redoing on the merged base (${task.mergeRetries}/${budget})`,
-            );
-          } else {
-            task.status = 'failed';
-            task.failureKind = 'merge';
-            task.result = `merge conflict after ${task.mergeRetries} redo(s): ${landed.conflict ?? ''}`;
-            this.log('task-fail', task.id, `failed (merge): ${truncate(landed.conflict ?? '', 200)}`);
-            if (!this.tryRepair(task, scope)) this.notify('task-fail', task.id, 'merge conflict');
-          }
+          this.recordMergeConflict(task, landed.conflict, scope);
           return;
         }
       }
 
-      task.status = 'completed';
-      task.exitCode = outcome.exitCode;
-      task.result = truncateTail(stripAnsi(outcome.output).trim(), RESULT_LIMIT) || '(ok, no output)';
-      task.finishedAt = nowIso();
-      task.lastOutput = null;
-      task.pid = null;
-      this.log(
-        'task-done',
-        task.id,
-        `completed${outcome.exitCode !== null ? ` (exit ${outcome.exitCode})` : ''}${
-          task.reviewCmd ? ' — review passed' : ''
-        }`,
-      );
+      this.completeAttempt(task, outcome);
     } catch (err) {
-      if (this.tokens.get(task.id) !== token) return;
-      // The worktree may hold real work: save it before the worktree goes.
-      this.salvageWorktree(task.id, this.stopping ? 'stopped' : 'failed');
-      const reason: FailureKind =
-        this.reasons.get(task.id) ?? (err as { kind?: FailureKind }).kind ?? 'exit';
-      const message = err instanceof Error ? err.message : String(err);
-      const exitCode = (err as { exitCode?: number | null }).exitCode ?? null;
-      task.finishedAt = nowIso();
-      task.result = truncate(message, RESULT_LIMIT);
-      task.pid = null;
-      if (reason === 'exit') task.exitCode = exitCode;
-
-      // Everything except a deliberate stop or a missing command is
-      // retryable while attempts remain. Stall and timeout included.
-      const budget = this.maxAttemptsFor(task);
-      const retryable = reason !== 'manual' && task.attempts < budget;
-      if (this.stopping) {
-        task.status = 'pending';
-        task.failureKind = 'killed';
-        task.result = 'stopped by user';
-        this.log('task-killed', task.id, 'stopped; requeued as pending');
-      } else if (retryable) {
-        task.status = 'pending';
-        task.failureKind = null;
-        task.result = null;
-        task.exitCode = null;
-        this.log(
-          'task-retry',
-          task.id,
-          `attempt ${task.attempts}/${budget} failed (${reason}: ${truncate(message, 120)}); backing off`,
-        );
-        const delay = Math.min(60_000, 1000 * 2 ** Math.max(0, task.attempts - 1));
-        await this.backoff(delay * (0.5 + Math.random() * 0.5));
-      } else {
-        task.status = 'failed';
-        task.failureKind = reason;
-        const type =
-          reason === 'timeout' ? 'task-timeout' : reason === 'stalled' ? 'task-stalled' : 'task-fail';
-        this.log(type, task.id, `failed (${reason}): ${truncate(message, 300)}`);
-        if (!this.tryRepair(task, scope)) this.notify(type, task.id, truncate(message, 200));
-      }
+      await this.failAttempt(task, err, scope, token);
     } finally {
-      this.kills.delete(task.id);
-      this.reasons.delete(task.id);
-      this.closeLog(task.id);
-      this.attemptByTask.delete(task.id);
-      this.dropWorktree(task.id);
-      if (this.tokens.get(task.id) === token) {
-        this.inFlight.delete(task.id);
-        this.tokens.delete(task.id);
-        this.persist();
+      this.endAttempt(task, token);
+    }
+  }
+
+  // Opens one attempt: bumps the token (so a late settlement from a previous
+  // attempt is ignored), resets the per-attempt fields, and writes the header
+  // line to the attempt log before any output arrives. Returns the token the
+  // rest of this attempt must check before touching shared state.
+  private beginAttempt(task: Task): number {
+    const token = (this.tokens.get(task.id) ?? 0) + 1;
+    this.tokens.set(task.id, token);
+    this.inFlight.add(task.id);
+
+    const attempt = task.attempts + 1;
+    task.attempts = attempt;
+    this.attemptByTask.set(task.id, attempt);
+    task.status = 'running';
+    task.startedAt = nowIso();
+    task.finishedAt = null;
+    task.exitCode = null;
+    task.failureKind = null;
+    task.result = null;
+    task.reviewResult = null;
+    task.reviewExitCode = null;
+    task.lastOutputAt = task.startedAt;
+    task.lastOutput = null;
+    task.pid = null;
+    // This attempt produces a new output, so any approval earned by an earlier
+    // one is void: it must be reviewed again before it counts as verified.
+    task.finalReview = null;
+    task.diffBase = null;
+    task.diffHead = null;
+    task.coverage = null;
+    // Header first: every attempt gets a log file even with no output.
+    this.appendLog(
+      task.id,
+      `# attempt ${attempt} started ${task.startedAt}\n# cmd: ${task.cmd ?? '(manual)'}${
+        task.reviewCmd ? `\n# review: ${task.reviewCmd}` : ''
+      }\n`,
+    );
+    this.log('task-start', task.id, `attempt ${attempt}/${this.maxAttemptsFor(task)}: ${task.title}`);
+    this.persist();
+    return token;
+  }
+
+  // Isolation was requested, so a failed worktree create fails the attempt
+  // immediately rather than letting the agent loose in the real working tree.
+  // This does not go through the normal retry path: the failure is setup, not
+  // the command.
+  private failWorktreeSetup(task: Task, err: unknown): void {
+    task.status = 'failed';
+    task.failureKind = 'worktree';
+    task.result = `worktree create failed: ${err instanceof Error ? err.message : String(err)}`;
+    this.log('task-fail', task.id, `failed (worktree): ${truncate(task.result, 200)}`);
+    this.notify('task-fail', task.id, 'worktree create failed');
+    this.dropWorktree(task.id);
+    this.inFlight.delete(task.id);
+    this.tokens.delete(task.id);
+    this.closeLog(task.id);
+    this.persist();
+  }
+
+  // Everything an attempt's commands need before they run: the harness
+  // candidate chosen for this attempt, the plan file path, upstream evidence
+  // for the {deps*} tokens, and (for chain-review tasks) the coverage bundle.
+  private attemptContext(
+    task: Task,
+    attempt: number,
+  ): {
+    chained: { cmd: string | null; planCmd: string | null };
+    planFile?: string;
+    depsContext: TokenContext;
+    specOverride?: string;
+  } {
+    const chained = this.applyHarnessChain(task, attempt);
+    const planFile = chained.planCmd ? this.planFilePath(task, attempt) : undefined;
+    // Upstream evidence for {deps} / {depsAll} / {depsFile}: deps are complete
+    // by the time a task runs, so this is the real graph state, not a promise.
+    const depsFile = task.deps.length > 0 ? this.depsFilePath(task, attempt) : undefined;
+    const depsContext: TokenContext = {
+      deps: describeDeps(this.state, task),
+      depsAll: describeDeps(this.state, task, { transitive: true }),
+      depsFile,
+    };
+    // Chain-review tasks: the covered tasks are done, so their facts are real.
+    let specOverride: string | undefined;
+    if (task.covers && task.covers.length > 0) {
+      const coverage = this.materializeCoverage(task);
+      task.coverage = coverage;
+      specOverride = this.renderCoverageSpec(task, coverage);
+      if (coverage) {
+        depsContext.coverage = coverage.tasks
+          .map((id) => `- ${id} [${this.state.tasks[id].status}] ${this.state.tasks[id].title}`)
+          .join('\n');
+        depsContext.coverageManifest = coverage.manifest;
+        depsContext.coverageDir = coverage.dir;
+        depsContext.coverageStat = coverage.stat;
+        depsContext.coverageFiles = coverage.files;
       }
+    }
+    if (depsFile) {
+      try {
+        writeFileSync(
+          depsFile,
+          `# Upstream evidence for ${task.id} "${task.title}"\n\n` +
+            `## Direct dependencies\n${depsContext.deps}\n\n` +
+            `## All upstream tasks\n${depsContext.depsAll}\n`,
+          'utf8',
+        );
+      } catch {
+        // the inline tokens still carry the evidence
+      }
+    }
+    return { chained, planFile, depsContext, specOverride };
+  }
+
+  // A chain-review task produces a judgement, not code: its VERDICT line
+  // decides whether it passed. With its own reviewer configured, the reviewer
+  // panel owns that decision instead. A missing verdict fails closed.
+  private applyChainReviewVerdict(task: Task, outcome: ExecOutcome, attempt: number): void {
+    if (
+      !task.covers ||
+      task.covers.length === 0 ||
+      this.reviewersFor(task).length > 0 ||
+      task.reviewCmd
+    ) {
+      return;
+    }
+    const verdict = parseVerdict(stripAnsi(outcome.output));
+    if (verdict.kind !== 'pass') {
+      const reason = verdict.reason || 'no VERDICT line in the review output';
+      task.lastRejection = `chain review: ${reason}`;
+      this.log('task-review-fail', task.id, `chain review rejected the covered work: ${reason.slice(0, 200)}`);
+      throw Object.assign(new Error(`chain review failed: ${reason}`), { kind: 'review' as const });
+    }
+    task.finalReview = {
+      verdict: 'pass',
+      reason: verdict.reason,
+      at: nowIso(),
+      round: attempt,
+    };
+    this.log('task-review-pass', task.id, `chain review passed${verdict.reason ? `: ${verdict.reason.slice(0, 120)}` : ''}`);
+  }
+
+  // The exit policy is applied once, here, before reviewers and before
+  // anything lands: rejected work must not reach the integration branch. A
+  // judge (reviewer/verdict) owns the decision when one exists — agents
+  // routinely exit non-zero after doing the work. `failOnNonZeroExit`
+  // overrides both ways; unset means "strict unless a judge is present".
+  private enforceExitPolicy(task: Task, outcome: ExecOutcome): void {
+    const judges = this.reviewersFor(task).length > 0 || Boolean(task.reviewCmd);
+    const policy = this.state.settings.failOnNonZeroExit;
+    const failOnExit = policy === null || policy === undefined ? !judges : policy;
+    if (failOnExit && outcome.exitCode !== null && outcome.exitCode !== 0) {
+      throw Object.assign(
+        new Error(`exit ${outcome.exitCode}${tailOf(stripAnsi(outcome.output))}`),
+        { kind: 'exit' as const, exitCode: outcome.exitCode },
+      );
+    }
+  }
+
+  // A merge conflict is redone on the new integration base instead of being
+  // charged against the command's attempt budget (bounded by mergeRounds).
+  private recordMergeConflict(task: Task, conflict: string | undefined, scope: Set<string> | null): void {
+    const budget = this.state.settings.mergeRounds ?? 2;
+    if (task.mergeRetries < budget) {
+      task.mergeRetries += 1;
+      task.status = 'pending';
+      task.failureKind = null;
+      task.result = `merge conflict with the integration base; redoing on top of it (${task.mergeRetries}/${budget})`;
+      this.log(
+        'task-retry',
+        task.id,
+        `merge conflict; redoing on the merged base (${task.mergeRetries}/${budget})`,
+      );
+    } else {
+      task.status = 'failed';
+      task.failureKind = 'merge';
+      task.result = `merge conflict after ${task.mergeRetries} redo(s): ${conflict ?? ''}`;
+      this.log('task-fail', task.id, `failed (merge): ${truncate(conflict ?? '', 200)}`);
+      if (!this.tryRepair(task, scope)) this.notify('task-fail', task.id, 'merge conflict');
+    }
+  }
+
+  // Success: record the output tail (verdicts live at the end of an agent's
+  // output) and mark the task done.
+  private completeAttempt(task: Task, outcome: ExecOutcome): void {
+    task.status = 'completed';
+    task.exitCode = outcome.exitCode;
+    task.result = truncateTail(stripAnsi(outcome.output).trim(), RESULT_LIMIT) || '(ok, no output)';
+    task.finishedAt = nowIso();
+    task.lastOutput = null;
+    task.pid = null;
+    this.log(
+      'task-done',
+      task.id,
+      `completed${outcome.exitCode !== null ? ` (exit ${outcome.exitCode})` : ''}${
+        task.reviewCmd ? ' — review passed' : ''
+      }`,
+    );
+  }
+
+  // Failure path: salvage partial work, classify the failure, then retry with
+  // backoff while attempts remain, or fail permanently (repairing upstream when
+  // configured). A deliberate stop requeues instead of counting as a failure.
+  private async failAttempt(
+    task: Task,
+    err: unknown,
+    scope: Set<string> | null,
+    token: number,
+  ): Promise<void> {
+    if (this.tokens.get(task.id) !== token) return;
+    // The worktree may hold real work: save it before the worktree goes.
+    this.salvageWorktree(task.id, this.stopping ? 'stopped' : 'failed');
+    const reason: FailureKind =
+      this.reasons.get(task.id) ?? (err as { kind?: FailureKind }).kind ?? 'exit';
+    const message = err instanceof Error ? err.message : String(err);
+    const exitCode = (err as { exitCode?: number | null }).exitCode ?? null;
+    task.finishedAt = nowIso();
+    task.result = truncate(message, RESULT_LIMIT);
+    task.pid = null;
+    if (reason === 'exit') task.exitCode = exitCode;
+
+    // Everything except a deliberate stop or a missing command is retryable
+    // while attempts remain. Stall and timeout included.
+    const budget = this.maxAttemptsFor(task);
+    const retryable = reason !== 'manual' && task.attempts < budget;
+    if (this.stopping) {
+      task.status = 'pending';
+      task.failureKind = 'killed';
+      task.result = 'stopped by user';
+      this.log('task-killed', task.id, 'stopped; requeued as pending');
+    } else if (retryable) {
+      task.status = 'pending';
+      task.failureKind = null;
+      task.result = null;
+      task.exitCode = null;
+      this.log(
+        'task-retry',
+        task.id,
+        `attempt ${task.attempts}/${budget} failed (${reason}: ${truncate(message, 120)}); backing off`,
+      );
+      const delay = Math.min(60_000, 1000 * 2 ** Math.max(0, task.attempts - 1));
+      await this.backoff(delay * (0.5 + Math.random() * 0.5));
+    } else {
+      task.status = 'failed';
+      task.failureKind = reason;
+      const type =
+        reason === 'timeout' ? 'task-timeout' : reason === 'stalled' ? 'task-stalled' : 'task-fail';
+      this.log(type, task.id, `failed (${reason}): ${truncate(message, 300)}`);
+      if (!this.tryRepair(task, scope)) this.notify(type, task.id, truncate(message, 200));
+    }
+  }
+
+  // Per-attempt cleanup, always run: close logs, drop bookkeeping, and mark the
+  // task out of flight so a new attempt (or a stop) can pick it up.
+  private endAttempt(task: Task, token: number): void {
+    this.kills.delete(task.id);
+    this.reasons.delete(task.id);
+    this.closeLog(task.id);
+    this.attemptByTask.delete(task.id);
+    this.dropWorktree(task.id);
+    if (this.tokens.get(task.id) === token) {
+      this.inFlight.delete(task.id);
+      this.tokens.delete(task.id);
+      this.persist();
     }
   }
 }

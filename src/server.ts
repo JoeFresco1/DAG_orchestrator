@@ -1,14 +1,13 @@
-import { createServer } from 'node:http';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   acquireLock,
   assertNoForeignLock,
   attemptLogFiles,
-  foreignLock,
   killOrphans,
   loadRun,
   logEvent,
@@ -31,7 +30,6 @@ import {
   loadRegistry,
   projectId,
   removeProject,
-  type ProjectEntry,
 } from './registry.js';
 import {
   activeRunFile,
@@ -44,11 +42,19 @@ import {
 import {
   describeSettingsProblems,
   validateSettingsPatch,
-  type DepFailurePolicy,
-  type GatePolicy,
   type Run,
   type Task,
 } from './types.js';
+import { checkOrigin, json, parseBody, readBody, sleepMs } from './http.js';
+import {
+  currentRun,
+  definitionPayload,
+  jobView,
+  projectName,
+  projectPayload,
+  summaryPayload,
+} from './server-view.js';
+import type { RunRuntime, StartOptions, StartResult } from './server-types.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -63,18 +69,6 @@ export interface ServeOptions {
 
 // One runtime per RUN, not per project: two runs in one repository are two
 // independent runners with their own locks and integration branches.
-interface RunRuntime {
-  runId: string;
-  projectDir: string;
-  file: string;
-  archived: boolean;
-  runner: DagRunner | null;
-  releaseLock: (() => void) | null;
-  jobStartedAt: string | null;
-  activeScope: string[] | null;
-  starting: boolean;
-}
-
 const runtimes = new Map<string, RunRuntime>();
 let defaultRunId: string | null = null;
 let listeningPort = 0;
@@ -138,100 +132,6 @@ function dropRuntime(runId: string): void {
   runtimes.delete(runId);
 }
 
-function projectPayload(entry: ProjectEntry): Record<string, unknown> {
-  const dir = projectOf(entry.file);
-  const runs = listRuns(dir).map((row) => ({
-    ...row,
-    job: runtimes.get(row.runId) ? jobView(runtimes.get(row.runId) as RunRuntime) : null,
-  }));
-  const active = runs.find((r) => !r.archived) ?? null;
-  const running = runs.filter((r) => r.job?.running).length;
-  return {
-    id: projectId(entry.file),
-    name: entry.name,
-    dir,
-    file: entry.file,
-    exists: existsSync(entry.file),
-    addedAt: entry.addedAt,
-    activeRunId: active?.runId ?? null,
-    running,
-    totalRuns: runs.length,
-    counts: active?.counts ?? {},
-    status: active?.status ?? 'empty',
-    runs,
-  };
-}
-
-function projectName(dir: string): string {
-  const entry = loadRegistry().projects.find((p) => projectOf(p.file) === resolve(dir));
-  return entry?.name ?? basename(dir);
-}
-
-// ---------------------------------------------------------------------------
-// HTTP helpers
-// ---------------------------------------------------------------------------
-
-function readBody(req: import('node:http').IncomingMessage): Promise<string> {
-  return new Promise((resolveBody, reject) => {
-    let data = '';
-    req.on('data', (c: Buffer) => {
-      data += c;
-      if (data.length > MAX_BODY_BYTES) {
-        reject(new Error('request body too large'));
-        req.destroy();
-      }
-    });
-    req.on('end', () => resolveBody(data));
-    req.on('error', reject);
-  });
-}
-
-const MAX_BODY_BYTES = 1024 * 1024;
-
-const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-// Malformed JSON is the caller's fault, not a server error.
-function parseBody(req: import('node:http').IncomingMessage, raw: string): Record<string, unknown> {
-  const text = raw.trim();
-  if (!text) return {};
-  const type = String(req.headers['content-type'] ?? '');
-  if (!type.includes('application/json')) {
-    throw Object.assign(new Error('content-type must be application/json'), { code: 415 });
-  }
-  try {
-    const parsed = JSON.parse(text) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('body must be a JSON object');
-    }
-    return parsed as Record<string, unknown>;
-  } catch (err) {
-    throw Object.assign(new Error(`invalid JSON body: ${err instanceof Error ? err.message : String(err)}`), {
-      code: 400,
-    });
-  }
-}
-
-// Browsers can reach localhost from any page, and the server can spawn
-// processes (notifyCmd, worktreePrepareCmd). Only accept mutations from our own
-// origin: this blocks CSRF and DNS-rebinding without a token.
-function checkOrigin(req: import('node:http').IncomingMessage, port: number): string | null {
-  const host = String(req.headers.host ?? '');
-  const hostOk =
-    /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(host) ||
-    host === `localhost:${port}` ||
-    host === `127.0.0.1:${port}`;
-  if (!hostOk) return `host not allowed: ${host}`;
-  const origin = req.headers.origin;
-  if (origin) {
-    const ok =
-      origin === `http://localhost:${port}` ||
-      origin === `http://127.0.0.1:${port}` ||
-      origin === `http://[::1]:${port}`;
-    if (!ok) return `origin not allowed: ${origin}`;
-  }
-  return null;
-}
-
 function activeRuntimeForFile(file: string): RunRuntime | null {
   const target = resolve(file);
   for (const rt of runtimes.values()) {
@@ -241,125 +141,9 @@ function activeRuntimeForFile(file: string): RunRuntime | null {
   return null;
 }
 
-function json(res: import('node:http').ServerResponse, code: number, body: unknown): void {
-  res.writeHead(code, { 'content-type': 'application/json' });
-  res.end(JSON.stringify(body));
-}
-
-function jobView(rt: RunRuntime): Record<string, unknown> {
-  const active = rt.runner?.isRunning || rt.runner?.isStopping;
-  const foreign = active ? null : foreignLock(rt.file);
-  return {
-    running: rt.runner?.isRunning ?? false,
-    stopping: rt.runner?.isStopping ?? false,
-    current: active ? (rt.runner?.current ?? []) : [],
-    result: active ? null : (rt.runner?.result ?? null),
-    startedAt: active ? rt.jobStartedAt : null,
-    scope: active ? rt.activeScope : null,
-    external: foreign ? { pid: foreign.pid, note: foreign.note, startedAt: foreign.startedAt } : null,
-  };
-}
-
-function defHash(run: Run): number {
-  let h = 2166136261;
-  const feed = (s: string): void => {
-    for (let i = 0; i < s.length; i++) {
-      h ^= s.charCodeAt(i);
-      h = Math.imul(h, 16777619);
-    }
-  };
-  for (const t of Object.values(run.tasks)) {
-    feed(t.id);
-    feed(t.title);
-    feed(t.deps.join(','));
-  }
-  return h >>> 0;
-}
-
-function definitionPayload(run: Run): Record<string, unknown> {
-  return {
-    id: run.id,
-    objective: run.objective,
-    createdAt: run.createdAt,
-    settings: run.settings,
-    tasks: Object.values(run.tasks).map((t) => ({
-      id: t.id,
-      title: t.title,
-      deps: t.deps,
-      seq: t.seq,
-      model: t.model,
-      variant: t.variant,
-    })),
-  };
-}
-
-function summaryPayload(run: Run): Record<string, unknown> {
-  const counts: Record<string, number> = {};
-  const tasks = Object.values(run.tasks).map((t) => {
-    const display = deriveStatus(run, t);
-    counts[display] = (counts[display] ?? 0) + 1;
-    return {
-      id: t.id,
-      status: t.status,
-      display,
-      attempts: t.attempts,
-      maxAttempts: t.maxAttempts,
-      failureKind: t.failureKind,
-      exitCode: t.exitCode,
-      lastOutputAt: t.lastOutputAt,
-      pid: t.pid,
-      model: t.model,
-      variant: t.variant,
-      reviews: t.reviews,
-      reviewRounds: t.reviewRounds,
-      repairs: t.repairs,
-      repairRounds: t.repairRounds,
-    };
-  });
-  return {
-    rev: run.rev,
-    defRev: defHash(run),
-    runId: run.id,
-    objective: run.objective,
-    updatedAt: run.updatedAt,
-    counts,
-    total: tasks.length,
-    tasks,
-  };
-}
-
-function currentRun(rt: RunRuntime): Run {
-  return rt.runner && (rt.runner.isRunning || rt.runner.isStopping) ? rt.runner.state : loadRun(rt.file);
-}
-
 // ---------------------------------------------------------------------------
 // Run lifecycle
 // ---------------------------------------------------------------------------
-
-interface StartOptions {
-  ids?: string[] | null;
-  concurrency?: number;
-  timeoutMs?: number;
-  silenceMs?: number;
-  maxAttempts?: number;
-  onDepFailure?: DepFailurePolicy;
-  onGateBlocked?: GatePolicy;
-  maxWallClockMs?: number;
-  notifyCmd?: string;
-  model?: string;
-  variant?: string;
-  worktree?: 'none' | 'task';
-  worktreePrepareCmd?: string;
-  force?: boolean;
-}
-
-interface StartResult {
-  started: boolean;
-  scope?: string[];
-  skippedManual?: string[];
-  error?: string;
-  code?: number;
-}
 
 async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult> {
   if (rt.archived) {
@@ -469,6 +253,20 @@ async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult
   }
 }
 
+// A single API route: fixed method (or '*' for any) plus a path matcher.
+type ApiHandler = (
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  m: RegExpMatchArray,
+) => Promise<void> | void;
+
+interface ApiRoute {
+  method: string;
+  match: RegExp;
+  handle: ApiHandler;
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -501,6 +299,246 @@ export function startServer(opts: ServeOptions): void {
     }
   };
 
+  // -------------------------------------------------------------------------
+  // API routes: /api/*
+  // -------------------------------------------------------------------------
+
+  // GET /api/projects (also /api/runs): every project with its runs.
+  const listProjects: ApiHandler = (_req, res) => {
+    const registry = loadRegistry();
+    const projects = registry.projects.map((entry) => projectPayload(entry, runtimeFor));
+    json(res, 200, { projects, singleRunMode, defaultRunId, port: listeningPort });
+  };
+
+  // GET/PATCH/DELETE /api/projects/:id: one project's payload or its metadata.
+  const projectRoute: ApiHandler = async (req, res, _url, m) => {
+    const id = m[1];
+    const registry = loadRegistry();
+    const entry = registry.projects.find((p) => projectId(p.file) === id);
+    if (!entry) {
+      json(res, 404, { error: `unknown project ${id}` });
+      return;
+    }
+    if (req.method === 'GET') {
+      const payload = projectPayload(entry, runtimeFor);
+      let settings: unknown = null;
+      const activeFile = activeRunFile(projectOf(entry.file));
+      if (existsSync(activeFile)) {
+        try {
+          settings = loadRun(activeFile).settings;
+        } catch {
+          settings = null;
+        }
+      }
+      json(res, 200, { project: payload, settings });
+      return;
+    }
+    if (req.method === 'PATCH') {
+      const body = parseBody(req, await readBody(req)) as { name?: string };
+      const name = body.name?.trim();
+      if (!name) {
+        json(res, 400, { error: 'name is required' });
+        return;
+      }
+      addProject(entry.file, name);
+      json(res, 200, { project: projectPayload({ ...entry, name }, runtimeFor) });
+      return;
+    }
+    if (req.method === 'DELETE') {
+      const removed = removeProject(id);
+      json(res, removed ? 200 : 404, removed ? { removed: id } : { error: `unknown project ${id}` });
+      return;
+    }
+    json(res, 405, { error: `${req.method} not allowed` });
+  };
+
+  // GET /api/fs: the folder browser backing the add-project flow.
+  const fsRoute: ApiHandler = (_req, res, url) => {
+    const wanted = cleanPath(url.searchParams.get('dir') ?? '');
+    const dir = wanted ? resolve(wanted) : homedir();
+    let entries: { name: string; path: string; hasRun: boolean }[] = [];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+        .map((e) => ({
+          name: e.name,
+          path: join(dir, e.name),
+          hasRun: existsSync(join(dir, e.name, 'dag.run.json')),
+        }))
+        .sort((a, b) => Number(b.hasRun) - Number(a.hasRun) || a.name.localeCompare(b.name));
+    } catch (err) {
+      json(res, 400, {
+        error: `cannot read ${dir}: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      return;
+    }
+    const parent = dirname(dir);
+    json(res, 200, {
+      dir,
+      parent: parent === dir ? null : parent,
+      isProject: existsSync(join(dir, 'dag.run.json')),
+      dirs: entries,
+    });
+  };
+
+  // GET /api/context: what this hub process knows, for the page shell.
+  const contextRoute: ApiHandler = (_req, res) => {
+    json(res, 200, {
+      singleRunMode,
+      defaultRunId,
+      runIds: [...runtimes.keys()],
+      port: listeningPort,
+      staleBuild: staleBuild(),
+    });
+  };
+
+  // GET /api/models: the models the agent CLI offers.
+  const modelsRoute: ApiHandler = async (_req, res, url) => {
+    const { models, error } = await listAgentModels(url.searchParams.get('refresh') === '1');
+    json(res, 200, { models, error, source: 'opencode models' });
+  };
+
+  // POST /api/projects: register a project (and give it a first run if none).
+  const createProjectRoute: ApiHandler = async (req, res) => {
+    const body = parseBody(req, await readBody(req)) as { dir?: string; name?: string };
+    if (!body.dir) {
+      json(res, 400, { error: 'dir is required' });
+      return;
+    }
+    const entry = addProject(body.dir, body.name);
+    const dir = projectOf(entry.file);
+    if (!existsSync(activeRunFile(dir))) {
+      startNewRun(dir, entry.name);
+    }
+    json(res, 200, {
+      project: { projectId: projectId(entry.file), name: entry.name, dir },
+      runs: listRuns(dir),
+    });
+  };
+
+  // POST /api/runs/new: archive the active run and start a fresh one.
+  const newRunRoute: ApiHandler = async (req, res) => {
+    const body = parseBody(req, await readBody(req)) as { dir?: string; objective?: string };
+    if (!body.dir) {
+      json(res, 400, { error: 'dir is required' });
+      return;
+    }
+    const entry = addProject(body.dir);
+    const dir = projectOf(entry.file);
+    const active = activeRunFile(dir);
+    if (existsSync(active)) {
+      // Archiving replaces the run file: doing that under a live runner
+      // (this process's or another's) destroys both runs.
+      const busy = activeRuntimeForFile(active);
+      if (busy) {
+        json(res, 409, { error: `run ${busy.runId} is in progress; stop it before starting a new one` });
+        return;
+      }
+      try {
+        assertNoForeignLock(active);
+      } catch (err) {
+        json(res, 409, { error: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+    }
+    const { run, archivedTo } = startNewRun(dir, body.objective ?? entry.name);
+    // The archived run's cached runtime now points at the new file.
+    for (const [id, rt] of runtimes) {
+      if (resolve(rt.file) === resolve(active)) dropRuntime(id);
+    }
+    runtimeFor(run.id);
+    json(res, 200, { runId: run.id, archivedTo, project: { name: entry.name, dir } });
+  };
+
+  // /api/runs/:runId/…: resolve the runtime, then delegate to handleRunRoute.
+  const runApiRoute: ApiHandler = async (req, res, url, m) => {
+    const runId = m[1];
+    const rest = m[2] ?? '';
+    const rt = runtimeFor(runId);
+    if (!rt) {
+      const dirs = ambiguousRunId(runId);
+      if (dirs.length > 1) {
+        json(res, 409, {
+          error: `run id ${runId} exists in ${dirs.length} projects (${dirs.join(', ')}); ids are only unique per project`,
+        });
+        return;
+      }
+      json(res, 404, { error: `unknown run ${runId}` });
+      return;
+    }
+    await handleRunRoute(req, res, url, rt, rest);
+  };
+
+  // Order matters: exact/static paths first, the param routes last.
+  const apiRoutes: ApiRoute[] = [
+    { method: 'GET', match: /^\/api\/(?:projects|runs)$/, handle: listProjects },
+    { method: '*', match: /^\/api\/projects\/([^/]+)$/, handle: projectRoute },
+    { method: 'GET', match: /^\/api\/fs$/, handle: fsRoute },
+    { method: 'GET', match: /^\/api\/context$/, handle: contextRoute },
+    { method: 'GET', match: /^\/api\/models$/, handle: modelsRoute },
+    { method: 'POST', match: /^\/api\/projects$/, handle: createProjectRoute },
+    { method: 'POST', match: /^\/api\/runs\/new$/, handle: newRunRoute },
+    { method: '*', match: /^\/api\/runs\/([^/]+)(\/.*)?$/, handle: runApiRoute },
+  ];
+
+  // -------------------------------------------------------------------------
+  // Pages
+  // -------------------------------------------------------------------------
+
+  // Pages are read from disk per request, but the routes were frozen when this
+  // process started. If the code on disk is newer, this process would serve a
+  // page whose API it does not implement (the page then hangs on "loading…"),
+  // so say so instead.
+  const page = async (res: ServerResponse, name: string): Promise<void> => {
+    if (staleBuild()) {
+      res.writeHead(503, { 'content-type': 'text/html' });
+      res.end(
+        `<!doctype html><meta charset="utf-8"><title>DAG Orchestrator — restart needed</title>` +
+          `<body style="background:#04070d;color:#d7f5ff;font:14px ui-monospace,Consolas,monospace;padding:40px">` +
+          `<h1 style="color:#ffc400;font-size:16px;letter-spacing:.1em">THE HUB IS RUNNING OLDER CODE</h1>` +
+          `<p>This process started before the code on disk changed, so it cannot serve the viewer.</p>` +
+          `<p>Stop it and start it again:</p>` +
+          `<pre style="background:#0b1220;border:1px solid #1e2a3f;padding:12px">dag serve</pre>` +
+          `<p style="color:#6f9db4">(Single-run mode: <code>dag serve --file &lt;run file&gt;</code>)</p>` +
+          `</body>`,
+      );
+      return;
+    }
+    const html = await readFile(join(here, '..', 'viewer', name), 'utf8');
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(html);
+  };
+
+  // Serves an HTML page or the bundled vendor script; returns false when the
+  // request is not a page route so the caller can fall through to 404.
+  const pageRoute = async (req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> => {
+    if (req.method !== 'GET') return false;
+    if (path === '/') {
+      if (singleRunMode && defaultRunId) {
+        res.writeHead(302, { location: `/r/${defaultRunId}` });
+        res.end();
+        return true;
+      }
+      await page(res, 'index.html');
+      return true;
+    }
+    if (path.match(/^\/p\/[^/]+\/?$/)) {
+      await page(res, 'project.html');
+      return true;
+    }
+    if (path.match(/^\/r\/[^/]+\/?$/)) {
+      await page(res, 'run.html');
+      return true;
+    }
+    if (path === '/vendor/vis-network.min.js') {
+      const js = await readFile(join(here, '..', 'viewer', 'vendor', 'vis-network.min.js'), 'utf8');
+      res.writeHead(200, { 'content-type': 'text/javascript' });
+      res.end(js);
+      return true;
+    }
+    return false;
+  };
+
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? '/', 'http://localhost');
@@ -511,229 +549,16 @@ export function startServer(opts: ServeOptions): void {
         return;
       }
 
-      // ---- projects: the hub's top level ----
-      if ((path === '/api/projects' || path === '/api/runs') && req.method === 'GET') {
-        const registry = loadRegistry();
-        const projects = registry.projects.map((entry: ProjectEntry) => projectPayload(entry));
-        json(res, 200, { projects, singleRunMode, defaultRunId, port: listeningPort });
+      for (const route of apiRoutes) {
+        if (route.method !== '*' && req.method !== route.method) continue;
+        const m = path.match(route.match);
+        if (!m) continue;
+        await route.handle(req, res, url, m);
         return;
       }
 
-      // ---- one project: its runs and the active run's settings ----
-      const projectMatch = path.match(/^\/api\/projects\/([^/]+)$/);
-      if (projectMatch) {
-        const id = projectMatch[1];
-        const registry = loadRegistry();
-        const entry = registry.projects.find((p) => projectId(p.file) === id);
-        if (!entry) {
-          json(res, 404, { error: `unknown project ${id}` });
-          return;
-        }
-        if (req.method === 'GET') {
-          const payload = projectPayload(entry);
-          let settings: unknown = null;
-          const activeFile = activeRunFile(projectOf(entry.file));
-          if (existsSync(activeFile)) {
-            try {
-              settings = loadRun(activeFile).settings;
-            } catch {
-              settings = null;
-            }
-          }
-          json(res, 200, { project: payload, settings });
-          return;
-        }
-        if (req.method === 'PATCH') {
-          const body = parseBody(req, await readBody(req)) as { name?: string };
-          const name = body.name?.trim();
-          if (!name) {
-            json(res, 400, { error: 'name is required' });
-            return;
-          }
-          addProject(entry.file, name);
-          json(res, 200, { project: projectPayload({ ...entry, name }) });
-          return;
-        }
-        if (req.method === 'DELETE') {
-          const removed = removeProject(id);
-          json(res, removed ? 200 : 404, removed ? { removed: id } : { error: `unknown project ${id}` });
-          return;
-        }
-        json(res, 405, { error: `${req.method} not allowed` });
-        return;
-      }
+      if (await pageRoute(req, res, path)) return;
 
-      // ---- folder browser for the add-project flow ----
-      if (path === '/api/fs' && req.method === 'GET') {
-        const wanted = cleanPath(url.searchParams.get('dir') ?? '');
-        const dir = wanted ? resolve(wanted) : homedir();
-        let entries: { name: string; path: string; hasRun: boolean }[] = [];
-        try {
-          entries = readdirSync(dir, { withFileTypes: true })
-            .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
-            .map((e) => ({
-              name: e.name,
-              path: join(dir, e.name),
-              hasRun: existsSync(join(dir, e.name, 'dag.run.json')),
-            }))
-            .sort((a, b) => Number(b.hasRun) - Number(a.hasRun) || a.name.localeCompare(b.name));
-        } catch (err) {
-          json(res, 400, {
-            error: `cannot read ${dir}: ${err instanceof Error ? err.message : String(err)}`,
-          });
-          return;
-        }
-        const parent = dirname(dir);
-        json(res, 200, {
-          dir,
-          parent: parent === dir ? null : parent,
-          isProject: existsSync(join(dir, 'dag.run.json')),
-          dirs: entries,
-        });
-        return;
-      }
-
-      if (path === '/api/context' && req.method === 'GET') {
-        json(res, 200, {
-          singleRunMode,
-          defaultRunId,
-          runIds: [...runtimes.keys()],
-          port: listeningPort,
-          staleBuild: staleBuild(),
-        });
-        return;
-      }
-
-      if (path === '/api/models' && req.method === 'GET') {
-        const { models, error } = await listAgentModels(url.searchParams.get('refresh') === '1');
-        json(res, 200, { models, error, source: 'opencode models' });
-        return;
-      }
-
-      // ---- register a project (and give it a first run if it has none) ----
-      if (path === '/api/projects' && req.method === 'POST') {
-        const body = parseBody(req, await readBody(req)) as { dir?: string; name?: string };
-        if (!body.dir) {
-          json(res, 400, { error: 'dir is required' });
-          return;
-        }
-        const entry = addProject(body.dir, body.name);
-        const dir = projectOf(entry.file);
-        if (!existsSync(activeRunFile(dir))) {
-          startNewRun(dir, entry.name);
-        }
-        json(res, 200, {
-          project: { projectId: projectId(entry.file), name: entry.name, dir },
-          runs: listRuns(dir),
-        });
-        return;
-      }
-
-      // ---- archive the active run and start a fresh one ----
-      if (path === '/api/runs/new' && req.method === 'POST') {
-        const body = parseBody(req, await readBody(req)) as { dir?: string; objective?: string };
-        if (!body.dir) {
-          json(res, 400, { error: 'dir is required' });
-          return;
-        }
-        const entry = addProject(body.dir);
-        const dir = projectOf(entry.file);
-        const active = activeRunFile(dir);
-        if (existsSync(active)) {
-          // Archiving replaces the run file: doing that under a live runner
-          // (this process's or another's) destroys both runs.
-          const busy = activeRuntimeForFile(active);
-          if (busy) {
-            json(res, 409, { error: `run ${busy.runId} is in progress; stop it before starting a new one` });
-            return;
-          }
-          try {
-            assertNoForeignLock(active);
-          } catch (err) {
-            json(res, 409, { error: err instanceof Error ? err.message : String(err) });
-            return;
-          }
-        }
-        const { run, archivedTo } = startNewRun(dir, body.objective ?? entry.name);
-        // The archived run's cached runtime now points at the new file.
-        for (const [id, rt] of runtimes) {
-          if (resolve(rt.file) === resolve(active)) dropRuntime(id);
-        }
-        runtimeFor(run.id);
-        json(res, 200, { runId: run.id, archivedTo, project: { name: entry.name, dir } });
-        return;
-      }
-
-      // ---- per-run routes: /api/runs/:runId/<rest> ----
-      const runMatch = path.match(/^\/api\/runs\/([^/]+)(\/.*)?$/);
-      if (runMatch) {
-        const runId = runMatch[1];
-        const rest = runMatch[2] ?? '';
-        const rt = runtimeFor(runId);
-        if (!rt) {
-          const dirs = ambiguousRunId(runId);
-          if (dirs.length > 1) {
-            json(res, 409, {
-              error: `run id ${runId} exists in ${dirs.length} projects (${dirs.join(', ')}); ids are only unique per project`,
-            });
-            return;
-          }
-          json(res, 404, { error: `unknown run ${runId}` });
-          return;
-        }
-        await handleRunRoute(req, res, url, rt, rest);
-        return;
-      }
-
-      // ---- pages ----
-      // Pages are read from disk per request, but the routes were frozen when
-      // this process started. If the code on disk is newer, this process would
-      // serve a page whose API it does not implement (the page then hangs on
-      // "loading…"), so say so instead.
-      const page = async (name: string): Promise<void> => {
-        if (staleBuild()) {
-          res.writeHead(503, { 'content-type': 'text/html' });
-          res.end(
-            `<!doctype html><meta charset="utf-8"><title>DAG Orchestrator — restart needed</title>` +
-              `<body style="background:#04070d;color:#d7f5ff;font:14px ui-monospace,Consolas,monospace;padding:40px">` +
-              `<h1 style="color:#ffc400;font-size:16px;letter-spacing:.1em">THE HUB IS RUNNING OLDER CODE</h1>` +
-              `<p>This process started before the code on disk changed, so it cannot serve the viewer.</p>` +
-              `<p>Stop it and start it again:</p>` +
-              `<pre style="background:#0b1220;border:1px solid #1e2a3f;padding:12px">dag serve</pre>` +
-              `<p style="color:#6f9db4">(Single-run mode: <code>dag serve --file &lt;run file&gt;</code>)</p>` +
-              `</body>`,
-          );
-          return;
-        }
-        const html = await readFile(join(here, '..', 'viewer', name), 'utf8');
-        res.writeHead(200, { 'content-type': 'text/html' });
-        res.end(html);
-      };
-
-      if (path === '/' && req.method === 'GET') {
-        if (singleRunMode && defaultRunId) {
-          res.writeHead(302, { location: `/r/${defaultRunId}` });
-          res.end();
-          return;
-        }
-        await page('index.html');
-        return;
-      }
-      if (path.match(/^\/p\/[^/]+\/?$/) && req.method === 'GET') {
-        await page('project.html');
-        return;
-      }
-      const pageMatch = path.match(/^\/r\/([^/]+)\/?$/);
-      if (pageMatch && req.method === 'GET') {
-        await page('run.html');
-        return;
-      }
-      if (path === '/vendor/vis-network.min.js' && req.method === 'GET') {
-        const js = await readFile(join(here, '..', 'viewer', 'vendor', 'vis-network.min.js'), 'utf8');
-        res.writeHead(200, { 'content-type': 'text/javascript' });
-        res.end(js);
-        return;
-      }
       res.writeHead(404).end('not found');
     } catch (err) {
       const code = (err as { code?: number }).code ?? 500;
@@ -745,16 +570,48 @@ export function startServer(opts: ServeOptions): void {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // Per-run routes: /api/runs/:runId/<rest>
+  // -------------------------------------------------------------------------
+
   async function handleRunRoute(
-    req: import('node:http').IncomingMessage,
-    res: import('node:http').ServerResponse,
+    req: IncomingMessage,
+    res: ServerResponse,
     url: URL,
     rt: RunRuntime,
     rest: string,
   ): Promise<void> {
     const file = rt.file;
+    // Archived runs are read-only history.
+    const guardArchived = (): boolean => {
+      if (!rt.archived) return false;
+      json(res, 409, { error: 'archived runs are read-only history' });
+      return true;
+    };
+    // Reject mutations while another process holds the run file.
+    const guardForeignLock = (): boolean => {
+      try {
+        assertNoForeignLock(file);
+        return false;
+      } catch (err) {
+        json(res, 409, { error: err instanceof Error ? err.message : String(err) });
+        return true;
+      }
+    };
+    const guardIdle = (message: string): boolean => {
+      if (!rt.runner?.isRunning) return false;
+      json(res, 409, { error: message });
+      return true;
+    };
 
-    if (rest === '/run' && req.method === 'GET') {
+    type RunRoute = {
+      method: string;
+      match: RegExp;
+      handle: (m: RegExpMatchArray) => Promise<void> | void;
+    };
+
+    // Full run state, plus the job and environment metadata the page needs.
+    const getRun = (): void => {
       if (!existsSync(file)) {
         json(res, 404, { error: `no run file at ${file}` });
         return;
@@ -772,82 +629,63 @@ export function startServer(opts: ServeOptions): void {
           archived: rt.archived,
         },
       });
-      return;
-    }
+    };
 
-    if (rest === '/summary' && req.method === 'GET') {
+    // Polled summary; `since=<rev>` short-circuits with `unchanged: true`.
+    const getSummary = (): void => {
       if (!existsSync(file)) {
         json(res, 409, { error: `no run file at ${file}`, missing: true });
         return;
       }
       const run = currentRun(rt);
       const since = Number(url.searchParams.get('since') ?? -1);
-      if (since === run.rev) {
-        json(res, 200, {
-          rev: run.rev,
-          unchanged: true,
-          file,
-          name: projectName(rt.projectDir),
-          projectId: projectId(join(rt.projectDir, 'dag.run.json')),
-          archived: rt.archived,
-          job: jobView(rt),
-          staleBuild: staleBuild(),
-        });
-        return;
-      }
-      json(res, 200, {
-        ...summaryPayload(run),
+      const meta = {
         file,
         name: projectName(rt.projectDir),
         projectId: projectId(join(rt.projectDir, 'dag.run.json')),
         archived: rt.archived,
-        job: jobView(rt),
-        staleBuild: staleBuild(),
-      });
-      return;
-    }
+      };
+      if (since === run.rev) {
+        json(res, 200, { rev: run.rev, unchanged: true, ...meta, job: jobView(rt), staleBuild: staleBuild() });
+        return;
+      }
+      json(res, 200, { ...summaryPayload(run), ...meta, job: jobView(rt), staleBuild: staleBuild() });
+    };
 
-    if (rest === '/definition' && req.method === 'GET') {
+    const getDefinition = (): void => {
       if (!existsSync(file)) {
         json(res, 409, { error: 'no run file', missing: true });
         return;
       }
       json(res, 200, definitionPayload(currentRun(rt)));
-      return;
-    }
+    };
 
-    if (rest === '/events' && req.method === 'GET') {
+    const getEvents = (): void => {
       const since = Number(url.searchParams.get('since') ?? 0);
       const events = readEventTail(file).filter((e) => e.seq > since);
       json(res, 200, {
         events: events.slice(-500),
         latestSeq: events.length > 0 ? events[events.length - 1].seq : since,
       });
-      return;
-    }
+    };
 
-    if (rest === '/run/start' && req.method === 'POST') {
+    const startRunRoute = async (): Promise<void> => {
       const body = parseBody(req, await readBody(req)) as unknown as StartOptions;
       const result = await startRun(rt, body);
       json(res, result.started ? 200 : (result.code ?? 400), result);
-      return;
-    }
+    };
 
-    if (rest === '/run/stop' && req.method === 'POST') {
+    const stopRunRoute = (): void => {
       if (!rt.runner?.isRunning) {
         json(res, 409, { error: 'no run in progress' });
         return;
       }
       if (!rt.runner.isStopping) void rt.runner.stop();
       json(res, 200, { stopping: true });
-      return;
-    }
+    };
 
-    if (rest === '/archive' && req.method === 'POST') {
-      if (rt.runner?.isRunning) {
-        json(res, 409, { error: 'stop the run before archiving it' });
-        return;
-      }
+    const archiveRoute = (): void => {
+      if (guardIdle('stop the run before archiving it')) return;
       const target = archiveRun(rt.projectDir, rt.file);
       if (!target) {
         json(res, 400, { error: 'nothing to archive' });
@@ -855,31 +693,13 @@ export function startServer(opts: ServeOptions): void {
       }
       runtimes.delete(rt.runId);
       json(res, 200, { archivedTo: target });
-      return;
-    }
-
-    const guardArchived = (): boolean => {
-      if (!rt.archived) return false;
-      json(res, 409, { error: 'archived runs are read-only history' });
-      return true;
     };
 
-    if (rest === '/retry' && req.method === 'POST') {
+    const retryRoute = async (): Promise<void> => {
       if (guardArchived()) return;
-      if (rt.runner?.isRunning) {
-        json(res, 409, { error: 'stop the run before retrying tasks' });
-        return;
-      }
-      const body = parseBody(req, await readBody(req)) as {
-        ids?: string[] | null;
-        cascade?: boolean;
-      };
-      try {
-        assertNoForeignLock(file);
-      } catch (err) {
-        json(res, 409, { error: err instanceof Error ? err.message : String(err) });
-        return;
-      }
+      if (guardIdle('stop the run before retrying tasks')) return;
+      const body = parseBody(req, await readBody(req)) as { ids?: string[] | null; cascade?: boolean };
+      if (guardForeignLock()) return;
       const touched = await mutate(
         file,
         (run) => {
@@ -893,50 +713,25 @@ export function startServer(opts: ServeOptions): void {
         'viewer retry',
       );
       json(res, 200, { retried: touched });
-      return;
-    }
+    };
 
-    if (rest === '/skip-blocked' && req.method === 'POST') {
+    const skipBlockedRoute = async (): Promise<void> => {
       if (guardArchived()) return;
-      if (rt.runner?.isRunning) {
-        json(res, 409, { error: 'stop the run before skipping tasks' });
-        return;
-      }
-      try {
-        assertNoForeignLock(file);
-      } catch (err) {
-        json(res, 409, { error: err instanceof Error ? err.message : String(err) });
-        return;
-      }
-      const skipped = await mutate(
-        file,
-        (run) => [...skipBlocked(run), ...skipGated(run)],
-        'viewer skip',
-      );
+      if (guardIdle('stop the run before skipping tasks')) return;
+      if (guardForeignLock()) return;
+      const skipped = await mutate(file, (run) => [...skipBlocked(run), ...skipGated(run)], 'viewer skip');
       json(res, 200, { skipped });
-      return;
-    }
+    };
 
-    if (rest === '/kill-orphans' && req.method === 'POST') {
+    const killOrphansRoute = async (): Promise<void> => {
       if (guardArchived()) return;
-      if (rt.runner?.isRunning) {
-        json(res, 409, { error: 'stop the run before killing orphans' });
-        return;
-      }
-      try {
-        assertNoForeignLock(file);
-      } catch (err) {
-        json(res, 409, { error: err instanceof Error ? err.message : String(err) });
-        return;
-      }
+      if (guardIdle('stop the run before killing orphans')) return;
+      if (guardForeignLock()) return;
       const killed = await mutate(file, (run) => killOrphans(run), 'viewer kill-orphans');
       json(res, 200, { killed });
-      return;
-    }
+    };
 
-    const logMatch = rest.match(/^\/logs\/([^/]+)$/);
-    if (logMatch && req.method === 'GET') {
-      const taskId = logMatch[1];
+    const logsRoute = (taskId: string): void => {
       const attempts = attemptLogFiles(file, taskId);
       if (attempts.length === 0) {
         json(res, 404, { error: `no attempt logs for ${taskId}` });
@@ -945,12 +740,11 @@ export function startServer(opts: ServeOptions): void {
       const requested = url.searchParams.get('attempt');
       const attempt = requested ? Number(requested) : attempts[attempts.length - 1];
       json(res, 200, { attempts, attempt, content: readAttemptLog(file, taskId, attempt) });
-      return;
-    }
+    };
 
     // Project-scoped settings live on the run file, so the project page edits
     // them here rather than shipping a second settings store.
-    if (rest === '/settings' && req.method === 'PATCH') {
+    const patchSettings = async (): Promise<void> => {
       if (guardArchived()) return;
       const body = parseBody(req, await readBody(req)) as Record<string, unknown>;
       const allowed = new Set([
@@ -984,16 +778,8 @@ export function startServer(opts: ServeOptions): void {
         json(res, 400, { error: describeSettingsProblems(problems), problems });
         return;
       }
-      if (rt.runner?.isRunning) {
-        json(res, 409, { error: 'stop the run before changing its settings' });
-        return;
-      }
-      try {
-        assertNoForeignLock(file);
-      } catch (err) {
-        json(res, 409, { error: err instanceof Error ? err.message : String(err) });
-        return;
-      }
+      if (guardIdle('stop the run before changing its settings')) return;
+      if (guardForeignLock()) return;
       const settings = await mutate(
         file,
         (run) => {
@@ -1003,24 +789,20 @@ export function startServer(opts: ServeOptions): void {
         'viewer settings',
       );
       json(res, 200, { settings });
-      return;
-    }
+    };
 
-    const taskMatch = rest.match(/^\/tasks\/([^/]+)$/);
-    if (taskMatch && req.method === 'GET') {
+    const getTask = (taskId: string): void => {
       const run = currentRun(rt);
-      const task = run.tasks[taskMatch[1]];
+      const task = run.tasks[taskId];
       if (!task) {
-        json(res, 404, { error: `unknown task ${taskMatch[1]}` });
+        json(res, 404, { error: `unknown task ${taskId}` });
         return;
       }
       json(res, 200, { task, display: deriveStatus(run, task) });
-      return;
-    }
+    };
 
-    if (taskMatch && req.method === 'POST') {
+    const postTask = async (taskId: string): Promise<void> => {
       if (guardArchived()) return;
-      const taskId = taskMatch[1];
       const active = rt.runner?.isRunning === true;
       if (active && rt.runner?.state.tasks[taskId]?.status === 'running') {
         json(res, 409, { error: `task ${taskId} is running; stop the run first` });
@@ -1048,19 +830,42 @@ export function startServer(opts: ServeOptions): void {
         json(res, 200, apply(rt.runner.state));
         saveRun(rt.runner.state, file);
       } else {
-        try {
-          assertNoForeignLock(file);
-        } catch (err) {
-          json(res, 409, { error: err instanceof Error ? err.message : String(err) });
-          return;
-        }
+        if (guardForeignLock()) return;
         json(res, 200, await mutate(file, apply, 'viewer edit'));
       }
+    };
+
+    const runRoutes: RunRoute[] = [
+      { method: 'GET', match: /^\/run$/, handle: getRun },
+      { method: 'GET', match: /^\/summary$/, handle: getSummary },
+      { method: 'GET', match: /^\/definition$/, handle: getDefinition },
+      { method: 'GET', match: /^\/events$/, handle: getEvents },
+      { method: 'POST', match: /^\/run\/start$/, handle: startRunRoute },
+      { method: 'POST', match: /^\/run\/stop$/, handle: stopRunRoute },
+      { method: 'POST', match: /^\/archive$/, handle: archiveRoute },
+      { method: 'POST', match: /^\/retry$/, handle: retryRoute },
+      { method: 'POST', match: /^\/skip-blocked$/, handle: skipBlockedRoute },
+      { method: 'POST', match: /^\/kill-orphans$/, handle: killOrphansRoute },
+      { method: 'GET', match: /^\/logs\/([^/]+)$/, handle: (m) => logsRoute(m[1]) },
+      { method: 'PATCH', match: /^\/settings$/, handle: patchSettings },
+      { method: 'GET', match: /^\/tasks\/([^/]+)$/, handle: (m) => getTask(m[1]) },
+      { method: 'POST', match: /^\/tasks\/([^/]+)$/, handle: (m) => postTask(m[1]) },
+    ];
+
+    for (const route of runRoutes) {
+      if (route.method !== '*' && req.method !== route.method) continue;
+      const m = rest.match(route.match);
+      if (!m) continue;
+      await route.handle(m);
       return;
     }
 
     json(res, 404, { error: `unknown route ${rest}` });
   }
+
+  // -------------------------------------------------------------------------
+  // Listen, shutdown, auto-resume
+  // -------------------------------------------------------------------------
 
   let port = basePort;
   let attempts = 0;
