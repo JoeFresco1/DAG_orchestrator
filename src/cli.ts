@@ -79,6 +79,8 @@ usage: dag <cmd> [flags]
 Every command accepts --file, --force (override a foreign lock), and --json.
 `;
 
+// Dispatch the first argument to a registered command; the handler owns the
+// remaining argv and the process exit code.
 async function main(): Promise<void> {
   const cmd = process.argv[2] ?? '';
   const argv = process.argv.slice(3);
@@ -91,6 +93,8 @@ async function main(): Promise<void> {
   console.log(HELP);
 }
 
+// Report the failure with a non-zero exit code: schedulers and `dag run` rely
+// on the code, not the message, to detect failure.
 main().catch((err) => {
   console.error(err instanceof Error ? err.message : String(err));
   process.exitCode = 1;

@@ -16,6 +16,8 @@ import { emit, flag, has, numberFlag } from '../cli-args.js';
 // another job or a start time), remove/retry one, or list what is queued.
 // `scheduler` is the worker that drains the queue in order.
 export async function scheduleCmd(argv: string[], cmd: string): Promise<void> {
+  // `scheduler` is the worker: it blocks, draining jobs in order until the
+  // queue is empty (or, with --watch, forever).
   if (cmd === 'scheduler') {
     const code = await runScheduler({
       pollMs: (numberFlag(argv, 'poll', 0.1) ?? 5) * 1000,
@@ -31,6 +33,8 @@ export async function scheduleCmd(argv: string[], cmd: string): Promise<void> {
   if (sub === 'add') {
     const target = flag(argv, 'file') ?? flag(argv, 'dir');
     if (!target) throw new Error('usage: dag schedule add --file <run file> [--name N] [--at "YYYY-MM-DD HH:MM"] [--after <job>]');
+    // Collect only the flags actually passed: an absent flag must not override
+    // the run file's own settings when the job later runs.
     const args: JobArgs = {};
     const concurrency = flag(argv, 'concurrency');
     if (concurrency !== undefined) args.concurrency = Number(concurrency);
@@ -80,6 +84,8 @@ export async function scheduleCmd(argv: string[], cmd: string): Promise<void> {
   }
   if (sub === 'clear') {
     const schedule = loadSchedule();
+    // Clear only finished history: pending/running jobs survive, so a clear
+    // cannot silently cancel queued work.
     const before = schedule.jobs.length;
     const { saveSchedule } = await import('../scheduler.js');
     schedule.jobs = schedule.jobs.filter(

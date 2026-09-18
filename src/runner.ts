@@ -72,7 +72,12 @@ const refuseMessage = (file: string): string =>
   'Parallel workers live inside a run: raise --concurrency (up to 64). ' +
   'Independent graphs need their own run file (dag launch --all).';
 
+/**
+ * Values a `{token}` in a command or spec can expand to. The runner fills only
+ * the fields a given phase actually produced; `renderTokens` substitutes them.
+ */
 export interface TokenContext {
+  // Path to the current attempt's captured plan (the `{planFile}` token).
   planFile?: string;
   // Chain review: facts about the tasks this task covers.
   coverage?: string;
@@ -86,16 +91,24 @@ export interface TokenContext {
   diffHead?: string;
   diffStat?: string;
   files?: string;
+  // Upstream evidence: direct deps, the transitive roll-up, and a file with both.
   deps?: string;
   depsAll?: string;
   depsFile?: string;
+  // The prior attempt's rejection reason, fed into a redo prompt.
   lastRejection?: string | null;
 }
 
 export interface ExecContext extends TokenContext {
+  // The executor contract: stream output for the heartbeat/log, hand the runner
+  // a kill hook and the live pid, and ask whether a stop/kill already claimed
+  // this task before treating a termination as the task's own outcome.
   onOutput: (chunk: string) => void;
+  // Registered so the runner can kill this process on stop/timeout/stall.
   registerKill: (fn: () => void) => void;
+  // True once the runner has recorded a kill reason for this task.
   aborted: () => boolean;
+  // Persist the process id so a crashed run can later spot orphans.
   setPid: (pid: number | null) => void;
   // Per-task working directory (worktree isolation); falls back to the
   // executor's default when undefined.
@@ -108,6 +121,10 @@ export interface ExecContext extends TokenContext {
   depsFile?: string;
 }
 
+/**
+ * Result of one executed phase. `exitCode` is null only when the process died
+ * by signal; an ordinary non-zero exit is an outcome the runner's policy judges.
+ */
 export interface ExecOutcome {
   output: string;
   exitCode: number | null;
@@ -116,11 +133,15 @@ export interface ExecOutcome {
 // `cmdOverride` lets the runner reuse the executor for reviewer commands.
 export type Executor = (task: Task, ctx: ExecContext, cmdOverride?: string) => Promise<ExecOutcome>;
 
+// Promise-based timer: the scheduler polls with this and retries back off on it.
 export const sleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
 
+// One timestamp format everywhere (events, task state, reviews): ISO-8601 UTC.
 export const nowIso = (): string => new Date().toISOString();
 
+// Head-truncation, for text whose beginning matters (plans, specs). Agent
+// output needs truncateTail instead: its verdict is at the end.
 export function truncate(s: string, n: number): string {
   return s.length <= n ? s : `${s.slice(0, n)}\n… [truncated ${s.length - n} chars]`;
 }
@@ -137,6 +158,8 @@ export function truncateTail(s: string, n: number): string {
 //   VERDICT: FAIL: <reason>
 export function parseVerdict(output: string): { kind: 'pass' | 'fail' | 'none'; reason: string } {
   const matches = [...output.matchAll(/^[^\S\n]*VERDICT[^\S\n]*:[^\S\n]*(PASS|FAIL)\b[^\S\n]*:?[^\S\n]*(.*)$/gim)];
+  // The LAST verdict line wins: an agent's transcript can echo an early PASS
+  // and only conclude FAIL at the end, and the conclusion is the verdict.
   const last = matches[matches.length - 1];
   if (!last) return { kind: 'none', reason: '' };
   const kind = last[1].toUpperCase() === 'PASS' ? 'pass' : 'fail';
@@ -339,13 +362,21 @@ export function shellExecutor(cwd?: string): Executor {
     });
 }
 
+// Bytes of an attempt's output kept for the task result. The executor holds a
+// larger rolling window while streaming but truncates to this on settlement.
 const CAPTURE_LIMIT = 64 * 1024;
 
+// Short tail of captured output, prefixed with a newline so it appends cleanly
+// to an error message. Empty string when the phase produced no output at all.
 function tailOf(output: string): string {
   const tail = output.trim();
   return tail ? `\n${truncateTail(tail, 600)}` : '';
 }
 
+/**
+ * Everything the runner may be told that is not part of the run file itself.
+ * All optional: an unset value falls back to the run's settings, then defaults.
+ */
 export interface RunnerOptions {
   executor?: Executor;
   persist?: (run: Run) => void;
@@ -366,6 +397,7 @@ export interface RunnerOptions {
   cwd?: string;
 }
 
+/** Final buckets for a settled run, plus recovery and end-of-run review facts. */
 export interface RunSummary {
   scope: string[];
   completed: string[];
@@ -379,6 +411,7 @@ export interface RunSummary {
   finalReview: FinalReviewSummary | null;
 }
 
+/** Verdict of the end-of-run review (per-task or whole-run), when configured. */
 export interface FinalReviewSummary {
   mode: FinalReviewMode;
   verdict: 'pass' | 'fail' | 'error' | 'skipped';
@@ -388,21 +421,35 @@ export interface FinalReviewSummary {
   requeued: string[];
 }
 
+// Live state of an open per-attempt log file. `written` counts actual bytes
+// (not UTF-16 code units) so the cap is a real byte cap, and `capped` makes the
+// one-time truncation notice print exactly once.
 interface AttemptLog {
   stream: WriteStream;
   written: number;
   capped: boolean;
 }
 
+/** The execution engine for one run: schedule, execute, review, and land tasks. */
 export class DagRunner {
+  // Task ids currently being executed, whether or not their process is alive.
   private inFlight = new Set<string>();
+  // Kill hooks installed by executors, keyed by task id.
   private kills = new Map<string, () => void>();
+  // Why a task is being killed; read by the settlement path to classify the failure.
   private reasons = new Map<string, FailureKind>();
+  // Per-attempt generation counter: bumping it makes a late settlement from an
+  // earlier attempt a no-op. Checked by beginAttempt/endAttempt callers.
   private tokens = new Map<string, number>();
+  // Open per-attempt log files.
   private logs = new Map<string, AttemptLog>();
+  // Attempt number for the open log file, used when lazily creating it.
   private attemptByTask = new Map<string, number>();
+  // Lifecycle flags for stop()/start().
   private stopping = false;
   private active = false;
+  // Coalesced-persist state: `dirty` marks a write pending, `flushTimer` holds
+  // the scheduled flush while one is pending.
   private dirty = false;
   private flushTimer: NodeJS.Timeout | null = null;
   private loopPromise: Promise<void> | null = null;
@@ -411,18 +458,29 @@ export class DagRunner {
   private stopGate: Promise<never> = new Promise<never>(() => {});
   private rejectStopGate: ((err: Error) => void) | null = null;
   private budgetReached = false;
+  // Interrupted tasks requeued and orphan pids spotted at start, reported at end.
   private recovery: RecoveryResult = { requeued: [], orphanPids: [] };
+  // Releases the run-file lock on teardown; null when the caller already held it.
   private releaseLock: (() => void) | null = null;
+  // Per-task worktree path, and the integration commit the worktree branched from.
   private worktrees = new Map<string, string>();
   private worktreeBases = new Map<string, string>();
+  // The shared integration worktree and the commit the run started from.
   private integration: { path: string; branch: string } | null = null;
   private integrationBase: string | null = null;
+  // Repository root for git operations (null when isolation is off).
   private repoDir: string | null = null;
+  // Paths excluded from the worktree snapshot, so run artifacts stay out of git.
   private excludes: SnapshotExcludes | undefined;
+  // Serializes merges into the integration branch: only one writer at a time.
   private landChain: Promise<void> = Promise.resolve();
+  // Counters for end-of-run review rounds (current round vs the configured cap).
   private reviewRound = 0;
   private reviewRounds = 0;
+  // Latest end-of-run review outcome, surfaced in the run summary.
   private finalReview: FinalReviewSummary | null = null;
+  // Coverage bundles are deterministic once their covered tasks finish, so cache
+  // them per chain-review task rather than rebuilding on every attempt.
   private coverageCache = new Map<string, TaskCoverage | null>();
 
   constructor(
@@ -935,6 +993,8 @@ export class DagRunner {
         run.tasks[id].finalReview?.verdict !== 'pass',
     );
 
+    // Fail-closed: only an explicit PASS passes. A missing VERDICT line is a
+    // rejection, never silent approval.
     const verdictOf = (output: string): { verdict: 'pass' | 'fail'; reason: string } => {
       const parsed = parseVerdict(stripAnsi(output));
       if (parsed.kind === 'pass') return { verdict: 'pass', reason: parsed.reason };
@@ -1417,6 +1477,8 @@ export class DagRunner {
     const path = this.worktrees.get(task.id);
     const base = this.worktreeBases.get(task.id);
     if (!path || !base) return null;
+    // --numstat must see new files, so stage the worktree first. It is
+    // disposable (committed then dropped right after), so staging is harmless.
     git(path, ['add', '-A']);
     const numstat = git(path, ['diff', '--cached', '--numstat', base]);
     if (numstat.code !== 0) return null;
@@ -1909,6 +1971,8 @@ export class DagRunner {
         this.dropWorktree(task.id);
       }
     };
+    // Queue this merge after the previous one whatever its outcome, and store a
+    // chain that swallows errors so one bad merge cannot wedge every later merge.
     const next = this.landChain.then(run, run);
     this.landChain = next.then(
       () => undefined,
@@ -2367,6 +2431,8 @@ export class DagRunner {
         task.id,
         `attempt ${task.attempts}/${budget} failed (${reason}: ${truncate(message, 120)}); backing off`,
       );
+      // Exponential backoff capped at 60s, jittered to 50-100% so retries from
+      // parallel tasks do not resynchronize into a thundering herd.
       const delay = Math.min(60_000, 1000 * 2 ** Math.max(0, task.attempts - 1));
       await this.backoff(delay * (0.5 + Math.random() * 0.5));
     } else {

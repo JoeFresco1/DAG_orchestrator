@@ -12,12 +12,17 @@ import { join, relative } from 'node:path';
 // files, excluding our own run artifacts), so a dirty repo does not change
 // what the agents see.
 
+/** Raw outcome of one git invocation; stdout/stderr are already trimmed. */
 export interface GitResult {
   code: number;
   stdout: string;
   stderr: string;
 }
 
+/**
+ * Run git in `dir` with long-path support. stdout/stderr are trimmed and the
+ * exit code defaults to 1 so a missing or crashed process reads as failure.
+ */
 export function git(dir: string, args: string[], env?: NodeJS.ProcessEnv): GitResult {
   const res = spawnSync('git', ['-c', 'core.longpaths=true', ...args], {
     cwd: dir,
@@ -41,6 +46,7 @@ function longPath(path: string): string {
   return abs.replace(/\//g, '\\');
 }
 
+/** True when `dir` is inside a git working tree. */
 export function isGitRepo(dir: string): boolean {
   return git(dir, ['rev-parse', '--is-inside-work-tree']).stdout === 'true';
 }
@@ -55,6 +61,11 @@ export interface SnapshotExcludes {
   archived: string;
 }
 
+/**
+ * Compute the run-artifact paths to exclude from a snapshot, relative to the
+ * repo root. A run file outside the repo falls back to as-given so the exclude
+ * patterns still match what git sees.
+ */
 export function snapshotExcludes(runFile: string, repoDir: string): SnapshotExcludes {
   const rel = relative(repoDir, runFile).replace(/\\/g, '/');
   const safe = rel.startsWith('..') ? runFile.replace(/\\/g, '/') : rel;
@@ -65,6 +76,7 @@ export function snapshotExcludes(runFile: string, repoDir: string): SnapshotExcl
   };
 }
 
+/** Dirty means any change that is not one of our own run artifacts. */
 export function isDirty(dir: string, excludes?: SnapshotExcludes): boolean {
   const res = git(dir, ['status', '--porcelain']);
   const skip = excludes ?? { file: 'dag.run.json', dir: 'dag.run.d', archived: 'dag.runs' };
@@ -89,10 +101,12 @@ export function headCommit(dir: string): string {
   return res.code === 0 ? res.stdout : '';
 }
 
+/** Current branch name; "HEAD" means detached. */
 export function currentBranch(dir: string): string {
   return git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']).stdout;
 }
 
+// Pinned identity so bookkeeping commits work on machines with no git user.
 const IDENTITY = ['-c', 'user.name=dag-orchestrator', '-c', 'user.email=dag@localhost'];
 // The tool's own bookkeeping commits must never run the user's hooks: husky /
 // lint-staged / commitlint would fail them, and a failed commit here loses the
@@ -152,6 +166,12 @@ export function worktreeRoot(repoDir: string, runId: string): string {
   return join(tmpdir(), 'dwt', key);
 }
 
+/**
+ * Create (or reuse) the per-run integration worktree and its `dag/<runId>`
+ * branch. The base is an explicit ref when given, else the working tree
+ * snapshotted so dirty edits are visible to agents. Reuse is validated against
+ * the current repo and branch so a stale checkout is never resurrected.
+ */
 export function ensureIntegrationWorktree(
   repoDir: string,
   runId: string,
@@ -178,6 +198,8 @@ export function ensureIntegrationWorktree(
   git(repoDir, ['worktree', 'prune']);
   mkdirSync(path, { recursive: true });
   rmSync(path, { recursive: true, force: true });
+  // Prefer the caller's base; otherwise snapshot dirty work so uncommitted
+  // edits are visible, falling back to HEAD when the tree is clean.
   let resolvedBase =
     base ?? (isDirty(repoDir, excludes) ? snapshotCommit(repoDir, excludes) : headCommit(repoDir));
   if (!resolvedBase) {
@@ -185,6 +207,7 @@ export function ensureIntegrationWorktree(
     // branch can exist. Without this, `worktree add` fails on a fresh repo.
     resolvedBase = snapshotCommit(repoDir, excludes);
   }
+  // Reuse the branch a previous run left behind; otherwise create it at base.
   const existing = git(repoDir, ['rev-parse', '--verify', branch]).code === 0;
   const args = existing
     ? ['worktree', 'add', path, branch]
@@ -209,6 +232,10 @@ function safeTaskId(taskId: string): string {
   return taskId;
 }
 
+/**
+ * Create a fresh worktree for one task, branched from `fromBranch`. `-B`
+ * resets the branch each call, so a retry starts from the current base.
+ */
 export function createTaskWorktree(
   repoDir: string,
   runId: string,
@@ -234,6 +261,10 @@ export function createTaskWorktree(
   return { path, branch };
 }
 
+/**
+ * Remove a worktree with a long-path recursive delete only when git still
+ * lists the path as one of its own (never nuke an unknown directory).
+ */
 export function removeWorktree(repoDir: string, path: string): void {
   const res = git(repoDir, ['worktree', 'remove', '--force', path]);
   if (res.code !== 0 && existsSync(path)) {
@@ -256,16 +287,19 @@ export function removeWorktree(repoDir: string, path: string): void {
   git(repoDir, ['worktree', 'prune']);
 }
 
+/** Compare paths loosely: case- and separator-insensitive, trailing / ignored. */
 function samePath(a: string, b: string): boolean {
   const norm = (p: string): string => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
   return norm(a) === norm(b);
 }
 
+/** Commit outcome; a null commit means there was nothing to save. */
 export interface CommitResult {
   commit: string | null;
   files: number;
 }
 
+/** Stage everything and commit; an empty staging area yields commit: null. */
 export function commitAll(worktree: string, message: string): CommitResult {
   const add = git(worktree, ['add', '-A']);
   if (add.code !== 0) throw new Error(`git add failed: ${add.stderr}`);
@@ -294,11 +328,14 @@ export function mergeIntoIntegration(
     taskBranch,
   ]);
   if (res.code === 0) return { merged: true, conflict: false, detail: res.stdout };
+  // Always abort so the integration worktree is clean for a possible retry;
+  // the flag only distinguishes "redo on the new base" from other failures.
   git(integrationWorktree, ['merge', '--abort']);
   const conflict = /CONFLICT|conflict/i.test(res.stdout + res.stderr);
   return { merged: false, conflict, detail: (res.stderr || res.stdout).slice(0, 500) };
 }
 
+/** Best-effort note left for a human inspecting a failed task's worktree. */
 export function writeWorktreeNote(path: string, text: string): void {
   try {
     writeFileSync(join(path, '.dag-note.txt'), text, 'utf8');

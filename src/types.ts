@@ -1,3 +1,9 @@
+// ---------------------------------------------------------------------------
+// Domain types for a run. Defines task statuses, event shapes, the Task and
+// RunSettings records, and the split between definition fields (dag.run.json)
+// and dynamic fields (state.json). Pure types, constants, and the settings
+// validator; this module performs no I/O.
+// ---------------------------------------------------------------------------
 export type TaskStatus =
   | 'pending'
   | 'ready'
@@ -15,6 +21,7 @@ export const TASK_STATUSES: TaskStatus[] = [
   'skipped',
 ];
 
+// End-of-run review scope: none, one reviewer per task, or one for the run.
 export type FinalReviewMode = 'off' | 'per-task' | 'run';
 
 // Facts about the tasks a chain-review task covers, gathered when it runs.
@@ -28,6 +35,7 @@ export interface TaskCoverage {
   tasks: string[];
 }
 
+// Outcome of one end-of-run review pass over a task or the whole run.
 export interface FinalReviewVerdict {
   verdict: 'pass' | 'fail' | 'error';
   reason: string;
@@ -35,11 +43,14 @@ export interface FinalReviewVerdict {
   round: number;
 }
 
+// Statuses from which a task will not run again without an explicit retry.
 export type TerminalStatus = 'completed' | 'failed' | 'skipped';
 
 // What the UI/CLI show: real status plus two derived states.
 export type DisplayStatus = TaskStatus | 'blocked' | 'gated';
 
+// Why an attempt ended badly; lets retries and reports distinguish a real
+// command failure from infrastructure trouble.
 export type FailureKind =
   | 'exit'
   | 'spawn'
@@ -54,6 +65,7 @@ export type FailureKind =
   | 'setup'
   | 'plan';
 
+// Event vocabulary written to events.jsonl and the viewer's live feed.
 export type EventType =
   | 'run-start'
   | 'run-stop'
@@ -91,12 +103,14 @@ export interface DagEvent {
 import type { Reviewer } from './review-policy.js';
 import type { HarnessCandidate } from './harness-chain.js';
 
+// One named reviewer's outcome for the most recent review pass.
 export interface ReviewerVerdict {
   verdict: 'pass' | 'fail' | 'skipped' | 'error';
   reason: string;
   at: string;
 }
 
+// A human checkpoint: the runner waits at `question` until approved/rejected.
 export interface ApprovalGate {
   question: string;
   options: string[];
@@ -113,10 +127,12 @@ export interface Task {
   // Shell command the runner executes. Null = manual task, never auto-run.
   cmd: string | null;
   gate: ApprovalGate | null;
+  // Human-readable outcome or failure summary from the last attempt.
   result: string | null;
   createdAt: string;
   // Monotonic creation order; deterministic tiebreak for launch order.
   seq: number;
+  // Command attempts used so far, and the budget. A harness chain can raise it.
   attempts: number;
   maxAttempts: number;
   // 0 = no limit. Null = inherit run settings.
@@ -135,6 +151,7 @@ export interface Task {
   // means the work is not accepted and gets redone (bounded by reviewRounds).
   reviewCmd: string | null;
   reviewRounds: number;
+  // Review passes already spent, against the reviewRounds budget.
   reviews: number;
   reviewResult: string | null;
   reviewExitCode: number | null;
@@ -198,6 +215,10 @@ export interface SettingsProblem {
 
 const PROBLEM = (field: string, reason: string): SettingsProblem => ({ field, reason });
 
+/**
+ * Validate a raw settings patch from any entry point. Returns every problem
+ * found (never throws) so callers can report them all at once.
+ */
 export function validateSettingsPatch(patch: Record<string, unknown>): SettingsProblem[] {
   const problems: SettingsProblem[] = [];
   const num = (field: string, min: number, max: number, integer = true): void => {
@@ -255,11 +276,13 @@ export function validateSettingsPatch(patch: Record<string, unknown>): SettingsP
   return problems;
 }
 
+/** Render validation problems as a single human-readable line. */
 export function describeSettingsProblems(problems: SettingsProblem[]): string {
   return problems.map((p) => `${p.field}: ${p.reason}`).join('; ');
 }
 
 export interface RunSettings {
+  // Workers a single runner may run at once, and the hard per-task wall clock.
   concurrency: number;
   timeoutMs: number;
   silenceMs: number;
@@ -271,6 +294,7 @@ export interface RunSettings {
   // (buffered tool calls: pytest, mypy, long model turns), so the default is
   // to warn and let the hard timeout bound the task, not to kill on silence.
   silenceAction: 'warn' | 'kill';
+  // Default retry budget; an individual task may override it.
   maxAttempts: number;
   onDepFailure: DepFailurePolicy;
   onGateBlocked: GatePolicy;
@@ -308,6 +332,7 @@ export interface RunSettings {
   mergeRounds: number;
 }
 
+// Baseline settings every run starts from; user settings layer on top.
 export const DEFAULT_SETTINGS: RunSettings = {
   concurrency: 4,
   timeoutMs: 60 * 60 * 1000,
@@ -348,15 +373,21 @@ export interface Run {
   events: DagEvent[];
 }
 
+// Bumped when the on-disk shape changes; older files are migrated on load.
 export const STORAGE_VERSION = 2;
 // One runner, many workers: this caps how many workers it can run at once.
 export const MAX_CONCURRENCY = 64;
+// In-memory events kept for API responses; events.jsonl holds the full history.
 export const EVENT_RING_LIMIT = 200;
+// Rotate the event log past this size so tail reads stay cheap.
 export const EVENT_LOG_ROTATE_BYTES = 20 * 1024 * 1024;
+// Truncation limits for values surfaced in status/list output.
 export const RESULT_LIMIT = 4000;
 export const OUTPUT_TAIL_LIMIT = 2000;
 export const ATTEMPT_LOG_CAP_DEFAULT = 1024 * 1024;
 
+// Task fields stored in the definition file. Everything here is authored, not
+// observed, so it changes only when a user edits the task.
 export const DEFINITION_FIELDS = [
   'id',
   'title',
@@ -381,6 +412,8 @@ export const DEFINITION_FIELDS = [
   'covers',
 ] as const;
 
+// Task fields stored in the state sidecar. These change constantly as a run
+// progresses, which is exactly why they live apart from the definition.
 export const DYNAMIC_FIELDS = [
   'status',
   'result',
@@ -409,6 +442,8 @@ export const DYNAMIC_FIELDS = [
   'coverage',
 ] as const;
 
+// Cap on stored plan text; plans are prompts, not deliverables.
+// Cap on stored plan text; plans are prompts, not deliverables.
 export const PLAN_LIMIT = 20000;
 
 export type DagConvergence = 'empty' | 'all-done' | 'active';

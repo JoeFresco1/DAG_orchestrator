@@ -1,3 +1,6 @@
+// Server launcher: picks a free port, spawns a detached `dag serve` process per
+// project, and tracks the running servers in a per-user file so they can be
+// listed and stopped later.
 import { spawn, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
@@ -16,6 +19,7 @@ export interface ServerRecord {
   startedAt: string;
 }
 
+/** On-disk list of launched viewers; `version` is a forward-compatibility marker. */
 export interface ServersFile {
   version: 1;
   servers: ServerRecord[];
@@ -40,6 +44,8 @@ export function saveServers(servers: ServersFile): void {
   atomicWriteJson(serversPath(), servers);
 }
 
+// EPERM means the process exists but belongs to another user; only ESRCH means
+// it is truly gone.
 export function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -49,10 +55,14 @@ export function isAlive(pid: number): boolean {
   }
 }
 
+// Blocking sleep for shutdown polling; Atomics.wait needs no busy loop and no
+// async plumbing.
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// Drop records for processes that are gone; a crashed or exited server must
+// not make `dag servers` claim it is still up.
 export function pruneServers(): ServerRecord[] {
   const file = loadServers();
   const alive = file.servers.filter((s) => isAlive(s.pid));
@@ -82,6 +92,8 @@ export function portAvailable(port: number, host = '127.0.0.1'): Promise<boolean
   });
 }
 
+// Walk upward from the preferred port, skipping ports other projects have
+// already claimed, and return the first one we can actually bind.
 export async function pickPort(file: string, preferred = 8787): Promise<number> {
   const claimed = claimedPorts(file);
   for (let port = preferred; port < preferred + 200; port++) {
@@ -91,12 +103,15 @@ export async function pickPort(file: string, preferred = 8787): Promise<number> 
   throw new Error(`no free port in ${preferred}..${preferred + 199}`);
 }
 
+// Absolute path to the CLI entry point (the sibling of this module), so the
+// spawned process runs the same build that launched it.
 export function cliPath(): string {
   const here = fileURLToPath(import.meta.url);
   const ext = here.endsWith('.ts') ? '.ts' : '.js';
   return join(dirname(here), `cli${ext}`);
 }
 
+/** Flags forwarded to the spawned server process. */
 export interface LaunchOptions {
   open?: boolean;
   autoResume?: boolean;
@@ -104,6 +119,7 @@ export interface LaunchOptions {
   extraArgs?: string[];
 }
 
+/** Outcome of a launch: either a reused live server or a freshly spawned one. */
 export interface LaunchResult {
   entry: ProjectEntry;
   port: number;
@@ -112,6 +128,7 @@ export interface LaunchResult {
   alreadyRunning: boolean;
 }
 
+/** Launch (or reuse) the detached server for one project and record its port and pid. */
 export async function launchProject(entry: ProjectEntry, opts: LaunchOptions = {}): Promise<LaunchResult> {
   const running = serverFor(entry.file);
   if (running) {
@@ -137,6 +154,7 @@ export async function launchProject(entry: ProjectEntry, opts: LaunchOptions = {
   if (opts.killOrphans) args.push('--kill-orphans');
   if (opts.extraArgs) args.push(...opts.extraArgs);
 
+  // Detached with its own stdio so the viewer outlives this CLI invocation.
   const child = spawn(process.execPath, args, {
     detached: true,
     windowsHide: true,
@@ -165,6 +183,8 @@ export async function launchProject(entry: ProjectEntry, opts: LaunchOptions = {
   return { entry, port: actualPort, pid: child.pid ?? 0, url, alreadyRunning: false };
 }
 
+// Scrape the URL the server printed into its log; it may differ from our guess
+// when the server had to bump the port.
 async function confirmPort(logFile: string, fallback: number): Promise<number> {
   for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 150));
@@ -218,6 +238,7 @@ export function stopServer(file: string): { stopped: boolean; pid: number | null
   return { stopped: true, pid: running.pid };
 }
 
+// --all ignores the explicit dirs and returns every registered project.
 export function projectEntriesFromArgs(dirs: string[], all: boolean): ProjectEntry[] {
   if (all) return loadRegistry().projects;
   const entries: ProjectEntry[] = [];

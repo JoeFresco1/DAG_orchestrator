@@ -1,3 +1,6 @@
+// Project registry: the hub's per-user memory of which run files exist. Entries
+// are matched by normalized path, and every writer takes a lock so concurrent
+// `dag` processes cannot lose each other's edits.
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -13,6 +16,7 @@ export interface ProjectEntry {
   port?: number;
 }
 
+/** On-disk shape of the registry; `version` is a forward-compatibility marker. */
 export interface Registry {
   version: 1;
   projects: ProjectEntry[];
@@ -54,6 +58,8 @@ export function saveRegistry(registry: Registry): void {
   atomicWriteJson(registryPath(), registry);
 }
 
+// Stable per-project id derived from the normalized absolute path, so the same
+// run file keeps one id however the path was spelled.
 export function projectId(file: string): string {
   const abs = resolve(cleanPath(file));
   return `proj_${createHash('sha1').update(abs.toLowerCase()).digest('hex').slice(0, 8)}`;
@@ -67,6 +73,8 @@ export function defaultProjectName(file: string): string {
   return fileBase === 'dag.run' || fileBase === 'dag' ? folder : `${folder}/${fileBase}`;
 }
 
+// Accept either a run file or a project folder; a folder gets the conventional
+// dag.run.json appended.
 export function resolveRunFile(target: string): string {
   const abs = resolve(cleanPath(target));
   if (abs.endsWith('.json')) return abs;
@@ -95,6 +103,8 @@ export function samePath(a: string, b: string): boolean {
   return process.platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y;
 }
 
+// Register (or update) a project. An existing entry is matched by path so a
+// re-add becomes a rename, never a duplicate.
 export function addProject(target: string, name?: string): ProjectEntry {
   const file = resolveRunFile(target);
   return withRegistryLock(() => {
@@ -116,6 +126,8 @@ export function addProject(target: string, name?: string): ProjectEntry {
   });
 }
 
+// Accepts the same handles as findProject (id, path or name); returns false
+// when nothing matched so the caller can report it.
 export function removeProject(idOrPath: string): boolean {
   const registry = loadRegistry();
   const before = registry.projects.length;
@@ -127,6 +139,8 @@ export function removeProject(idOrPath: string): boolean {
   return true;
 }
 
+// Resolve any user-supplied handle (project id, path, or display name) to an
+// entry; the first matching identifier wins.
 export function findProject(idOrPath: string): ProjectEntry | null {
   const registry = loadRegistry();
   const abs = resolve(idOrPath);
@@ -137,6 +151,7 @@ export function findProject(idOrPath: string): ProjectEntry | null {
   );
 }
 
+// Remember the chosen port so the next launch reuses the same bookmarked URL.
 export function setProjectPort(file: string, port: number): ProjectEntry | null {
   const registry = loadRegistry();
   const entry = registry.projects.find((p) => samePath(p.file, file));

@@ -1,3 +1,8 @@
+// Agent model discovery: asks the user's own agent CLI (`opencode models`)
+// which models it can run, so the UI offers exactly what their subscriptions
+// and providers allow. Results are TTL-cached and concurrent callers share one
+// in-flight probe.
+
 import { spawn } from 'node:child_process';
 import { resolveCommand } from './command-resolution.js';
 
@@ -8,14 +13,22 @@ export interface AgentModelList {
   error: string | null;
 }
 
+// Last result and when it was taken; the CLI is slow enough that serving a
+// few-minutes-stale list beats blocking a request on it.
 let cache: { at: number; value: AgentModelList } | null = null;
 const TTL_MS = 5 * 60 * 1000;
+// Hard cap on one probe: the CLI is known to hang when logged out.
 const TIMEOUT_MS = 30_000;
 
 // Concurrent callers share one probe: the CLI can take seconds to answer, and
 // the server must not run a synchronous child process inside a request handler.
 let inflight: Promise<AgentModelList> | null = null;
 
+/**
+ * Resolve the model list. Returns the cache while fresh, joins an in-flight
+ * probe when one exists, and otherwise starts a new one. `force` bypasses only
+ * the freshness check, not the shared probe.
+ */
 export function listAgentModels(force = false): Promise<AgentModelList> {
   if (!force && cache && Date.now() - cache.at < TTL_MS) return Promise.resolve(cache.value);
   if (inflight) return inflight;
@@ -30,6 +43,8 @@ export function listAgentModels(force = false): Promise<AgentModelList> {
   return inflight;
 }
 
+// Spawn `opencode models` once and settle the promise exactly once: whichever
+// of timeout / stdout-close / error fires first wins, guarded by `settled`.
 function query(): Promise<AgentModelList> {
   return new Promise((resolve) => {
     const finish = (value: AgentModelList): void => resolve(value);
@@ -70,6 +85,8 @@ function query(): Promise<AgentModelList> {
           });
           return;
         }
+        // Keep only provider/model lines; CLIs mix banners, hints and blank
+        // lines into the same stream.
         const models = stdout
           .split('\n')
           .map((l) => l.trim())

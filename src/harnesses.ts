@@ -25,9 +25,15 @@ export interface Harness {
   notes?: string;
 }
 
+// Every review prompt ends with this; agent reviewers fail closed when the
+// verdict line is missing.
 const VERDICT_RULE =
   'End your reply with exactly one line: VERDICT: PASS or VERDICT: FAIL: <reason>.';
 
+/**
+ * Built-in preset table. Each entry is plain data; adding a CLI is one object,
+ * not a new code path. `verified` marks presets exercised against the real CLI.
+ */
 export const HARNESSES: Harness[] = [
   {
     name: 'opencode',
@@ -89,6 +95,7 @@ export const HARNESSES: Harness[] = [
   },
 ];
 
+/** Look up a preset by name; undefined means unknown/unavailable. */
 export function findHarness(name: string): Harness | undefined {
   return HARNESSES.find((h) => h.name === name);
 }

@@ -1,3 +1,12 @@
+// ---------------------------------------------------------------------------
+// Store: persistence and editing for a single run.
+//
+// A run is deliberately split in two so that frequent state updates never
+// rewrite the task definitions: dag.run.json holds the definition (objective,
+// settings, task specs) and dag.run.d/state.json holds mutable state (statuses,
+// counters, rev, eventSeq). This module owns atomic writes, the run lock, the
+// append-only event log, and the task/graph operations the CLI and viewer call.
+// ---------------------------------------------------------------------------
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import {
@@ -45,6 +54,7 @@ import {
 //   dag.run.json.lock      held while a run is active
 // ---------------------------------------------------------------------------
 
+// Every path a run owns, all derived from the run definition file.
 export interface RunPaths {
   file: string;
   dir: string;
@@ -54,8 +64,10 @@ export interface RunPaths {
   lock: string;
 }
 
+/** Derive the full path layout for a run from its definition-file path. */
 export function runPaths(file: string): RunPaths {
   const abs = resolve(file);
+  // The sidecar directory mirrors the file name with the .json suffix dropped.
   const base = abs.endsWith('.json') ? abs.slice(0, -5) : abs;
   const dir = `${base}.d`;
   return {
@@ -94,6 +106,8 @@ function atomicWrite(path: string, data: string): void {
   renameSync(tmp, path);
 }
 
+// A torn or truncated primary file falls back to the .bak the last atomic
+// write left behind, so a crash mid-rename cannot lose both copies.
 function readJsonWithBackup<T>(path: string): T | null {
   for (const candidate of [path, `${path}.bak`]) {
     if (!existsSync(candidate)) continue;
@@ -203,6 +217,10 @@ function appendEventLine(paths: RunPaths, ev: DagEvent): void {
   eventLogSizes.set(paths.events, size + Buffer.byteLength(line));
 }
 
+/**
+ * Append an event to both the in-memory ring and the on-disk jsonl log.
+ * Logging is best-effort: a write failure must never break a run.
+ */
 export function logEvent(
   run: Run,
   type: EventType,
@@ -277,6 +295,8 @@ export function readEventTail(file: string, maxBytes = 256 * 1024): DagEvent[] {
   return events;
 }
 
+// Read the most recent `limit` events; reads a generous tail rather than the
+// whole log so listing history stays cheap as the file grows.
 export function readEventLog(file: string, limit: number): DagEvent[] {
   const events = readEventTail(file, 8 * 1024 * 1024);
   return events.slice(-limit);
@@ -286,6 +306,8 @@ export function readEventLog(file: string, limit: number): DagEvent[] {
 // Lock
 // ---------------------------------------------------------------------------
 
+// Lock holder identity. `host` + pid let another process decide liveness; the
+// note names the command holding it, for the error message.
 export interface LockInfo {
   pid: number;
   host: string;
@@ -302,6 +324,8 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+// Parse the lock file, or null if it is absent or unreadable (another process
+// may be mid-create; callers must treat null as "unknown", not "free").
 export function readLock(file: string): LockInfo | null {
   const paths = runPaths(file);
   if (!existsSync(paths.lock)) return null;
@@ -672,6 +696,7 @@ export function mutate<T>(file: string, fn: (run: Run) => T, lockLabel?: string)
   return next;
 }
 
+// Mark the run as changed without persisting; the next saveRun picks it up.
 export function touch(run: Run): void {
   run.updatedAt = new Date().toISOString();
 }
@@ -680,6 +705,8 @@ export function touch(run: Run): void {
 // Task operations
 // ---------------------------------------------------------------------------
 
+// Caller-supplied fields for a new task. Dynamic/state fields are initialized
+// by addTask, not accepted here.
 export interface AddTaskInput {
   title: string;
   spec: string;
@@ -700,6 +727,7 @@ export interface AddTaskInput {
   covers?: string[] | null;
 }
 
+/** Add a pending task, wire its deps, reject cycles, and record the edit. */
 export function addTask(run: Run, input: AddTaskInput): Task {
   // Dedupe: a repeated dep is always a mistake and would double-count edges.
   const deps = [...new Set(input.deps ?? [])];
@@ -763,6 +791,8 @@ export function addTask(run: Run, input: AddTaskInput): Task {
   return task;
 }
 
+// Partial update for an existing task. Only defined keys are applied, so
+// `undefined` means "leave unchanged" while `null` means "clear".
 export interface EditTaskInput {
   title?: string;
   spec?: string;
@@ -784,6 +814,10 @@ export interface EditTaskInput {
   harnessChain?: HarnessCandidate[] | null;
 }
 
+/**
+ * Apply a partial update. Dep changes that would introduce a cycle roll back to
+ * the prior task, so the graph is never left invalid.
+ */
 export function editTask(run: Run, id: string, patch: EditTaskInput): Task {
   const task = run.tasks[id];
   if (!task) throw new Error(`unknown task ${id}`);
@@ -823,6 +857,8 @@ export function editTask(run: Run, id: string, patch: EditTaskInput): Task {
   return task;
 }
 
+// Delete a task and drop it from every other task's deps, so no dangling edge
+// keeps a dependent blocked forever.
 export function removeTask(run: Run, id: string): void {
   if (!run.tasks[id]) throw new Error(`unknown task ${id}`);
   delete run.tasks[id];
@@ -935,6 +971,8 @@ export function orphanedPids(run: Run): number[] {
     .map((t) => t.pid as number);
 }
 
+// Kill a worker and its descendants. Detached workers spawn their own process
+// group, so signal the group, not just the direct pid.
 export function killPid(pid: number): boolean {
   try {
     if (process.platform === 'win32') {
@@ -954,6 +992,8 @@ export function killPid(pid: number): boolean {
   }
 }
 
+// Reap processes left behind by a crashed run. Returns per-pid outcomes so the
+// caller can report what was actually found and killed.
 export function killOrphans(run: Run): { pid: number; killed: boolean }[] {
   const out: { pid: number; killed: boolean }[] = [];
   for (const task of Object.values(run.tasks)) {
@@ -992,6 +1032,9 @@ export function skipBlocked(run: Run, reason = 'dependency failed', only?: Set<s
   return skipped;
 }
 
+// Resolve unapproved gates when policy is 'skip': a gated task whose deps are
+// done and that the human never answered becomes skipped. Tasks whose deps are
+// unfinished are left alone, since the gate may still be decided later.
 export function skipGated(run: Run, only?: Set<string>): string[] {
   const skipped: string[] = [];
   for (const task of topoSort(run)) {
@@ -1035,6 +1078,7 @@ export function buildIntegrationSpec(run: Run, depIds: string[], cmd: string): s
   return lines.join('\n');
 }
 
+// Fields a bulk `set` can change across many tasks at once.
 export interface TaskPatch {
   cmd?: string | null;
   reviewCmd?: string | null;
@@ -1052,6 +1096,8 @@ export interface TaskPatch {
   silenceMs?: number | null;
 }
 
+// Which tasks a bulk edit targets: all, an explicit id list, or a title/id
+// regex (matched case-insensitively).
 export interface TaskSelector {
   all?: boolean;
   only?: string[];
@@ -1136,6 +1182,7 @@ export function setTaskCommand(
   return setTasks(run, { cmd }, selector);
 }
 
+/** Shallow-merge a settings patch over the run's current settings. */
 export function setSettings(run: Run, patch: Partial<RunSettings>): RunSettings {
   run.settings = { ...run.settings, ...patch };
   logEvent(run, 'edit', null, `settings: ${JSON.stringify(patch)}`);
@@ -1143,6 +1190,8 @@ export function setSettings(run: Run, patch: Partial<RunSettings>): RunSettings 
   return run.settings;
 }
 
+// Attach a human approval gate. `approved: null` means undecided; moving a
+// pending task to ready lets the runner consider it, which then waits at the gate.
 export function setGate(
   run: Run,
   id: string,
@@ -1158,6 +1207,7 @@ export function setGate(
   return task;
 }
 
+/** Record a human decision on a gate, unblocking the task or letting it skip. */
 export function resolveGate(run: Run, id: string, approved: boolean): Task {
   const task = run.tasks[id];
   if (!task?.gate) throw new Error(`task ${id} has no gate`);
@@ -1180,6 +1230,7 @@ function safeId(id: string): string {
   return id;
 }
 
+/** Absolute path of one attempt's stdout/stderr log. */
 export function attemptLogPath(file: string, taskId: string, attempt: number): string {
   return join(runPaths(file).logs, `${safeId(taskId)}.${attempt}.log`);
 }
@@ -1190,11 +1241,13 @@ export function heartbeatPath(file: string, taskId: string): string {
   return join(runPaths(file).dir, 'heartbeats', safeId(taskId));
 }
 
+/** Refresh a worker's heartbeat file so the stall watchdog leaves it alone. */
 export function recordHeartbeat(file: string, taskId: string): void {
   const path = heartbeatPath(file, taskId);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${new Date().toISOString()}\n`, 'utf8');
 }
+// Sorted attempt numbers that have a log on disk; used to offer `--attempt N`.
 export function attemptLogFiles(file: string, taskId: string): number[] {
   const paths = runPaths(file);
   if (!existsSync(paths.logs)) return [];
@@ -1210,6 +1263,8 @@ export function attemptLogFiles(file: string, taskId: string): number[] {
   return attempts.sort((a, b) => a - b);
 }
 
+// Read the tail of one attempt's log. Logs can be large, so only the last
+// maxBytes are returned, with a marker noting the truncation.
 export function readAttemptLog(
   file: string,
   taskId: string,

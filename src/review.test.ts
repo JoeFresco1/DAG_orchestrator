@@ -1,3 +1,6 @@
+// Review and policy tests: end-of-run review, chain-review coverage tasks, the
+// reviewer panel and its when-DSL, integration repair, verdict parsing, harness
+// token rendering, and command resolution.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -420,6 +423,7 @@ describe('reviewer panel', () => {
   it('feeds the last rejection into the redo prompt via {lastRejection}', async () => {
     const dir = tempDir();
     const out = join(dir, 'argv.jsonl').replace(/\\/g, '/');
+    // A probe command that records the argv each work attempt receives.
     const probe = `"${process.execPath}" -e "require('fs').appendFileSync('${out}', JSON.stringify(process.argv.slice(1)) + '\\n')"`;
     try {
       const run = newRun('panel-feedback');
@@ -987,6 +991,7 @@ describe('reviewer agents and integration repair', () => {
   it('salvages partial work from a failed task worktree', async () => {
     const repo = tempDir();
     try {
+      // Shorthand for running git against this throwaway repo.
       const g = (args: string[]): ReturnType<typeof git> => git(repo, args);
       g(['init', '-q']);
       g(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'init']);
@@ -1060,6 +1065,7 @@ describe('reviewer agents and integration repair', () => {
 
   it('drops the flag and its value when no model is configured', async () => {
     const run = newRun('no-model');
+    // A probe that echoes its argv as JSON so flag handling is inspectable.
     const probe = `"${process.execPath}" -e "console.log(JSON.stringify(process.argv.slice(1)))"`;
     const a = addTask(run, { title: 'plain', spec: 'hello world', cmd: `${probe} -- -m {model} --variant {variant} {spec}` });
     const runner = new DagRunner(run, { executor: shellExecutor() });

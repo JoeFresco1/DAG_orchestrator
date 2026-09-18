@@ -10,8 +10,11 @@ export interface ResolvedCommand {
   args: string[];
 }
 
+// Resolution hits the filesystem and reads shim files; cache per name so a
+// long-lived server does not repeat that work on every spawn.
 const cache = new Map<string, ResolvedCommand>();
 
+/** Candidate paths for `name` in PATH order, .exe before the npm shims. */
 function pathCandidates(name: string): string[] {
   const dirs = (process.env.PATH ?? '').split(delimiter).filter(Boolean);
   const out: string[] = [];
@@ -32,6 +35,10 @@ function expandDp0(target: string, shimDir: string): string {
   return isAbsolute(cleaned) ? cleaned : join(shimDir, cleaned);
 }
 
+/**
+ * Read a .cmd/.bat shim and extract the real executable or JS entry point it
+ * forwards to. Returns null when the shim is unreadable or unrecognized.
+ */
 function resolveShim(shimPath: string): ResolvedCommand | null {
   let text: string;
   try {
@@ -54,11 +61,17 @@ function resolveShim(shimPath: string): ResolvedCommand | null {
   return null;
 }
 
+/**
+ * Map a command name to a file + argv a shell-less spawn can execute. On Unix
+ * this is a no-op; on Windows it follows npm/pnpm .cmd shims to their target.
+ */
 export function resolveCommand(file: string): ResolvedCommand {
   if (process.platform !== 'win32') return { file, args: [] };
   const cached = cache.get(file);
   if (cached) return cached;
 
+  // Default to the bare name: if nothing on PATH matches, let spawn report the
+  // ENOENT rather than inventing a path.
   let resolved: ResolvedCommand = { file, args: [] };
   const candidate = pathCandidates(file).find((c) => existsSync(c));
   if (candidate) {
@@ -66,6 +79,8 @@ export function resolveCommand(file: string): ResolvedCommand {
     if (lower.endsWith('.exe')) {
       resolved = { file: candidate, args: [] };
     } else if (lower.endsWith('.cmd') || lower.endsWith('.bat')) {
+      // Unparseable shim: keep the shim path rather than dropping the command,
+      // so the failure names the file the user meant.
       resolved = resolveShim(candidate) ?? { file: candidate, args: [] };
     } else {
       resolved = { file: candidate, args: [] };

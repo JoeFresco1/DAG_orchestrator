@@ -43,6 +43,7 @@ import { initCmd, projectsCmd } from './projects.js';
 import { scheduleCmd } from './schedule.js';
 import { launchCmd, serveCmd, serversCmd } from './viewer.js';
 
+/** Maps `dag <name>` to its handler; aliases share one handler on purpose. */
 export const COMMANDS: Record<string, CommandHandler> = {
   // Viewer / server
   serve: serveCmd,
@@ -55,6 +56,7 @@ export const COMMANDS: Record<string, CommandHandler> = {
   runs: runsCmd,
   // Scheduling
   schedule: scheduleCmd,
+  // Same handler as `schedule`; it checks `cmd` to choose queue vs worker.
   scheduler: scheduleCmd,
   // Run lifecycle
   run: runCmd,
@@ -76,6 +78,7 @@ export const COMMANDS: Record<string, CommandHandler> = {
   blocked: blockedCmd,
   show: showCmd,
   'set': setCmd,
+  // `set-cmd` is the historical name for the same bulk editor.
   'set-cmd': setCmd,
   heartbeat: heartbeatCmd,
   log: logCmd,
@@ -83,6 +86,7 @@ export const COMMANDS: Record<string, CommandHandler> = {
   gc: gcCmd,
   gate: gateCmd,
   approve: approveCmd,
+  // approve/reject are one handler; it reads the command name for the verdict.
   reject: approveCmd,
   dot: dotCmd,
   // Reviews and harnesses

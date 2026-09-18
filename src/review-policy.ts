@@ -34,6 +34,11 @@ export interface WhenClause {
   invalid: string | null;
 }
 
+/**
+ * Parse a `when` string into clauses. `invalid` captures the first clause that
+ * did not match any known form, so callers can fail open instead of dropping a
+ * gate they cannot understand.
+ */
 export function parseWhen(when?: string): WhenClause {
   const out: WhenClause = { onReject: false, minLines: null, touches: null, invalid: null };
   const text = (when ?? 'always').trim();
@@ -90,6 +95,7 @@ export function globMatches(pattern: string, path: string): boolean {
       re += '[^/]';
       continue;
     }
+    // Any other character is literal, so escape regex metacharacters.
     re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
   }
   return new RegExp(`^${re}$`).test(norm);
@@ -102,6 +108,10 @@ export interface ReviewerDecision {
   onReject: boolean;
 }
 
+/**
+ * Resolve each reviewer against the run's diff. Every evaluable clause is
+ * ANDed; a clause that cannot be evaluated (no diff) leaves the gate open.
+ */
 export function decideReviewers(
   reviewers: Reviewer[],
   diff: DiffStats | null,
@@ -148,6 +158,7 @@ export function decideReviewers(
   });
 }
 
+/** One line per reviewer for logs and the run summary. */
 export function summarizeVerdicts(
   verdicts: Record<string, { verdict: string; reason?: string }>,
 ): string {

@@ -1,3 +1,5 @@
+// Scheduling state and worker: the job list is persisted per user, and
+// runScheduler drains it one job at a time.
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { appendFileSync, closeSync, mkdirSync, openSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -76,6 +78,7 @@ export interface NewJobInput {
   args: JobArgs;
 }
 
+// Register a job as pending; the scheduler takes ownership from here.
 export function addJob(input: NewJobInput): ScheduleJob {
   const schedule = loadSchedule();
   const job: ScheduleJob = {
@@ -140,6 +143,9 @@ export interface DueDecision {
   blocked?: string;
 }
 
+// A job is due only when its clock has passed and every `--after` predecessor
+// finished successfully. A failed/blocked/cancelled predecessor blocks the
+// dependent rather than letting it run.
 export function decideDue(job: ScheduleJob, schedule: ScheduleFile, now = Date.now()): DueDecision {
   if (job.at && now < Date.parse(job.at)) return { due: false };
   if (job.after) {

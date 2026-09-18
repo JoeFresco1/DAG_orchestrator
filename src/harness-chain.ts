@@ -32,6 +32,7 @@ export function parseHarnessChain(text: string): HarnessCandidate[] {
   return out;
 }
 
+/** Render a chain back to its compact "harness:model:variant, ..." form. */
 export function formatHarnessChain(chain: HarnessCandidate[]): string {
   return chain
     .map((c) => [c.harness, c.model ?? '', c.variant ?? ''].join(':').replace(/:+$/, ''))
@@ -46,6 +47,10 @@ export interface AttemptPlan {
   fellBack: boolean;
 }
 
+/**
+ * Pick the candidate for a 1-based attempt number. The index is clamped to the
+ * chain length, so once the list is exhausted the last candidate is retried.
+ */
 export function planAttempt(
   chain: HarnessCandidate[] | null | undefined,
   attempt: number,

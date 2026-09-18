@@ -1,3 +1,5 @@
+// Harness-chain tests: parsing per-tool model/effort, rejecting unknown tools,
+// attempt-to-candidate mapping, and the attempt budget a chain implies.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { attemptsForChain, formatHarnessChain, parseHarnessChain, planAttempt } from './harness-chain.js';

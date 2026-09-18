@@ -237,6 +237,8 @@ export function reviewerCmd(argv: string[]): void {
     const task = run.tasks[id];
     if (!task) throw new Error(`unknown task ${id}`);
     const before = (task.reviewers ?? []).length;
+    // The pre-`reviewers` field `reviewCmd` is listed as a synthetic reviewer
+    // named "review"; removing that name must clear the legacy field too.
     const legacyCleared = name === 'review' && Boolean(task.reviewCmd);
     task.reviewers = (task.reviewers ?? []).filter((r) => r.name !== name);
     if (legacyCleared) task.reviewCmd = null;

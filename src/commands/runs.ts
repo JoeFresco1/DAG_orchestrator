@@ -14,6 +14,8 @@ export function newRunCmd(argv: string[]): void {
   if (!objective) throw new Error('--objective is required');
   const dir = projectOf(file);
   const active = activeRunFile(dir);
+  // Refuse when another process holds the run: archiving under a live runner
+  // would destroy the active run.
   if (existsSync(active)) {
     try {
       assertNoForeignLock(active);

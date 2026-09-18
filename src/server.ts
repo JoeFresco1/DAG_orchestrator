@@ -1,3 +1,6 @@
+// HTTP hub: serves the viewer pages and a JSON API over one or many runs.
+// This file owns routing, run resolution, locking and the guarded mutations;
+// per-run payload shaping lives in server-view.ts.
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { existsSync, readdirSync, statSync } from 'node:fs';
@@ -58,6 +61,7 @@ import type { RunRuntime, StartOptions, StartResult } from './server-types.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
+/** How the hub should listen and which run (if any) it should focus on. */
 export interface ServeOptions {
   // Single-run focus for `dag serve --file`. Omit for hub mode.
   file?: string;
@@ -132,6 +136,8 @@ function dropRuntime(runId: string): void {
   runtimes.delete(runId);
 }
 
+// A run file can be reached through more than one runId alias; this finds a
+// runtime that is actively driving it so start/new-run can refuse to clobber.
 function activeRuntimeForFile(file: string): RunRuntime | null {
   const target = resolve(file);
   for (const rt of runtimes.values()) {
@@ -145,6 +151,7 @@ function activeRuntimeForFile(file: string): RunRuntime | null {
 // Run lifecycle
 // ---------------------------------------------------------------------------
 
+/** Validate, lock, snapshot settings and start a runner for one runtime. */
 async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult> {
   if (rt.archived) {
     return { started: false, error: 'this run is archived (history) and cannot be started', code: 409 };
@@ -199,6 +206,8 @@ async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult
     }
     saveRun(run, rt.file);
 
+    // Split the selection into runnable tasks and manual ones (no cmd and no
+    // chain). Manuals are reported as skipped; only runnables form the scope.
     const candidates = opts.ids ?? Object.keys(run.tasks);
     const manual = candidates.filter(
       (id) => !run.tasks[id].cmd && (run.tasks[id].status === 'pending' || run.tasks[id].status === 'ready'),
@@ -226,6 +235,8 @@ async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult
     // A runner that cannot even set up (no git repo for isolation, bad graph)
     // refuses synchronously and finishes instantly. Report that instead of
     // claiming the run started and leaving the UI looking idle.
+    // The runner releases its lock and persists when it finishes; capture the
+    // event count now to detect a synchronous setup refusal below.
     const eventsBefore = run.events.length;
     void rt.runner.start(new Set(scope)).finally(() => {
       rt.releaseLock?.();
@@ -271,6 +282,7 @@ interface ApiRoute {
 // Server
 // ---------------------------------------------------------------------------
 
+/** Start the hub or single-run server; returns once listening has begun. */
 export function startServer(opts: ServeOptions): void {
   const basePort = opts.port ?? 8787;
   singleRunMode = Boolean(opts.file);
@@ -543,6 +555,8 @@ export function startServer(opts: ServeOptions): void {
     try {
       const url = new URL(req.url ?? '/', 'http://localhost');
       const path = url.pathname;
+      // A localhost hub is still reachable from any page in the browser, so
+      // reject cross-origin requests before they can mutate a run.
       const originError = checkOrigin(req, listeningPort);
       if (originError) {
         json(res, 403, { error: originError });
@@ -574,6 +588,7 @@ export function startServer(opts: ServeOptions): void {
   // Per-run routes: /api/runs/:runId/<rest>
   // -------------------------------------------------------------------------
 
+  /** Dispatch a /api/runs/:runId sub-route against a resolved runtime. */
   async function handleRunRoute(
     req: IncomingMessage,
     res: ServerResponse,
@@ -598,6 +613,8 @@ export function startServer(opts: ServeOptions): void {
         return true;
       }
     };
+    // Mutations that would race the runner are refused; the caller supplies the
+    // action-specific message.
     const guardIdle = (message: string): boolean => {
       if (!rt.runner?.isRunning) return false;
       json(res, 409, { error: message });
@@ -660,6 +677,8 @@ export function startServer(opts: ServeOptions): void {
       json(res, 200, definitionPayload(currentRun(rt)));
     };
 
+    // Incremental event tail: `since` is the last seq the client saw, and the
+    // response is capped so a long-idle page cannot pull the whole history.
     const getEvents = (): void => {
       const since = Number(url.searchParams.get('since') ?? 0);
       const events = readEventTail(file).filter((e) => e.seq > since);
@@ -826,6 +845,8 @@ export function startServer(opts: ServeOptions): void {
         logEvent(run, 'edit', taskId, 'updated from viewer');
         return { id: taskId, status: task.status, display: deriveStatus(run, task) };
       };
+      // While a run is active the authoritative state is the in-memory run;
+      // editing on disk would be overwritten by the next runner persist.
       if (active && rt.runner) {
         json(res, 200, apply(rt.runner.state));
         saveRun(rt.runner.state, file);
@@ -885,6 +906,7 @@ export function startServer(opts: ServeOptions): void {
     if (opts.open) openBrowser(`http://localhost:${listeningPort}`);
     if (opts.autoResume) void autoResumeAll(opts.killOrphansOnResume ?? false);
   });
+  // Walk the port up a few times so two hubs started together do not collide.
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE' && attempts < 10) {
       console.log(`port ${port} busy, trying ${port + 1}...`);
@@ -898,6 +920,8 @@ export function startServer(opts: ServeOptions): void {
   });
   server.listen(port, '127.0.0.1');
 
+  // Stop runners and release their locks before exiting so the run files are
+  // left in a resumable state.
   const shutdown = (): void => {
     void (async () => {
       for (const rt of runtimes.values()) {
@@ -913,6 +937,8 @@ export function startServer(opts: ServeOptions): void {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
+  // After a restart, resume every project that still has ready work. Foreign
+  // locks are respected: another live process owns that run, not us.
   async function autoResumeAll(killOrphansOnResume: boolean): Promise<void> {
     for (const dir of projectDirs()) {
       const active = activeRunFile(dir);
@@ -944,6 +970,7 @@ export function startServer(opts: ServeOptions): void {
   }
 }
 
+/** Ask every active runner to stop; used by in-process callers, not the CLI. */
 export function stopServer(): void {
   void (async () => {
     for (const rt of runtimes.values()) await rt.runner?.stop();

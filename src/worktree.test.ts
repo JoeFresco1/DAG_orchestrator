@@ -1,3 +1,6 @@
+// Worktree isolation tests: snapshotting a dirty tree, creating and
+// re-attaching integration/task worktrees, hook hygiene, branch naming, and
+// merge-conflict detection.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
@@ -102,6 +105,7 @@ describe('worktree isolation', () => {
     try {
       const integration = ensureIntegrationWorktree(repo, 'run_hooks');
       const task = createTaskWorktree(repo, 'run_hooks', 'task_h', integration.branch);
+      // Hooks that always fail: committing agent work must bypass them.
       mkdirSync(join(repo, '.git', 'hooks'), { recursive: true });
       writeFileSync(join(repo, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\nexit 1\n');
       writeFileSync(join(repo, '.git', 'hooks', 'commit-msg'), '#!/bin/sh\nexit 1\n');

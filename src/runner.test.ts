@@ -1,3 +1,5 @@
+// Runner watchdog and failure tests: hard timeouts, silence stalls, retries,
+// harness fallback, exit policies, kill/stop semantics, and slot throughput.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -168,6 +170,8 @@ describe('watchdog and failures', () => {
   });
 
   it('applies the exit policy the same way for real and mocked executors', async () => {
+    // One-shot run through the real shell executor with merged settings, so the
+    // policy is exercised end to end rather than against a mock.
     const real = (cmd: string, settings: Partial<Run['settings']>): Promise<Run> => {
       const { run, a } = make(['a']) as { run: Run; a: Task };
       run.tasks[a.id].cmd = cmd;
@@ -175,6 +179,7 @@ describe('watchdog and failures', () => {
       Object.assign(run.settings, settings);
       return new DagRunner(run, { executor: shellExecutor() }).start().then(() => run);
     };
+    // A tiny node one-liner that exits with the given code.
     const exiting = (code: number): string =>
       `"${process.execPath}" -e "process.exit(${code})"`;
 
@@ -212,6 +217,7 @@ describe('watchdog and failures', () => {
   it('does not land work whose exit policy rejected it', async () => {
     const repo = gitRepo();
     try {
+      // Seed a committed repo so the runner can create a task worktree.
       mkdirSync(join(repo, 'sub'), { recursive: true });
       writeFileSync(join(repo, 'tracked.txt'), 'base\n');
       git(repo, ['add', '-A']);

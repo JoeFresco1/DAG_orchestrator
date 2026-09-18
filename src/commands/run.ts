@@ -177,6 +177,8 @@ export async function runCmd(argv: string[]): Promise<void> {
     process.exitCode = 1;
     return;
   }
+  // Exit non-zero when the run did not fully converge, so schedulers and CI
+  // treat a failed or unfinished run as a failure.
   const review = summary.finalReview;
   if (review && review.verdict !== 'pass' && review.verdict !== 'skipped') {
     process.exitCode = 1;

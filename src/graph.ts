@@ -1,3 +1,7 @@
+// Dependency-graph queries over a run: readiness, transitive blocking, depth
+// and topological order, cycle detection, and the upstream-evidence text used
+// by the {deps} / {depsAll} / {depsFile} tokens. Pure functions, no I/O.
+
 import type {
   DagConvergence,
   DisplayStatus,
@@ -7,10 +11,12 @@ import type {
   TerminalStatus,
 } from './types.js';
 
+/** All tasks in the run; the store is keyed by id, order is insertion order. */
 export function taskList(run: Run): Task[] {
   return Object.values(run.tasks);
 }
 
+/** Terminal statuses never change again, so downstream work can be judged. */
 export function isTerminal(status: TaskStatus): status is TerminalStatus {
   return status === 'completed' || status === 'failed' || status === 'skipped';
 }
@@ -23,10 +29,12 @@ export function depUnusable(task: Task, tasks: Record<string, Task>): boolean {
   });
 }
 
+/** Direct dependencies only; a missing dep is simply not completed. */
 export function depsMet(task: Task, tasks: Record<string, Task>): boolean {
   return task.deps.every((d) => tasks[d]?.status === 'completed');
 }
 
+/** `approved !== true` means null/false/unapproved all count as closed. */
 export function gateBlocks(task: Task): boolean {
   return task.gate !== null && task.gate.approved !== true;
 }
@@ -69,6 +77,7 @@ export function transitiveBlocked(
   return blocked;
 }
 
+/** Non-terminal tasks that can never run because an ancestor failed/skipped. */
 export function getBlocked(run: Run): Task[] {
   const memo = new Map<string, boolean>();
   return taskList(run)
@@ -106,6 +115,8 @@ export function transitiveDepIds(run: Run, id: string): string[] {
 // inputs changed when an upstream task is repaired or retried.
 export function transitiveDependentIds(run: Run, id: string): string[] {
   const seen = new Set<string>([id]);
+  // Fixed-point expansion: each pass can discover new dependents of the ones
+  // just added, so keep going until a full pass changes nothing.
   for (let pass = 0; pass < Object.keys(run.tasks).length; pass += 1) {
     let grew = false;
     for (const task of Object.values(run.tasks)) {
@@ -132,6 +143,8 @@ export function describeDeps(
 ): string {
   const perDep = opts.perDep ?? 1200;
   const limit = opts.limit ?? 20000;
+  // Collapse whitespace and cap length: dependency output can be huge, and
+  // these strings are inlined into prompts.
   const oneLine = (s: string, n: number): string => {
     const flat = s.replace(/\s+/g, ' ').trim();
     return flat.length > n ? `${flat.slice(0, n)}…` : flat;
@@ -201,6 +214,7 @@ export function describeStuck(run: Run): StuckReason[] {
   return out;
 }
 
+/** Run-level state for the UI: empty, all-done, or still active. */
 export function evaluateConvergence(run: Run): DagConvergence {
   const all = taskList(run);
   if (all.length === 0) return 'empty';
@@ -211,6 +225,8 @@ export function evaluateConvergence(run: Run): DagConvergence {
 // Depth for layered rendering: longest chain from a root.
 export function computeDepths(run: Run): Map<string, number> {
   const depths = new Map<string, number>();
+  // `trail` is the current recursion path; seeing an id twice is a back edge,
+  // i.e. a cycle. Memoized depths make this linear in the shared prefixes.
   const visit = (id: string, trail: string[]): number => {
     const cached = depths.get(id);
     if (cached !== undefined) return cached;
@@ -228,6 +244,7 @@ export function computeDepths(run: Run): Map<string, number> {
   return depths;
 }
 
+/** Throw if the graph has a cycle; delegates to the depth computation. */
 export function assertNoCycle(run: Run): void {
   computeDepths(run); // throws on cycle
 }
@@ -240,6 +257,7 @@ export function topoSort(run: Run): Task[] {
   );
 }
 
+/** Human-readable status block for `dag status`: counts, ready, and why stuck. */
 export function summarize(run: Run): string {
   const counts = new Map<TaskStatus, number>();
   for (const t of taskList(run)) counts.set(t.status, (counts.get(t.status) ?? 0) + 1);

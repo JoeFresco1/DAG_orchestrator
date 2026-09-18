@@ -141,6 +141,7 @@ export function listCmd(argv: string[]): void {
       failureKind: t.failureKind,
     }))
     .filter((r) => !only || r.display === only);
+  // --limit 0 (the default) means no cap; a positive value truncates the list.
   const shown = limit > 0 ? rows.slice(0, limit) : rows;
   emit(argv, shown, () =>
     shown
@@ -359,6 +360,7 @@ export function gcCmd(argv: string[]): void {
     // no logs dir yet
   }
   try {
+    // The event log rotates to a single `.1` file; older history is discarded.
     const rotated = `${paths.events}.1`;
     if (statSync(rotated).mtimeMs < cutoff) {
       rmSync(rotated, { force: true });
@@ -401,6 +403,8 @@ export function approveCmd(argv: string[], cmd: string): void {
 export function dotCmd(argv: string[]): void {
   const file = flag(argv, 'file') ?? 'dag.run.json';
   const run = loadRun(file);
+  // Graphviz IDs come from untrusted task titles, so quotes are neutralized
+  // rather than escaped.
   const lines = [`digraph "${run.id}" {`, `  label="${run.objective.replace(/"/g, "'")}";`];
   for (const t of Object.values(run.tasks)) {
     const display = deriveStatus(run, t);

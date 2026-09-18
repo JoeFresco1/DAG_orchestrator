@@ -59,6 +59,8 @@ export function serversCmd(argv: string[]): void {
     for (let i = 0; i < argv.length; i++) {
       if (argv[i] === '--dir' && argv[i + 1]) dirs.push(argv[i + 1]);
     }
+    // --all stops everything recorded; --dir resolves each folder to its
+    // project entry so we stop the right run file.
     const targets = has(argv, 'all')
       ? pruneServers().map((s) => ({ name: s.name, file: s.file }))
       : dirs.map((d) => {

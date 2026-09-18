@@ -1,3 +1,5 @@
+// Graph scheduling and project-registry tests: ready/blocked computation, topo
+// order, scoped runs, project identity, job ordering, and time parsing.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync } from 'node:fs';
@@ -94,6 +96,7 @@ describe('scheduling', () => {
 describe('projects and scheduling', () => {
   it('treats the same run file as one project however the path is spelled', () => {
     const dir = tempDir();
+    // Point the registry at a throwaway file so the user's projects are safe.
     process.env.DAG_REGISTRY = join(dir, 'projects.json');
     try {
       const file = join(dir, 'my-app', 'dag.run.json');

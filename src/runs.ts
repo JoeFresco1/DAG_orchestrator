@@ -1,3 +1,5 @@
+// Run history on disk: archive the active run, list active plus archived runs,
+// and resolve a run id back to its file. The layout is documented just below.
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { loadRun, runPaths, saveRun } from './store.js';
@@ -11,6 +13,7 @@ import type { Run } from './types.js';
 //   <project>/dag.runs/<runId>/dag.run.json  archived runs (same shape)
 //   <project>/dag.runs/<runId>/dag.run.d/
 
+/** Where a run lives right now: its file, sidecar dir, and whether it is archive history. */
 export interface RunLocation {
   runId: string;
   file: string;
@@ -36,6 +39,8 @@ export function archiveDir(projectDir: string, runId: string): string {
   return join(runsRoot(projectDir), runId);
 }
 
+// Move the active run aside (run file, sidecar dir, backup and lock) under
+// dag.runs/<runId>. Idempotent: an existing archive is kept and reported.
 export function archiveRun(projectDir: string, file: string): string | null {
   if (!existsSync(file)) return null;
   const paths = runPaths(file);
@@ -71,11 +76,14 @@ export interface RunSummaryRow {
   updatedAt: string;
 }
 
+/** Read a run file into a compact row for listings; null when unreadable. */
 export function summarizeRunFile(file: string, archived: boolean): RunSummaryRow | null {
   try {
     const run: Run = loadRun(file);
     const counts: Record<string, number> = {};
     for (const t of Object.values(run.tasks)) counts[t.status] = (counts[t.status] ?? 0) + 1;
+    // "settled" means no task can still change: every task is in a terminal
+    // state, so the run has converged.
     const settled = Object.values(run.tasks).every(
       (t) => t.status === 'completed' || t.status === 'failed' || t.status === 'skipped',
     );
@@ -124,6 +132,8 @@ export function listRuns(projectDir: string): RunSummaryRow[] {
   return rows;
 }
 
+// Locate a run by id: the active slot first, then the archive. An unreadable
+// active file falls through instead of failing the lookup.
 export function findRun(projectDir: string, runId: string): RunLocation | null {
   const active = activeRunFile(projectDir);
   if (existsSync(active)) {

@@ -1,3 +1,6 @@
+// Storage and runner-policy tests: the definition/state file split, legacy-run
+// migration, crash recovery and locking, skip/gate/budget policies, and
+// settings validation.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -50,6 +53,8 @@ describe('dag edits', () => {
     assert.deepEqual(run.tasks[b.id].deps, []);
   });
 });
+// Files that are atomic, migratable, recoverable after a crash, and never
+// silently lose state; plus the non-crash policy paths (skip, gates, budget).
 describe('hardening', () => {
   it('persists definition and state separately, atomically, with a backup', () => {
     const dir = tempDir();
@@ -75,6 +80,8 @@ describe('hardening', () => {
   it('migrates a legacy single-file run without losing status or events', () => {
     const dir = tempDir();
     const file = join(dir, 'legacy.json');
+    // A pre-split run file: definition, state and events all in one JSON blob,
+    // the way an older version wrote it.
     const legacy = {
       id: 'run_legacy',
       objective: 'old',
@@ -279,6 +286,8 @@ describe('hardening', () => {
     const file = join(dir, 'run.json');
     saveRun(newRun('lock'), file);
     const paths = runPaths(file);
+    // A real live process to point the lock at: a lock owned by a live pid must
+    // be refused, while one owned by a dead pid is stolen.
     const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 15000)'], { stdio: 'ignore' });
     try {
       writeFileSync(
@@ -300,6 +309,8 @@ describe('hardening', () => {
     }
   });
 });
+// Repair invalidates already-completed descendants, and an approval must be
+// re-earned whenever the underlying output changes.
 describe('stale work and approvals', () => {
   it('redoes completed descendants when an upstream task is repaired', async () => {
     const run = newRun('invalidate');

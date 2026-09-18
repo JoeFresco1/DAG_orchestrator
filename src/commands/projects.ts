@@ -47,6 +47,8 @@ export async function projectsCmd(argv: string[]): Promise<void> {
     // Opens the project page in the hub, starting one if needed.
     const target = flag(argv, 'id') ?? argv[1];
     if (!target) throw new Error('usage: dag projects open <id|name> [--dir <folder>]');
+    // Resolve by id/name first; otherwise treat the argument (or --dir) as a
+    // path to register on the fly.
     const entry = findProject(target) ?? addProject(flag(argv, 'dir') ?? target);
     const { launchProject, openBrowser } = await import('../launcher.js');
     const launched = await launchProject(entry, { open: false });
