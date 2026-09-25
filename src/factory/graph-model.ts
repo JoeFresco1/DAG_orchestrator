@@ -1,7 +1,10 @@
 import { isFactoryEntityId, type FactoryEntityId, type FactoryEntityKind } from './contracts.js';
 
 export type RequirementEntityKind = 'goal' | 'spec' | 'requirement' | 'acceptance_criterion';
-export type CodeEntityKind = 'module' | 'file' | 'symbol' | 'contract' | 'data' | 'execution_path';
+export type CodeEntityKind =
+  | 'module' | 'file' | 'symbol' | 'function' | 'class' | 'api' | 'contract'
+  | 'data' | 'schema' | 'database_model' | 'queue' | 'event' | 'test'
+  | 'configuration' | 'external_service' | 'execution_path';
 export type ExecutionEntityKind = 'implementation_task' | 'review_task' | 'verification_task' | 'remediation_task';
 export type DefectEntityKind = 'observation' | 'hypothesis' | 'defect' | 'dispute' | 'root_cause' | 'remediation';
 export type FactoryGraphEntityId<K extends FactoryEntityKind> = `${K}:v1:${string}`;
@@ -12,6 +15,8 @@ interface EntityBase<T extends string> {
   title: string;
   description?: string;
   evidenceIds?: string[];
+  sourcePath?: string;
+  sourceHash?: string;
 }
 
 export type RequirementEntity = EntityBase<RequirementEntityKind>;
@@ -27,7 +32,10 @@ export interface FactoryEntityByGraph {
 }
 
 export type RequirementEdgeType = 'parent_of' | 'specifies' | 'decomposes_to' | 'accepts';
-export type CodeEdgeType = 'contains' | 'declares' | 'uses' | 'calls' | 'tests';
+export type CodeEdgeType =
+  | 'contains' | 'declares' | 'imports' | 'uses' | 'calls' | 'inherits'
+  | 'implements' | 'reads' | 'writes' | 'publishes' | 'subscribes'
+  | 'serializes' | 'deserializes' | 'tests';
 export type ExecutionEdgeType = 'depends_on' | 'verifies' | 'reviews' | 'remediates';
 export type DefectEdgeType = 'corroborates' | 'supports' | 'explains' | 'disputes' | 'remediates';
 
@@ -78,11 +86,12 @@ export type FactoryCrossGraphEdge =
   | FactoryEdge<'produced', FactoryGraphEntityId<'execution'>, FactoryGraphEntityId<'defect'>> // execution task -> observation
   | FactoryEdge<'supports', FactoryGraphEntityId<'defect'>, FactoryGraphEntityId<'defect'>> // observation -> hypothesis or defect
   | FactoryEdge<'explained_by', FactoryGraphEntityId<'defect'>, FactoryGraphEntityId<'defect'>> // defect -> root cause
-  | FactoryEdge<'repaired_by', FactoryGraphEntityId<'defect'>, FactoryGraphEntityId<'execution'>>; // root cause -> remediation task
+  | FactoryEdge<'repaired_by', FactoryGraphEntityId<'defect'>, FactoryGraphEntityId<'execution'>> // root cause -> remediation task
+  | FactoryEdge<'involves', FactoryGraphEntityId<'code'>, FactoryGraphEntityId<'defect'>>; // code entity -> finding/defect
 
 const ENTITY_KINDS: Record<FactoryEntityKind, readonly string[]> = {
   requirement: ['goal', 'spec', 'requirement', 'acceptance_criterion'],
-  code: ['module', 'file', 'symbol', 'contract', 'data', 'execution_path'],
+  code: ['module', 'file', 'symbol', 'function', 'class', 'api', 'contract', 'data', 'schema', 'database_model', 'queue', 'event', 'test', 'configuration', 'external_service', 'execution_path'],
   execution: ['implementation_task', 'review_task', 'verification_task', 'remediation_task'],
   defect: ['observation', 'hypothesis', 'defect', 'dispute', 'root_cause', 'remediation'],
 };
@@ -95,11 +104,20 @@ const INTERNAL_EDGE_RULES: Record<FactoryEntityKind, Record<string, [string[], s
     accepts: [['acceptance_criterion'], ['requirement', 'code', 'execution_path']],
   },
   code: {
-    contains: [['module', 'file'], ['module', 'file', 'symbol', 'contract', 'data', 'execution_path']],
-    declares: [['file', 'module'], ['symbol', 'contract', 'data']],
-    uses: [['symbol', 'execution_path'], ['symbol', 'contract', 'data']],
-    calls: [['symbol'], ['symbol']],
-    tests: [['symbol', 'contract', 'execution_path'], ['file', 'symbol']],
+    contains: [['module', 'file'], ['module', 'file', 'symbol', 'function', 'class', 'api', 'contract', 'data', 'schema', 'database_model', 'queue', 'event', 'test', 'configuration', 'external_service', 'execution_path']],
+    declares: [['file', 'module', 'class', 'symbol', 'function', 'contract'], ['symbol', 'function', 'class', 'api', 'contract', 'data', 'schema', 'database_model', 'queue', 'event', 'configuration', 'external_service']],
+    imports: [['file'], ['file']],
+    uses: [['symbol', 'function', 'class', 'contract', 'execution_path'], ['symbol', 'function', 'class', 'api', 'contract', 'data', 'schema', 'database_model', 'queue', 'event', 'external_service']],
+    calls: [['symbol', 'function'], ['symbol', 'function', 'class']],
+    inherits: [['class'], ['class']],
+    implements: [['class'], ['class', 'contract']],
+    reads: [['symbol', 'function'], ['data', 'schema', 'database_model', 'configuration']],
+    writes: [['symbol', 'function'], ['data', 'schema', 'database_model']],
+    publishes: [['symbol', 'function'], ['event', 'queue']],
+    subscribes: [['symbol', 'function'], ['event', 'queue']],
+    serializes: [['symbol', 'function'], ['data', 'schema', 'api']],
+    deserializes: [['symbol', 'function'], ['data', 'schema', 'api']],
+    tests: [['file', 'symbol', 'function', 'class', 'contract', 'execution_path'], ['file', 'symbol', 'function', 'class']],
   },
   execution: {
     depends_on: [['implementation_task', 'review_task', 'verification_task', 'remediation_task'], ['implementation_task', 'review_task', 'verification_task', 'remediation_task']],
@@ -123,6 +141,7 @@ const CROSS_EDGE_RULES: Record<FactoryCrossGraphEdge['type'], [FactoryEntityKind
   supports: ['defect', ['observation'], 'defect', ['hypothesis', 'defect']],
   explained_by: ['defect', ['defect'], 'defect', ['root_cause']],
   repaired_by: ['defect', ['root_cause'], 'execution', ['remediation_task']],
+  involves: ['code', ['module', 'file', 'symbol', 'function', 'class', 'api', 'contract', 'data', 'schema', 'database_model', 'queue', 'event', 'execution_path'], 'defect', ['observation', 'hypothesis', 'defect', 'root_cause']],
 };
 
 export function createFactoryGraphModel(): FactoryGraphModel {
