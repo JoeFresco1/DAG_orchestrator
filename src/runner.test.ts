@@ -2,7 +2,8 @@
 // harness fallback, exit policies, kill/stop semantics, and slot throughput.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   addTask,
@@ -286,18 +287,53 @@ describe('stop', () => {
   });
 
   it('stops a real process tree', async () => {
-    const { run, a } = make(['a']) as { run: Run; a: Task };
-    run.tasks[a.id].timeoutMs = 0;
-    run.tasks[a.id].silenceMs = 0;
-    run.tasks[a.id].cmd = `"${process.execPath}" -e "setTimeout(()=>{},60000)"`;
-    const runner = new DagRunner(run, { executor: shellExecutor(), stopGraceMs: 3000 });
-    void runner.start();
-    while (run.tasks[a.id].status !== 'running') await sleep(10);
-    await sleep(150); // let the child actually spawn
-    const t0 = Date.now();
-    await runner.stop();
-    assert.equal(run.tasks[a.id].status, 'pending');
-    assert.ok(Date.now() - t0 < 3000, 'stop should not wait for the full grace when the kill works');
+    const dir = tempDir();
+    const pidFile = join(dir, 'grandchild.pid');
+    let childPid: number | null = null;
+    try {
+      const { run, a } = make(['a']) as { run: Run; a: Task };
+      run.tasks[a.id].timeoutMs = 0;
+      run.tasks[a.id].silenceMs = 0;
+      const script =
+        "const { spawn } = require('node:child_process'); const fs = require('node:fs'); const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { windowsHide: true }); fs.writeFileSync(process.argv[1], String(child.pid)); setTimeout(() => {}, 60000);";
+      run.tasks[a.id].cmd = `"${process.execPath}" -e ${JSON.stringify(script)} ${JSON.stringify(pidFile)}`;
+      const runner = new DagRunner(run, { executor: shellExecutor(), stopGraceMs: 3000 });
+      void runner.start();
+      for (let i = 0; i < 500 && (!existsSync(pidFile) || run.tasks[a.id].status !== 'running'); i++) {
+        await sleep(10);
+      }
+      assert.equal(run.tasks[a.id].status, 'running', 'the process tree started');
+      assert.ok(existsSync(pidFile), 'the descendant started');
+      childPid = Number(readFileSync(pidFile, 'utf8'));
+      assert.ok(Number.isInteger(childPid) && childPid > 0, 'the descendant PID was recorded');
+      const t0 = Date.now();
+      await runner.stop();
+      assert.equal(run.tasks[a.id].status, 'pending');
+      assert.ok(Date.now() - t0 < 3000, 'stop should not wait for the full grace when the kill works');
+      for (let i = 0; i < 100; i++) {
+        try {
+          process.kill(childPid, 0);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'ESRCH') return;
+          throw err;
+        }
+        await sleep(10);
+      }
+      assert.fail(`descendant process ${childPid} survived stop`);
+    } finally {
+      if (childPid !== null) {
+        if (process.platform === 'win32') {
+          spawnSync('taskkill', ['/pid', String(childPid), '/T', '/F'], { windowsHide: true });
+        } else {
+          try {
+            process.kill(childPid, 'SIGKILL');
+          } catch {
+            // already gone
+          }
+        }
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 describe('recovery', () => {
