@@ -180,14 +180,17 @@ export function stripAnsi(s: string): string {
 export function killTree(child: ChildProcess): void {
   if (child.pid) {
     if (process.platform === 'win32') {
-      spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
-      return;
-    }
-    try {
-      process.kill(-child.pid, 'SIGKILL'); // detached => own process group
-      return;
-    } catch {
-      // fall through to direct kill
+      const result = spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+        windowsHide: true,
+      });
+      if (result.status === 0) return;
+    } else {
+      try {
+        process.kill(-child.pid, 'SIGKILL'); // detached => own process group
+        return;
+      } catch {
+        // fall through to direct kill
+      }
     }
   }
   try {
