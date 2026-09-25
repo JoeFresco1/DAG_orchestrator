@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">DAG Orchestrator</title>
+  <desc id="desc">A dark banner showing connected task nodes flowing through plan, work, review, and merge.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#090d18"/>
+      <stop offset="0.55" stop-color="#11182a"/>
+      <stop offset="1" stop-color="#0b1320"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7c5cff"/>
+      <stop offset="1" stop-color="#2dd4bf"/>
+    </linearGradient>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1200" height="360" rx="28" fill="url(#bg)"/>
+  <circle cx="1045" cy="65" r="190" fill="#7c5cff" opacity=".06"/>
+  <circle cx="105" cy="340" r="220" fill="#2dd4bf" opacity=".05"/>
+
+  <g fill="none" stroke="#35405a" stroke-width="3">
+    <path d="M740 180H805L850 110H925"/>
+    <path d="M805 180H925"/>
+    <path d="M805 180L850 250H925"/>
+    <path d="M965 110L1040 180H1087"/>
+    <path d="M965 180H1087"/>
+    <path d="M965 250L1040 180"/>
+  </g>
+  <g filter="url(#glow)">
+    <circle cx="720" cy="180" r="20" fill="#7c5cff"/>
+    <circle cx="945" cy="110" r="20" fill="#2dd4bf"/>
+    <circle cx="945" cy="180" r="20" fill="#60a5fa"/>
+    <circle cx="945" cy="250" r="20" fill="#f59e0b"/>
+    <circle cx="1110" cy="180" r="23" fill="#34d399"/>
+  </g>
+  <g fill="#d7def0" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14" text-anchor="middle">
+    <text x="720" y="220">task</text>
+    <text x="945" y="72">plan</text>
+    <text x="945" y="222">review</text>
+    <text x="945" y="292">work</text>
+    <text x="1110" y="222">land</text>
+  </g>
+
+  <rect x="72" y="76" width="66" height="5" rx="2.5" fill="url(#accent)"/>
+  <text x="72" y="151" fill="#f8fafc" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="54" font-weight="700" letter-spacing="-2">DAG Orchestrator</text>
+  <text x="75" y="198" fill="#9aa7bd" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="22">Parallel coding agents. Explicit dependencies. Verified outcomes.</text>
+  <text x="75" y="254" fill="#697791" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16">plan  →  work  →  review  →  merge</text>
+  <rect x="72" y="286" width="256" height="34" rx="17" fill="#172238" stroke="#2b3a56"/>
+  <circle cx="94" cy="303" r="5" fill="#34d399"/>
+  <text x="110" y="309" fill="#b8c4d9" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="14">local-first · file-backed · observable</text>
+</svg>

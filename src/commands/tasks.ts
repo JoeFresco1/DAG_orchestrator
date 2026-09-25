@@ -107,7 +107,7 @@ export function editCmd(argv: string[]): void {
   }
   const task = editTask(run, id, patch);
   saveRun(run, file);
-  console.log(`${task.id} ${task.status} deps=[${task.deps.join(',')}] attempts=${task.attempts}/${task.maxAttempts}`);
+  console.log(`${task.id} ${task.status} deps=[${task.deps.join(',')}] attempts=${task.attempts} total, cycle=${task.attemptsInCycle}/${task.maxAttempts}`);
 }
 
 // `rm` deletes a node and strips it from the deps of every other task.
@@ -137,6 +137,7 @@ export function listCmd(argv: string[]): void {
       display: deriveStatus(run, t),
       deps: t.deps,
       attempts: t.attempts,
+      attemptsInCycle: t.attemptsInCycle,
       maxAttempts: t.maxAttempts,
       failureKind: t.failureKind,
     }))
@@ -147,7 +148,7 @@ export function listCmd(argv: string[]): void {
     shown
       .map(
         (r) =>
-          `${r.id} [${r.display}] deps=[${r.deps.join(',')}] attempts=${r.attempts}/${r.maxAttempts} ${r.title}`,
+          `${r.id} [${r.display}] deps=[${r.deps.join(',')}] attempts=${r.attempts} total, cycle=${r.attemptsInCycle}/${r.maxAttempts} ${r.title}`,
       )
       .concat(limit > 0 && rows.length > shown.length ? ['… more (use --limit 0 for all)'] : [])
       .join('\n'),

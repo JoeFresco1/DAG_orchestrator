@@ -77,6 +77,7 @@ export function summaryPayload(run: Run): Record<string, unknown> {
       status: t.status,
       display,
       attempts: t.attempts,
+      attemptsInCycle: t.attemptsInCycle,
       maxAttempts: t.maxAttempts,
       failureKind: t.failureKind,
       exitCode: t.exitCode,

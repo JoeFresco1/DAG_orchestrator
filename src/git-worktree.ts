@@ -131,22 +131,16 @@ export function snapshotCommit(repoDir: string, excludes?: SnapshotExcludes): st
     }
     // Add from the repo root, so a run file in a subdirectory still snapshots
     // the whole tree rather than only that subdirectory.
-    const add = git(
-      repoDir,
-      [
-        'add',
-        '-A',
-        '--',
-        '.',
-        `:(exclude)${skip.dir}`,
-        `:(exclude)${skip.file}`,
-        `:(exclude)${skip.file}.bak`,
-        `:(exclude)${skip.file}.lock`,
-        `:(exclude)${skip.archived}`,
-      ],
-      env,
-    );
+    // Explicit negative pathspecs make `git add` fail when those paths are also
+    // ignored by .gitignore. Stage normally in the throwaway index, then restore
+    // the run artifacts to their HEAD state (or remove them for an unborn HEAD).
+    const add = git(repoDir, ['add', '-A', '--', '.'], env);
     if (add.code !== 0) throw new Error(`git add failed: ${add.stderr}`);
+    const artifacts = [skip.dir, skip.file, `${skip.file}.bak`, `${skip.file}.lock`, skip.archived];
+    const exclude = head
+      ? git(repoDir, ['reset', '--quiet', head, '--', ...artifacts], env)
+      : git(repoDir, ['rm', '-r', '--cached', '--ignore-unmatch', '--', ...artifacts], env);
+    if (exclude.code !== 0) throw new Error(`git snapshot exclusion failed: ${exclude.stderr}`);
     const tree = git(repoDir, ['write-tree'], env).stdout;
     const args = [...IDENTITY, 'commit-tree', tree];
     if (head) args.push('-p', head);

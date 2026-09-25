@@ -449,9 +449,11 @@ export class DagRunner {
   private stopping = false;
   private active = false;
   // Coalesced-persist state: `dirty` marks a write pending, `flushTimer` holds
-  // the scheduled flush while one is pending.
+  // the scheduled flush while one is pending, and `persistWarned` keeps a
+  // failing write to one warning per outage instead of one per retry.
   private dirty = false;
   private flushTimer: NodeJS.Timeout | null = null;
+  private persistWarned = false;
   private loopPromise: Promise<void> | null = null;
   private summary: RunSummary | null = null;
   // Rejected by stop() to release tasks whose executor ignores the kill.
@@ -720,10 +722,28 @@ export class DagRunner {
   }
 
   // Persists the current state now; the coalesced form is `persist`.
+  //
+  // Called from a timer and from every transition, so a write failure must not
+  // escape: an event-loop callback that throws kills the process and takes every
+  // live worker with it. The failure is logged once per outage and a retry is
+  // armed — from a direct call too, since the next transition on a long task may
+  // be minutes away. In-memory state stays authoritative while the run is live,
+  // so a transiently unwritable file loses nothing.
   private flush(): void {
     this.dirty = false;
     this.state.updatedAt = nowIso();
-    this.opts.persist?.(this.state);
+    try {
+      this.opts.persist?.(this.state);
+      this.persistWarned = false;
+    } catch (err) {
+      this.dirty = true;
+      if (!this.persistWarned) {
+        this.persistWarned = true;
+        const message = err instanceof Error ? err.message : String(err);
+        this.log('note', null, `warning: could not persist run state, retrying — ${message}`);
+      }
+      this.persist();
+    }
   }
 
   // Retry delay that also wakes early when stop() is called.
@@ -1992,20 +2012,28 @@ export class DagRunner {
       const saved = commitAll(path, `dag: WIP ${taskId} ${task?.title ?? ''} (${why})`);
       if (saved.commit && task) {
         task.commit = saved.commit;
-        // Park the commit on its own ref: the next attempt force-resets the
-        // task branch, which would otherwise leave this work unreachable.
+        // Park every salvage on its own ref: the next attempt force-resets the
+        // task branch, and a later partial attempt must not replace an earlier
+        // useful checkpoint.
         if (this.repoDir && this.state.id) {
+          const salvageRef = `refs/dag-salvage/${this.state.id}-${taskId}-attempt-${task.attempts}`;
           git(this.repoDir, [
             'update-ref',
-            `refs/dag-salvage/${this.state.id}-${taskId}`,
+            salvageRef,
             saved.commit,
           ]);
+          this.log(
+            'note',
+            taskId,
+            `partial work salvaged at ${saved.commit.slice(0, 8)} (${saved.files} file(s), not merged; ${salvageRef})`,
+          );
+        } else {
+          this.log(
+            'note',
+            taskId,
+            `partial work salvaged to ${task.branch} @ ${saved.commit.slice(0, 8)} (${saved.files} file(s), not merged)`,
+          );
         }
-        this.log(
-          'note',
-          taskId,
-          `partial work salvaged to ${task.branch} @ ${saved.commit.slice(0, 8)} (${saved.files} file(s), not merged; also refs/dag-salvage/${this.state.id}-${taskId})`,
-        );
       }
     } catch {
       // best effort: the worktree is still dropped afterwards
@@ -2102,7 +2130,7 @@ export class DagRunner {
     }
     const { chained, planFile, depsContext, specOverride } = this.attemptContext(
       task,
-      task.attempts,
+      task.attemptsInCycle,
     );
 
     try {
@@ -2113,11 +2141,11 @@ export class DagRunner {
         task.status = 'failed';
         this.salvageWorktree(task.id, 'setup failed');
         const budget = this.maxAttemptsFor(task);
-        const retryable = task.attempts < budget;
+        const retryable = task.attemptsInCycle < budget;
         if (retryable) {
           task.status = 'pending';
           task.failureKind = null;
-          this.log('task-retry', task.id, `worktree prepare failed; attempt ${task.attempts}/${budget}`);
+          this.log('task-retry', task.id, `worktree prepare failed; cycle attempt ${task.attemptsInCycle}/${budget}`);
         } else if (!this.tryRepair(task, scope)) {
           this.notify('task-fail', task.id, 'worktree prepare failed');
         }
@@ -2204,6 +2232,7 @@ export class DagRunner {
 
     const attempt = task.attempts + 1;
     task.attempts = attempt;
+    task.attemptsInCycle += 1;
     this.attemptByTask.set(task.id, attempt);
     task.status = 'running';
     task.startedAt = nowIso();
@@ -2229,7 +2258,11 @@ export class DagRunner {
         task.reviewCmd ? `\n# review: ${task.reviewCmd}` : ''
       }\n`,
     );
-    this.log('task-start', task.id, `attempt ${attempt}/${this.maxAttemptsFor(task)}: ${task.title}`);
+    this.log(
+      'task-start',
+      task.id,
+      `attempt ${attempt} (cycle ${task.attemptsInCycle}/${this.maxAttemptsFor(task)}): ${task.title}`,
+    );
     this.persist();
     return token;
   }
@@ -2415,7 +2448,7 @@ export class DagRunner {
     // Everything except a deliberate stop or a missing command is retryable
     // while attempts remain. Stall and timeout included.
     const budget = this.maxAttemptsFor(task);
-    const retryable = reason !== 'manual' && task.attempts < budget;
+    const retryable = reason !== 'manual' && task.attemptsInCycle < budget;
     if (this.stopping) {
       task.status = 'pending';
       task.failureKind = 'killed';
@@ -2429,11 +2462,11 @@ export class DagRunner {
       this.log(
         'task-retry',
         task.id,
-        `attempt ${task.attempts}/${budget} failed (${reason}: ${truncate(message, 120)}); backing off`,
+        `attempt ${task.attempts} (cycle ${task.attemptsInCycle}/${budget}) failed (${reason}: ${truncate(message, 120)}); backing off`,
       );
       // Exponential backoff capped at 60s, jittered to 50-100% so retries from
       // parallel tasks do not resynchronize into a thundering herd.
-      const delay = Math.min(60_000, 1000 * 2 ** Math.max(0, task.attempts - 1));
+      const delay = Math.min(60_000, 1000 * 2 ** Math.max(0, task.attemptsInCycle - 1));
       await this.backoff(delay * (0.5 + Math.random() * 0.5));
     } else {
       task.status = 'failed';

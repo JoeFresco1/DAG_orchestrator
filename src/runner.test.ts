@@ -14,7 +14,7 @@ import {
   retryTask,
   saveRun,
 } from './store.js';
-import { transitiveBlocked } from './graph.js';
+import { describeStuck, transitiveBlocked } from './graph.js';
 import { DagRunner, shellExecutor, sleep } from './runner.js';
 import { parseHarnessChain } from './harness-chain.js';
 import { git } from './git-worktree.js';
@@ -85,6 +85,28 @@ describe('watchdog and failures', () => {
     assert.equal(run.tasks[a.id].attempts, 2);
     assert.equal(run.tasks[a.id].harness, 'codex');
     assert.ok(run.events.some((e) => /falling back to codex/.test(e.message ?? '')));
+  });
+
+  it('restarts a harness chain after an explicit retry cycle', async () => {
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    run.tasks[a.id].harnessChain = parseHarnessChain('opencode,codex');
+    const harnesses: (string | null)[] = [];
+    const execute = async (task: Task) => {
+      harnesses.push(task.harness);
+      return { output: 'ok', exitCode: 0 };
+    };
+    await new DagRunner(run, { executor: execute }).start();
+    retryTask(run, a.id);
+    await new DagRunner(run, { executor: execute }).start();
+    // Each preset runs plan + work; both retry cycles restart at candidate 1.
+    assert.deepEqual(harnesses, ['opencode', 'opencode', 'opencode', 'opencode']);
+    assert.equal(run.tasks[a.id].attempts, 2, 'lifetime attempt numbers remain unique');
+    assert.equal(run.tasks[a.id].attemptsInCycle, 1, 'new cycle has its own budget');
+  });
+
+  it('does not report a ready root task as stuck', () => {
+    const { run } = make(['a']) as { run: Run };
+    assert.deepEqual(describeStuck(run), []);
   });
 
   it('uses the run-level chain when the task has none', async () => {
@@ -352,5 +374,37 @@ describe('scheduling throughput', () => {
     );
     assert.equal(run.tasks[next.id].status, 'completed');
     assert.ok((startedAt.get(next.id) ?? 0) >= (startedAt.get(slow.id) ?? 0));
+  });
+});
+describe('persist resilience', () => {
+  it('keeps the run alive when a transient state write fails', async () => {
+    // The crash this guards: the runner persists from a timer, so an EPERM on
+    // the state rename used to throw out of the event loop and kill the whole
+    // process, taking every live worker with it.
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    let remainingFailures = 2;
+    let landed = 0;
+    const runner = new DagRunner(run, {
+      executor: async () => ({ output: 'ok', exitCode: 0 }),
+      persistThrottleMs: 5,
+      persist: () => {
+        if (remainingFailures > 0) {
+          remainingFailures--;
+          throw Object.assign(new Error('EPERM: operation not permitted, rename state.json'), {
+            code: 'EPERM',
+          });
+        }
+        landed++;
+      },
+    });
+    await runner.start();
+    assert.equal(run.tasks[a.id].status, 'completed');
+    // A failed direct flush arms a retry; give the retry window time to land.
+    for (let i = 0; i < 100 && landed === 0; i++) await sleep(10);
+    assert.ok(landed > 0, 'a later flush reached the store');
+    const warnings = run.events.filter(
+      (e) => e.type === 'note' && e.message.includes('could not persist run state'),
+    );
+    assert.equal(warnings.length, 1, 'one warning per outage, not one per retry');
   });
 });

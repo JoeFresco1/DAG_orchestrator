@@ -1023,6 +1023,12 @@ describe('reviewer agents and integration repair', () => {
       );
       const integration = git(repo, ['show', `dag/${run.id}:half-done.txt`]);
       assert.notEqual(integration.code, 0, 'salvage is never merged into the integration branch');
+      const salvage = git(repo, [
+        'show-ref',
+        '--verify',
+        `refs/dag-salvage/${run.id}-${a.id}-attempt-1`,
+      ]);
+      assert.equal(salvage.code, 0, 'salvage has a stable per-attempt ref');
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

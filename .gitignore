@@ -6,6 +6,7 @@ dist/
 *.run.json.bak
 *.run.json.lock
 *.d/
+dag.runs/
 dwt/
 
 # generated at build time from the vis-network dependency

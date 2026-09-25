@@ -84,6 +84,33 @@ export function runPaths(file: string): RunPaths {
 // Atomic write: tmp + fsync + rename, previous revision kept as .bak.
 // ---------------------------------------------------------------------------
 
+// Windows hands out transient handles on a file that a reader (antivirus,
+// search indexer, backup tool) currently has open, so the final rename can fail
+// with EPERM/EBUSY/EACCES even though the write itself is fine. Those are
+// retried with bounded backoff: a single flaky rename must not surface as a
+// lost write, and the runner persists from a timer, where an escaping error
+// kills the process and every live worker with it.
+const TRANSIENT_RENAME_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
+const RENAME_ATTEMPTS = 10;
+
+function isTransientRenameError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code;
+  return code !== undefined && TRANSIENT_RENAME_CODES.has(code);
+}
+
+// Synchronous on purpose: atomicWrite is only ever called from sync code.
+function renameWithRetry(from: string, to: string): void {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      renameSync(from, to);
+      return;
+    } catch (err) {
+      if (attempt >= RENAME_ATTEMPTS || !isTransientRenameError(err)) throw err;
+      syncSleep(Math.min(20 * 2 ** (attempt - 1), 500));
+    }
+  }
+}
+
 function atomicWrite(path: string, data: string): void {
   mkdirSync(dirname(path), { recursive: true });
   // Unique per writer: two processes writing the same file (the registry is
@@ -96,14 +123,24 @@ function atomicWrite(path: string, data: string): void {
   } finally {
     closeSync(fd);
   }
-  if (existsSync(path)) {
-    try {
-      renameSync(path, `${path}.bak`);
-    } catch {
-      // best effort; the rename below still overwrites
+  try {
+    if (existsSync(path)) {
+      try {
+        renameSync(path, `${path}.bak`);
+      } catch {
+        // best effort; the rename below still overwrites
+      }
     }
+    renameWithRetry(tmp, path);
+  } catch (err) {
+    // A write that never landed must not leave its temp file behind.
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // the stray temp file is cosmetic; the original error is what matters
+    }
+    throw err;
   }
-  renameSync(tmp, path);
 }
 
 // A torn or truncated primary file falls back to the .bak the last atomic
@@ -367,8 +404,9 @@ export function assertNoForeignLock(file: string, force = false): void {
   if (cur) throw new Error(lockedMessage(cur));
 }
 
-// Synchronous sleep for the lock loop: acquireLock is called from sync code,
-// and the wait only happens while another process is mid-write.
+// Synchronous sleep for the lock loop and for atomic-write rename retries:
+// both are called from sync code, and the wait only happens while another
+// process (or a reader holding a Windows handle) is briefly in the way.
 function syncSleep(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
@@ -528,6 +566,9 @@ function normalizeTask(raw: Partial<Task>, run: Run, index: number): Task {
     createdAt: raw.createdAt ?? now,
     seq: raw.seq ?? index + 1,
     attempts: raw.attempts ?? 0,
+    // Older state has only the lifetime counter. Preserve its retry behavior
+    // until the operator explicitly starts a fresh retry cycle.
+    attemptsInCycle: raw.attemptsInCycle ?? raw.attempts ?? 0,
     maxAttempts: raw.maxAttempts ?? run.settings.maxAttempts,
     timeoutMs: raw.timeoutMs ?? null,
     silenceMs: raw.silenceMs ?? null,
@@ -748,6 +789,7 @@ export function addTask(run: Run, input: AddTaskInput): Task {
     createdAt: new Date().toISOString(),
     seq,
     attempts: 0,
+    attemptsInCycle: 0,
     maxAttempts: input.maxAttempts ?? run.settings.maxAttempts,
     timeoutMs: input.timeoutMs ?? null,
     silenceMs: input.silenceMs ?? null,
@@ -884,6 +926,9 @@ export function retryTask(run: Run, id: string, cascade = false): string[] {
     t.lastOutputAt = null;
     t.lastOutput = null;
     t.pid = null;
+    // A manual retry is a new budget/fallback cycle, but `attempts` remains a
+    // lifetime sequence so old attempt logs are never overwritten.
+    t.attemptsInCycle = 0;
     // A manual retry is a fresh start: review and repair budgets reset, or a
     // task that exhausted its rounds could never run again.
     t.plan = null;
@@ -1132,6 +1177,8 @@ export function setTasks(run: Run, patch: TaskPatch, selector: TaskSelector): st
       task.maxAttempts,
       task.timeoutMs,
       task.silenceMs,
+      task.reviewers,
+      task.prepareCmd,
       task.harnessChain,
       task.covers,
     ]);
@@ -1161,6 +1208,8 @@ export function setTasks(run: Run, patch: TaskPatch, selector: TaskSelector): st
       task.maxAttempts,
       task.timeoutMs,
       task.silenceMs,
+      task.reviewers,
+      task.prepareCmd,
       task.harnessChain,
       task.covers,
     ]);

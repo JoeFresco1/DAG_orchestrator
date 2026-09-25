@@ -132,8 +132,12 @@ export interface Task {
   createdAt: string;
   // Monotonic creation order; deterministic tiebreak for launch order.
   seq: number;
-  // Command attempts used so far, and the budget. A harness chain can raise it.
+  // Lifetime command attempts (also the unique attempt-log number).
   attempts: number;
+  // Attempts used in the current retry cycle. An explicit `dag retry` resets
+  // this without reusing lifetime attempt/log numbers.
+  attemptsInCycle: number;
+  // Attempt budget for one retry cycle. A harness chain can raise it.
   maxAttempts: number;
   // 0 = no limit. Null = inherit run settings.
   timeoutMs: number | null;
@@ -418,6 +422,7 @@ export const DYNAMIC_FIELDS = [
   'status',
   'result',
   'attempts',
+  'attemptsInCycle',
   'startedAt',
   'finishedAt',
   'exitCode',

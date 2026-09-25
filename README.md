@@ -1,374 +1,369 @@
-# DAG Orchestrator
+<p align="center">
+  <img src="docs/readme-hero.svg" alt="DAG Orchestrator — parallel coding agents, explicit dependencies, verified outcomes" width="100%" />
+</p>
 
-A file-backed orchestrator for coding agents. You describe work as a dependency
-graph; it runs the graph with your agent CLI, in dependency order, in parallel,
-each task in its own git worktree — and it verifies the work before anything is
-merged.
+<p align="center">
+  <a href="https://github.com/JoeFresco1/DAG_orchestrator/actions/workflows/test.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/JoeFresco1/DAG_orchestrator/test.yml?branch=main&style=flat-square&label=build"></a>
+  <img alt="Node 20+" src="https://img.shields.io/badge/node-%E2%89%A520-339933?style=flat-square&logo=nodedotjs&logoColor=white">
+  <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.6-3178C6?style=flat-square&logo=typescript&logoColor=white">
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-7c5cff?style=flat-square"></a>
+</p>
 
-It is deliberately small and boring: no daemon, no database, no Electron, no
-server you have to keep alive. One run file per project, plain JSON you can
-read, and a viewer that serves from it.
+<p align="center">
+  Turn a coding plan into a dependency graph, run independent work in parallel,<br />
+  and make every task earn its way into the integration branch.
+</p>
 
-```
-        ┌─ plan ──────── planner agent (optional)
-task ───┼─ work ──────── your command / agent CLI
-        ├─ review ────── grounded reviewer (optional, verdict-gated)
-        └─ land ──────── commit + merge into dag/<runId>
-```
+---
 
-## Requirements
+DAG Orchestrator is a local-first runner for coding agents. Give it small,
+verifiable tasks; it handles dependency order, parallelism, retries, isolated
+git worktrees, reviewer verdicts, and a live browser view.
 
-- Node 20+ and git
-- An agent CLI for tasks to call — [opencode](https://opencode.ai) is what it
-  is built and tested against (`opencode run --auto ...`). Any non-interactive
-  command works, including plain shell commands.
+There is no database, hosted control plane, or always-on daemon. A run is a
+plain JSON file in your repository, with logs and state beside it.
 
-## Install
+## Why use it?
+
+| | Capability | What it gives you |
+|---|---|---|
+| ⚡ | **Dependency-aware parallelism** | Independent tasks run together; dependent tasks wait for real prerequisites. |
+| 🌿 | **One worktree per task** | Agents edit in isolation and successful work lands on a dedicated integration branch. |
+| ✅ | **Verification that gates progress** | Commands or reviewer agents must pass before a task completes. Missing verdicts fail closed. |
+| 🔁 | **Retries, repair, and fallback** | Retry failed subtrees, repair upstream work, or hand an attempt to another agent CLI. |
+| 👁️ | **A live local viewer** | Watch the graph, queue, logs, attempts, plans, and verdicts from one browser tab. |
+| 📁 | **Portable state** | The graph, history, transcripts, and archived runs live with the project—not in a black box. |
+
+## The 60-second tour
+
+### 1. Install
+
+You need **Node.js 20+**, **Git**, and at least one non-interactive agent CLI
+such as Codex, Claude Code, OpenCode, Cursor, or Gemini.
 
 ```bash
 git clone https://github.com/JoeFresco1/DAG_orchestrator.git
 cd DAG_orchestrator
 pnpm install
-pnpm build          # compiles to dist/ and vendors the viewer bundle
-npm link            # optional: puts `dag` on your PATH
+pnpm build
+npm link
 ```
 
-Without `npm link`, use `node dist/cli.js <command>` instead of `dag`.
+`npm link` makes the `dag` command available globally. You can instead run
+`node dist/cli.js <command>` from this repository.
 
-## Quickstart
+### 2. Describe the graph
+
+Run these commands inside the project you want the agents to work on:
 
 ```bash
-cd ~/my-project
-dag init --objective "ship the capture pipeline"
-dag settings --worktree task --concurrency 3 \
-  --model opencode-go/your-model --variant xhigh \
-  --notify "curl -s -d \"\$DAG_EVENT \$DAG_TASK\" https://your-hook"
+dag init --objective "Ship the import pipeline"
+dag settings --worktree task --concurrency 3
 
-# tasks are self-contained: inputs, outputs, acceptance
-dag add --title "Add the parser" \
-  --spec "Inputs: docs/TECH_SPEC.md §2. Outputs: src/parse.ts. Acceptance: pnpm test parse." \
-  --cmd "opencode run --auto -m {model} --variant {variant} Do this task: {spec}" \
-  --plan-cmd "opencode run --auto -m {model} --variant {variant} --agent plan Plan it: {spec}" \
-  --review-cmd "opencode run --auto -m {model} --variant {variant} Verify the acceptance criterion against the real files. End with VERDICT: PASS or VERDICT: FAIL: reason — {spec}" \
-  --review-rounds 1
+dag add \
+  --title "Parse input records" \
+  --spec "Inputs: docs/format.md. Outputs: src/parser.ts and tests. Acceptance: pnpm test parser."
 
-dag add --title "Wire it up" --spec "..." --deps <id> --cmd "..."
-
-dag serve --open          # watch it; press Run, or:
-dag run --concurrency 3   # headless; exits 1 if anything failed
+dag add \
+  --title "Expose the import API" \
+  --spec "Use the parser to implement the import endpoint. Acceptance: pnpm test api." \
+  --deps task_ab12cd34  # replace with the ID printed by the first `dag add`
 ```
 
-## How it works
-
-**One run file per project.** `dag.run.json` holds the graph; a sidecar
-directory holds everything else:
-
-```
-dag.run.json           graph: tasks, deps, specs, commands, policies
-dag.run.d/state.json   statuses, attempts, results, verdicts
-dag.run.d/events.jsonl append-only history (seq-cursored)
-dag.run.d/logs/        per-attempt transcripts (the "terminals")
-dag.run.d/plans/       planner output per attempt
-dag.run.d/deps/        upstream evidence per attempt
-```
-
-**One runner per file.** A pid lock (stale-detecting) guarantees a single
-writer, and that runner runs many workers in parallel. Different projects are
-different files and run independently.
-
-**Task lifecycle.** `plan → work → review → land`. A planning phase that fails
-fails the task — the work never runs unplanned. A reviewer that rejects sends
-the work back, bounded by `--review-rounds`. A reviewer that *crashes* fails as
-infrastructure, not as a verdict.
-
-**Any tool can do the work, and they back each other up.** A task can name a
-harness preset instead of a raw command, and an ordered chain of them:
+Tasks without a command are manual. Point them at an installed agent harness
+to make the run automatic:
 
 ```bash
 dag harness list
-dag set --all --harness-chain "opencode:provider/model:xhigh,codex,claude:sonnet"
+dag set --all --harness codex --with-review
 ```
 
-Attempt 1 uses `opencode`, and if it dies (spawn failure, timeout, stall, a
-review rejection, or a non-zero exit) attempt 2 runs the same task on `codex`.
-The chain length raises the attempt budget, so the handover happens without
-extra configuration; the last candidate sticks for any remaining attempts.
-Presets supply `cmd`/`planCmd`, each candidate supplies its own model, and the
-run records which tool the last attempt used. When a reviewer or
-`--review-cmd` is judging the work, verdicts decide and exit codes do not
-trigger a fallback (agents routinely exit non-zero after succeeding);
-`--fail-on-exit` / `--no-fail-on-exit` overrides that, and the same rule
-applies to real and mocked executors alike.
+Swap `codex` for `opencode`, `claude`, `cursor-agent`, or `gemini`. The harness
+supplies the non-interactive work, planning, and—when requested—review commands.
 
-**Verdicts are machine-readable and read from the output tail.** Agent
-harnesses exit 0 whatever they conclude, so a reviewer must end with:
-
-```
-VERDICT: PASS
-VERDICT: FAIL: tests/test_import.py still asserts the old record shape
-```
-
-No verdict = **failed closed** (never a silent pass). Shell reviewers
-(`pytest -q`) can use `--review-verdict exit-code` instead.
-
-**Worktree isolation.** With `--worktree task`, every task runs in its own git
-worktree on a per-run integration branch (`dag/<runId>`). A baseline snapshot
-commit of your *current* working tree (untracked files included) is the base,
-so uncommitted work is visible to the agents; your checkout is never touched.
-Work merges only after the task and its reviewer pass; conflicts are redone on
-the new base (bounded by `mergeRounds`). Failed or stopped tasks get a WIP
-commit on their own `dag-task/…` branch instead — partial work is recoverable,
-never merged.
-
-**Failure is explicit.** Every failure carries a kind — `exit`, `spawn`,
-`timeout`, `stalled`, `killed`, `manual`, `interrupted`, `review`, `merge`,
-`plan`, `worktree` — plus exit code and the tail of the output. Nothing fails
-silently.
-
-**Liveness.** A hard per-attempt `timeout`; a `silence` alert that *warns* by
-default (agents legitimately go quiet during buffered tool calls) with
-`--silence-action kill` as an option; `dag heartbeat --id <task>` for workers
-that write files instead of streaming.
-
-**Crash recovery.** `dag resume` requeues interrupted tasks,
-`dag kill-orphans` reaps process trees from a dead run, `dag serve
---auto-resume` does both at boot.
-
-## Tasks about tasks (chain reviews)
-
-Not every task has a spec to implement. Some tasks are *about* other tasks:
-"review everything these forty tasks did". A chain-review task covers a set of
-tasks, and its instruction is generated from their real state when it runs:
+### 3. Run and watch
 
 ```bash
-dag layers                                  # the dependency waves in this run
-dag chain-review --of a,b,c                 # an explicit set
-dag chain-review --wave 3 --batch 10        # one wave, 10 tasks per reviewer
-dag chain-review --from task_9f2 --depth 2  # the dependency cone of one task
-dag chain-review --all --batch 25           # a 500-task run: 20 reviewers
+dag serve --open          # interactive: press Run in the viewer
+# or
+dag run --concurrency 3   # headless
 ```
 
-- The task **depends on** what it covers, so it runs after them, and it is
-  itself a node in the graph (visible in the DAG, skippable, retryable).
-- Its spec is a **template**: `{coverage}`, `{coverageManifest}`,
-  `{coverageDir}`, `{coverageStat}`, `{coverageFiles}` are filled in when it
-  runs. Before it starts, the runner writes a bundle to
-  `dag.run.d/reviews/chain-<taskId>/`: a manifest describing every covered task
-  (spec, result, verdict, commit, diff range) plus one diff file per task, so a
-  reviewer reads incrementally instead of swallowing a megabyte of diff.
-- Its **verdict decides**: `VERDICT: PASS` completes it, `VERDICT: FAIL: reason`
-  fails it with kind `review` and the reason becomes `{lastRejection}` for a
-  retry. (With its own `--review-cmd` configured, that reviewer decides instead.)
-- Chain tasks are excluded from the end-of-run review — reviewing a review is
-  not useful.
+`dag run` exits non-zero when work fails or the graph does not converge, so it
+fits naturally into scripts and CI.
 
-This is the layer per-task reviews cannot see: each task locally correct, the
-combination wrong. The smoke test for it builds a ledger in three steps where
-`deposit` and `withdraw` are individually fine and `balance` ignores
-withdrawals; a real reviewer reading the bundle reports exactly that:
-"balance() ignores withdrawals (returns 100 instead of 70 after deposit 100 +
-withdraw 30)".
+## The execution model
 
-## End-of-run code review
+```mermaid
+flowchart LR
+  A[Task becomes ready] --> P{Plan configured?}
+  P -->|yes| B[Plan]
+  P -->|no| C[Work]
+  B --> C
+  C --> R{Review configured?}
+  R -->|yes| D[Review]
+  R -->|no| E[Land]
+  D -->|pass| E
+  D -->|reject| F[Retry with feedback]
+  F --> B
+  E --> G[Merge into dag/run-id]
+```
 
-When the work converges, an agent can review it — one reviewer per task, or one
-for the run as a whole:
+Every task moves through `plan → work → review → land`:
+
+- **Plan** is optional, but binding. If planning fails, work never starts.
+- **Work** can be any non-interactive command—not only an AI agent.
+- **Review** can be a test command or an agent that emits `VERDICT: PASS` or
+  `VERDICT: FAIL: reason`.
+- **Land** commits and merges only verified work into `dag/<runId>` when
+  worktree isolation is enabled. Your current checkout remains untouched.
+
+The runner refills concurrency slots as soon as tasks finish. Downstream work
+starts only after its dependencies have completed and landed.
+
+## Built for agent work that can be trusted
+
+### Isolated worktrees
+
+```bash
+dag settings --worktree task --concurrency 4
+dag run
+```
+
+Each task receives its own git worktree. DAG Orchestrator snapshots the current
+working tree—including uncommitted and untracked files—as the baseline, so
+agents see your real starting point without editing your checkout.
+
+Successful tasks merge into `dag/<runId>`. Failed or stopped tasks keep their
+recoverable work on a `dag-task/...` branch. Merge conflicts trigger a bounded
+redo on the new base instead of silently combining incompatible edits.
+
+> [!NOTE]
+> Worktrees do not contain ignored dependencies such as `node_modules` or
+> `.venv`. Configure preparation when tasks need them:
+> `dag settings --worktree-prepare "pnpm install --frozen-lockfile"`.
+
+### Reviewer gates
+
+Attach a deterministic check or an agent reviewer to any task:
+
+```bash
+dag reviewer add \
+  --id task_ab12cd34 \
+  --name regression \
+  --cmd "pnpm test" \
+  --verdict exit-code
+
+dag reviewer add \
+  --id task_ab12cd34 \
+  --name contract \
+  --cmd "codex exec 'Inspect the implementation and tests. End with VERDICT: PASS or VERDICT: FAIL: reason'" \
+  --when "diff-lines>250"
+```
+
+Multiple reviewers can guard the same task. Conditional reviewers support
+`always`, `on-reject`, `diff-lines>N`, and `diff-touches:glob,glob`.
+
+Agent reviewers must end their output with one of these markers:
+
+```text
+VERDICT: PASS
+VERDICT: FAIL: tests still assert the old record shape
+```
+
+No readable verdict means no approval.
+
+### Fallback across agent CLIs
+
+An ordered harness chain can hand later attempts to another tool:
+
+```bash
+dag set --all \
+  --harness-chain "opencode:provider/model:xhigh,codex,claude:sonnet"
+```
+
+The first attempt uses OpenCode, the second Codex, and the third Claude. Each
+candidate owns its model identifier and command shape; the run records which
+harness produced each attempt.
+
+### Repair and recovery
+
+```bash
+dag retry --id task_ab12cd34 --cascade  # retry a failure and its affected subtree
+dag retry-failed --cascade          # retry every failed branch
+dag resume                          # requeue work interrupted by a crash
+dag kill-orphans                    # reap processes left by a dead runner
+dag skip-blocked                    # deliberately converge past blocked work
+```
+
+Failures keep their kind (`exit`, `spawn`, `timeout`, `stalled`, `review`,
+`merge`, `plan`, and more), exit code, and output tail. Recovery does not
+require hand-editing state.
+
+## Reviews that understand the graph
+
+### Integration tasks
+
+Create a node that checks whether several completed tasks actually fit
+together:
+
+```bash
+dag review \
+  --of task_api,task_client \
+  --title "API and client agree" \
+  --cmd "pnpm test integration" \
+  --repair-rounds 1
+```
+
+If the integration check fails, DAG Orchestrator can requeue the upstream work
+and then rerun the integration node.
+
+### Chain reviews
+
+Review a wave, a dependency cone, or an entire large run as normal DAG nodes:
+
+```bash
+dag layers
+dag chain-review --wave 3 --batch 10
+dag chain-review --from task_9f2 --depth 2
+dag chain-review --all --batch 25
+```
+
+Before each chain review starts, the runner creates a manifest and one diff per
+covered task in `dag.run.d/reviews/chain-<taskId>/`. Reviewers work from actual
+results, verdicts, commits, and diffs—not from task descriptions alone.
+
+### End-of-run review
 
 ```bash
 dag settings --final-review per-task --final-review-rounds 1
-# optional: your own reviewer command (defaults to the harness preset)
-dag settings --final-review-cmd "claude -p --dangerously-skip-permissions \"Review the diff in {diffFile}. End with VERDICT: PASS or VERDICT: FAIL: reason\""
-dag final-review --mode per-task          # or run it after the fact
+dag final-review --mode per-task
 ```
 
-Each reviewer gets the task's own merged diff (`git diff <base> <head>`), the
-file list and the change summary written to `dag.run.d/reviews/<task>.diff`,
-plus the spec, and must end with the verdict line.
-
-- **A rejection fixes something.** With rounds left, the task is requeued with
-  the review notes as `{lastRejection}`, so the next attempt is a fix pass; with
-  no rounds left it fails with kind `review`. A passing task is not re-reviewed.
-- **Per-task needs isolation** (`--worktree task`), because that is what makes a
-  diff attributable to one task. Without it the run is reviewed as a whole.
-- **Run-level verdicts are advisory**: one reviewer cannot be attributed to one
-  task, so a failing verdict is reported and the run exits non-zero rather than
-  silently redoing everything.
-- `{diffFile}`, `{diffBase}`, `{diffHead}`, `{diffStat}`, `{files}` are
-  available in the review command for a custom reviewer.
-
-## Tokens
-
-Usable in any task command (`cmd`, `planCmd`, `reviewCmd`):
-
-| Token | Value |
-|---|---|
-| `{spec}` `{title}` `{id}` | the task's own fields |
-| `{plan}` `{planFile}` | planner output, inline / as a file |
-| `{deps}` | what each direct dependency actually produced (result, verdict, branch@commit) |
-| `{depsAll}` `{depsFile}` | transitive roll-up, inline / as a file |
-| `{lastRejection}` | why the previous attempt was rejected |
-| `{diffFile}` `{diffBase}` `{diffHead}` `{diffStat}` `{files}` | end-of-run review: the merged diff, its range, its summary |
-| `{model}` `{variant}` | effective model/effort: task override → run default; unset removes the flag |
+Per-task final review uses attributable worktree diffs. A rejection with rounds
+remaining requeues the task with the reviewer’s feedback. Without worktree
+isolation, DAG Orchestrator falls back to a run-level advisory review.
 
 ## One host, many projects
 
-`dag serve` with no `--file` starts a **hub**: one process serving every
-registered project, with a separate URL per run.
+One hub can serve every registered project:
 
 ```bash
-dag serve --open                 # hub: projects page
-dag serve --file dag.run.json    # focus one run (redirects / to it)
-dag projects open <id|name>      # jump straight to one project's page
+dag serve --open
+dag projects list
+dag projects open my-project
 ```
 
-The viewer is three levels, each with a way back up:
+The viewer has three scopes:
 
-- `/` — **projects**: search, add a folder (typed, or picked with the built-in
-  folder browser — `C:\path` and `"C:\path"` both work), remove one from the
-  hub (files untouched), and see at a glance which projects have live runs.
-- `/p/<projectId>` — **one project**: its live status and progress, every run
-  (active first, then archived history) linking to that run's page, plus
-  `New run`, `Rename` and `Settings` (concurrency, model, isolation, end-of-run
-  review, notify — stored on the active run file).
-- `/r/<runId>` — **one run, scoped end to end**: its graph, queue, inspector,
-  logs and terminals, with a breadcrumb back to its project. Every API call is
-  namespaced by that run id, so a run page can never show another run's tasks.
-- Runs execute independently: one runner per run, its own lock, its own
-  integration branch. A run in progress in one project never blocks another.
-- Archived runs are **read-only history**; the API refuses to start them.
-
-Pages are read from disk per request, but routes are frozen when the process
-starts. If the code on disk is newer than the running hub, it serves a
-"restart me" page with the command instead of pages whose API it does not have
-(that mismatch is what made the old index sit on "loading…" forever).
-
-
-## Run history
-
-Runs live in the project folder, so history travels with the repository:
-
-```
-<project>/dag.run.json + dag.run.d/      the active run
-<project>/dag.runs/<runId>/dag.run.json  archived runs (same shape)
+```text
+/                 projects on this host
+/p/<projectId>    active and archived runs for one project
+/r/<runId>        graph, queue, inspector, logs, and live task terminals
 ```
 
-```bash
-dag new-run --objective "next plan"   # archive the active run, start fresh
-dag runs                              # active + archived, with counts
-dag runs show --id run_xxxxxxxx       # where that run lives
-dag runs archive                      # archive without starting a new one
-```
+Runs execute independently, each with its own file, lock, runner, and
+integration branch. Archived runs are read-only.
 
-Nothing is stored in a database: an archived run is a directory you can read,
-diff, grep or delete.
-
-## Scheduling
-
-```bash
-dag schedule add --file a/dag.run.json --name a
-dag schedule add --file b/dag.run.json --name b --after a
-dag scheduler                    # runs jobs strictly in order
-```
-
-Prefer one hub process (`dag serve`); `dag launch` remains for the
-one-server-per-project layout with stable ports:
+For one-server-per-project operation with stable ports:
 
 ```bash
 dag launch --all --open
-dag servers | dag servers --stop --all
+dag servers
+dag servers --stop --all
 ```
 
-## CLI cheat sheet
+## Scheduling
 
-```
-init · add · edit · rm · list · status · ready · blocked · show · log · logs
-run [--only a,b] [--concurrency N] [--on-dep-failure block|skip] [--max-hours H]
-retry --id X [--cascade]     requeue a failed task (and its failed subtree)
-retry-failed                 requeue everything that failed
-resume · kill-orphans · skip-blocked · gc · settings · set · models
-harness [list|show] · set --harness NAME · set --harness-chain "a:x,b" · models
-final-review [--mode per-task|run] [--rounds N] [--cmd C]   end-of-run code review
-layers                       dependency waves (who could review whom)
-chain-review --of a,b | --wave N | --from ID | --all [--batch N] [--cmd C]
-review --of a,b --cmd "check"        scaffold an integration node (repairs upstream)
-review --id X --review-cmd "check"   attach a reviewer postcondition
-gate · approve · reject · heartbeat · dot · serve · launch · schedule · scheduler
-```
-
-Run `dag --help` for the full surface. Every command accepts `--json`.
-
-## Guarantees the runner keeps
-
-- **Exit policy in one place.** A process that terminates normally — including
-  a nonzero exit — is an *outcome*, not an exception. The policy is applied
-  once per attempt, before reviewers run and before anything lands in the
-  integration branch: strict by default, verdicts decide when a reviewer is
-  configured, `failOnNonZeroExit` overrides both ways. Spawn failures, signals,
-  timeouts and cancellation stay distinct infrastructure outcomes.
-- **Approvals do not outlive their work.** Every new attempt clears the
-  previous end-of-run verdict, its diff range and its coverage. A manual retry
-  must earn a fresh review.
-- **Repair invalidates downstream work.** Redoing an upstream task requeues the
-  work that already completed against it (in depth order) instead of leaving it
-  "verified" against inputs that no longer exist.
-- **Slots are refilled on completion.** Workers are not held behind a batch
-  barrier, so a task that finishes early frees its slot immediately.
-- **Settings are validated by value**, not just by key: enums, numeric bounds
-  and lengths are checked at the API, in the CLI and for loaded files. An
-  invalid isolation mode refuses execution — it never quietly means "run
-  unisolated".
-- **Global files are written under a lock** (registry, schedule) with unique
-  temp names and backup-aware readers, since every CLI invocation touches them.
-
-`pnpm smoke:viewer` drives the real pages in headless Edge: run, stop, retry,
-gate approval, settings, and the archived-run restriction. It skips when no
-browser is installed, so `pnpm test` stays hermetic.
-
-## Viewer
-
-`dag serve --open`. Left-to-right DAG colored by status; queue with checkboxes
-to run a subset; inspector with per-task model override; **double-click a task
-for its live terminal** (streaming transcript, attempt switcher, follow mode);
-collapsible panels; settings (☰) with per-field explanations; zoom readout
-bottom-left. The viewer is ~1000 lines of vanilla JS with a vendored
-vis-network; nothing is fetched from the network.
-
-## Tests
+Queue runs across repositories, including explicit order and start times:
 
 ```bash
-pnpm test        # 112 tests: graph semantics, scheduling, watchdogs, retries,
-                 # review/verdict protocol, worktree isolation + conflicts,
-                 # harness chains + fallback, locks, recovery, migration
+dag schedule add --file ../api/dag.run.json --name api
+dag schedule add --file ../web/dag.run.json --name web --after api
+dag schedule add --file ../e2e/dag.run.json --name e2e --after web --at "2026-09-18 23:00"
+dag scheduler --watch --open
 ```
 
-## Notes
+If a scheduled predecessor fails, its dependents are marked blocked rather
+than started against incomplete work.
 
-- Task state is plain JSON; nothing is hidden in a database you cannot diff.
-- Everything is local: the run file lives in your project, the server binds
-  loopback only, and no data leaves the machine.
+## What lives on disk?
 
-## Design boundaries
+```text
+dag.run.json                 graph, task specs, commands, and policies
+dag.run.d/state.json         statuses, attempts, results, and verdicts
+dag.run.d/events.jsonl       append-only event history
+dag.run.d/logs/              per-attempt stdout and stderr
+dag.run.d/plans/             planner output
+dag.run.d/deps/              upstream evidence supplied to workers
+dag.run.d/reviews/           task and chain-review diffs
+dag.runs/<runId>/            archived runs
+```
 
-Worth knowing before you build on it — these are deliberate, not gaps:
+Files are written atomically and the active run is protected by a
+stale-detecting PID lock. Different projects use different files and can run
+at the same time.
 
-- **One writer per run file.** A pid lockfile makes a single runner own a run
-  file; a second one is refused rather than allowed to clobber state. That
-  runner still runs many workers in parallel; *different projects are different
-  files* and run independently. The lock is local-only: sharing one run file
-  across machines is unsafe, and a lock from another host is respected rather
-  than stolen.
-- **Files, not a database.** State is a JSON file rewritten atomically
-  (tmp → fsync → rename, previous revision kept as `.bak`), plus an append-only
-  event log. Coalesced writes make 1000 tasks cheap; it is not a system for
-  millions.
-- **Deterministic first, agents second.** Regression and evidence checks are
-  commands (`pytest`, `ruff`, `git diff`); only judgment calls spend a model.
-- **Fail closed.** A reviewer with no readable verdict, an isolation mode that
-  cannot be established, or a prepare step that fails all stop the task rather
-  than let unverified work merge.
-- **Not a service.** One process serves the viewer and runs the graph; no auth,
-  no HA, no remote execution. Multi-machine work would mean driving remote
-  hosts as workers, which is intentionally out of scope today.
+## Command map
 
+| Job | Commands |
+|---|---|
+| Build the graph | `init`, `add`, `edit`, `rm`, `set`, `gate` |
+| Inspect it | `list`, `status`, `ready`, `blocked`, `show`, `layers`, `dot` |
+| Execute it | `run`, `approve`, `reject`, `heartbeat` |
+| Recover | `retry`, `retry-failed`, `resume`, `kill-orphans`, `skip-blocked`, `gc` |
+| Verify | `review`, `reviewer`, `chain-review`, `final-review` |
+| Choose workers | `harness`, `models`, `set --harness`, `set --harness-chain` |
+| Browse runs | `serve`, `launch`, `projects`, `runs`, `servers` |
+| Schedule | `schedule`, `scheduler` |
 
-MIT licensed.
+Run `dag` for the complete help text. Add `--json` to commands you want to
+consume programmatically.
+
+<details>
+<summary><strong>Command template tokens</strong></summary>
+
+| Token | Value |
+|---|---|
+| `{id}` `{title}` `{spec}` | The current task’s identity and instructions |
+| `{plan}` `{planFile}` | Planner output inline or as an absolute file path |
+| `{deps}` | Results, verdicts, branches, and commits from direct dependencies |
+| `{depsAll}` `{depsFile}` | The same evidence for all transitive dependencies |
+| `{lastRejection}` | Feedback from the previous rejected attempt |
+| `{model}` `{variant}` | Effective per-task or run-wide model settings |
+| `{diffFile}` `{diffBase}` `{diffHead}` | End-of-run review diff and range |
+| `{diffStat}` `{files}` | End-of-run change summary and file list |
+
+</details>
+
+<details>
+<summary><strong>Design boundaries</strong></summary>
+
+- **One writer per run.** A local PID lock refuses competing runners instead
+  of risking state corruption. One runner can still execute many tasks.
+- **Local files, not a database.** This is designed for repository-scale work,
+  not millions of distributed jobs.
+- **Deterministic checks first.** Use tests and linters when they can decide;
+  spend model judgment where interpretation is actually required.
+- **Fail closed.** Missing reviewer verdicts, unavailable isolation, and failed
+  worktree preparation stop the task.
+- **Local execution only.** The viewer binds to loopback. There is no auth,
+  high availability, or built-in multi-machine execution.
+
+</details>
+
+## Development
+
+```bash
+pnpm build
+pnpm typecheck
+pnpm test
+pnpm smoke:viewer
+```
+
+The viewer is vanilla JavaScript with a vendored `vis-network` bundle; it does
+not fetch runtime assets from the network.
+
+## License
+
+[MIT](LICENSE) © Joe Fresco

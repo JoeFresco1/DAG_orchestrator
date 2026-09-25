@@ -205,6 +205,9 @@ export function describeStuck(run: Run): StuckReason[] {
       out.push({ id: t.id, reason: `awaiting approval: ${t.gate?.question ?? ''}` });
       continue;
     }
+    // A deps-met, ungated task is ready to launch, not stuck. Root tasks have
+    // an empty dependency list and previously produced "waiting on: ".
+    if (depsMet(t, run.tasks)) continue;
     const waiting = t.deps.filter((d) => run.tasks[d].status !== 'completed');
     out.push({
       id: t.id,

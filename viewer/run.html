@@ -539,7 +539,7 @@ function pushEventLine(ev) {
   while (logEl.childElementCount > 300) logEl.removeChild(logEl.lastChild);
 }
 
-function sig(t) { return `${t.display}|${t.attempts}|${t.failureKind || ''}|${t.lastOutputAt ? t.lastOutputAt.slice(0, 17) : ''}`; }
+function sig(t) { return `${t.display}|${t.attempts}|${t.attemptsInCycle}|${t.failureKind || ''}|${t.lastOutputAt ? t.lastOutputAt.slice(0, 17) : ''}`; }
 
 // ---- definition / graph ----
 async function loadDefinition() {
@@ -703,7 +703,7 @@ function renderQueue() {
       t.id === inspected ? 'inspected' : '',
       job.current.includes(t.id) ? 'runnow' : '',
     ].filter(Boolean).join(' ');
-    const meta = `attempts ${t.attempts}/${t.maxAttempts}${t.failureKind ? ` · ${t.failureKind}` : ''}${t.exitCode !== null && t.exitCode !== undefined ? ` · exit ${t.exitCode}` : ''}${t.reviewRounds > 0 ? ` · rev ${t.reviews}/${t.reviewRounds + 1}` : ''}${t.repairRounds > 0 ? ` · fix ${t.repairs}/${t.repairRounds}` : ''}`;
+    const meta = `attempts ${t.attempts} total · cycle ${t.attemptsInCycle}/${t.maxAttempts}${t.failureKind ? ` · ${t.failureKind}` : ''}${t.exitCode !== null && t.exitCode !== undefined ? ` · exit ${t.exitCode}` : ''}${t.reviewRounds > 0 ? ` · rev ${t.reviews}/${t.reviewRounds + 1}` : ''}${t.repairRounds > 0 ? ` · fix ${t.repairs}/${t.repairRounds}` : ''}`;
     return `<div class="${cls}" data-id="${esc(t.id)}">
       <input type="checkbox" ${checked.has(t.id) ? 'checked' : ''} />
       <div class="t"><div class="title">${esc(titleOf(t.id))}</div><div class="id">${esc(t.id)} · ${meta}</div></div>
@@ -738,7 +738,7 @@ function renderInspector() {
     ? `<button class="mini" id="logBtn">■ terminal</button>`
     : '';
   if (!t) { inspectorEl.innerHTML = '<div class="empty">Select a task.</div>'; return; }
-  const bits = [t.id, detailDisplay(t), `deps: ${t.deps.join(', ') || '(none)'}`, `attempts: ${t.attempts}/${t.maxAttempts}`];
+  const bits = [t.id, detailDisplay(t), `deps: ${t.deps.join(', ') || '(none)'}`, `attempts: ${t.attempts} total; cycle ${t.attemptsInCycle}/${t.maxAttempts}`];
   if (t.reviewCmd) bits.push(`reviews: ${t.reviews}/${t.reviewRounds + 1}`);
   if (t.planCmd) bits.push(t.plan ? `plan: ${t.plan.length} chars` : 'plan: pending');
   if (t.repairRounds > 0) bits.push(`repairs: ${t.repairs}/${t.repairRounds}`);

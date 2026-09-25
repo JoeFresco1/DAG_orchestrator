@@ -21,6 +21,7 @@ import {
   retryTask,
   runPaths,
   saveRun,
+  setTasks,
 } from './store.js';
 import { DagRunner, shellExecutor, sleep } from './runner.js';
 import { validateSettingsPatch } from './types.js';
@@ -51,6 +52,23 @@ describe('dag edits', () => {
     removeTask(run, a.id);
     assert.ok(!run.tasks[a.id]);
     assert.deepEqual(run.tasks[b.id].deps, []);
+  });
+
+  it('reports prepare and reviewer bulk edits as changes', () => {
+    const run = newRun('bulk fields');
+    const a = addTask(run, { title: 'a', spec: '' });
+    assert.deepEqual(
+      setTasks(run, { prepareCmd: 'pnpm install' }, { only: [a.id] }),
+      [a.id],
+    );
+    assert.deepEqual(
+      setTasks(
+        run,
+        { reviewers: [{ name: 'tests', cmd: 'pnpm test', when: 'always', verdict: 'exit-code' }] },
+        { only: [a.id] },
+      ),
+      [a.id],
+    );
   });
 });
 // Files that are atomic, migratable, recoverable after a crash, and never
@@ -279,6 +297,25 @@ describe('hardening', () => {
     assert.equal(run.tasks[a.id].status, 'failed');
     assert.equal(run.tasks[a.id].failureKind, 'stalled');
     assert.ok(run.events.some((e) => e.type === 'task-retry'));
+  });
+
+  it('manual retry starts a fresh attempt budget without reusing lifetime numbers', async () => {
+    const run = newRun('fresh retry cycle');
+    const a = addTask(run, { title: 'a', spec: '' });
+    run.tasks[a.id].maxAttempts = 2;
+    const executor = async (): Promise<never> => {
+      throw Object.assign(new Error('nope'), { kind: 'exit', exitCode: 1 });
+    };
+    await new DagRunner(run, { executor }).start();
+    assert.equal(run.tasks[a.id].attempts, 2);
+    assert.equal(run.tasks[a.id].attemptsInCycle, 2);
+
+    retryTask(run, a.id);
+    assert.equal(run.tasks[a.id].attempts, 2, 'lifetime numbering is preserved');
+    assert.equal(run.tasks[a.id].attemptsInCycle, 0, 'retry budget is fresh');
+    await new DagRunner(run, { executor }).start();
+    assert.equal(run.tasks[a.id].attempts, 4);
+    assert.equal(run.tasks[a.id].attemptsInCycle, 2);
   });
 
   it('refuses to steal a live lock and steals a stale one', () => {
