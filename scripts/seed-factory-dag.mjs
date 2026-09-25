@@ -17,7 +17,7 @@ if (Object.keys(run.tasks ?? {}).length !== 0) {
   throw new Error(`run ${run.id} is not empty; refusing to seed twice`);
 }
 
-const workCmd = 'codex exec --approve-for-me -m gpt-6-luna "{spec}"';
+const workCmd = 'codex exec --approve-for-me -m gpt-6-luna -c model_reasoning_effort=max "{spec} Before finishing, run pnpm typecheck and relevant tests, and fix any failures. On retry, address this prior rejection: {lastRejection}"';
 const checkCmd = 'pnpm test';
 const typecheckCmd = 'pnpm typecheck';
 const tasks = [
@@ -117,8 +117,14 @@ for (const item of tasks) {
   });
   const args = ['add', '--title', title, '--spec', taskSpec, '--cmd', item.command ?? workCmd];
   if (deps.length) args.push('--deps', deps.join(','));
-  if (!item.command) args.push('--review-cmd', typecheckCmd, '--retries', '1', '--timeout', '7200', '--silence', '900');
+  if (!item.command) args.push('--retries', '1', '--timeout', '7200', '--silence', '900');
   const created = callCli(args);
+  if (!item.command) {
+    callCli(['reviewer', 'add', '--id', created.id, '--name', 'typecheck', '--cmd', typecheckCmd, '--when', 'always', '--verdict', 'exit-code']);
+  }
+  if (item.key === 'preflight') {
+    callCli(['reviewer', 'add', '--id', created.id, '--name', 'tests', '--cmd', checkCmd, '--when', 'always', '--verdict', 'exit-code']);
+  }
   ids.set(item.key, created.id);
   process.stdout.write(`${item.key}\t${created.id}\t${title}\n`);
 }

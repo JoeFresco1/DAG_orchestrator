@@ -29,7 +29,7 @@ function pathCandidates(name: string): string[] {
 
 // `%~dp0` / `%dp0%` expand to the shim's own directory, trailing separator and all.
 function expandDp0(target: string, shimDir: string): string {
-  const stripped = target.replace(/^~?%?dp0%?[\\/]*/i, '');
+  const stripped = target.replace(/^(?:%~dp0|%dp0%|~dp0|dp0)[\\/]*/i, '');
   const resolved = stripped.match(/^([a-zA-Z]:[\\/])/) ? stripped : join(shimDir, stripped);
   const cleaned = resolved.split(/[\\/]+/).join(sep);
   return isAbsolute(cleaned) ? cleaned : join(shimDir, cleaned);
@@ -47,16 +47,17 @@ function resolveShim(shimPath: string): ResolvedCommand | null {
     return null;
   }
   const shimDir = dirname(shimPath);
-  // npm/pnpm shims quote the real target: "…\node_modules\pkg\bin\x.exe" %*
-  const exe = text.match(/"([^"]+\.exe)"/i);
-  if (exe) {
-    const target = expandDp0(exe[1], shimDir);
-    if (existsSync(target)) return { file: target, args: [] };
-  }
+  // Corepack and npm shims often name node.exe before the JavaScript entry
+  // point. Resolve the script first so invoking the shim actually runs pnpm.
   const js = text.match(/"([^"]+\.(?:js|mjs|cjs))"/i);
   if (js) {
     const target = expandDp0(js[1], shimDir);
     if (existsSync(target)) return { file: process.execPath, args: [target] };
+  }
+  const exe = text.match(/"([^"]+\.exe)"/i);
+  if (exe) {
+    const target = expandDp0(exe[1], shimDir);
+    if (existsSync(target)) return { file: target, args: [] };
   }
   return null;
 }
