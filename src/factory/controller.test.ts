@@ -7,8 +7,10 @@ import test from 'node:test';
 import type { Executor } from '../runner.js';
 import { loadRun, retryTask, runPaths, saveRun } from '../store.js';
 import { traceRequirement } from './graph-model.js';
-import { resumeFactory, startFactory, type StructuredFactoryGoal } from './controller.js';
+import { resumeFactory, startFactory, type FactoryControllerOptions, type StructuredFactoryGoal } from './controller.js';
 import { VERIFICATION_CATEGORIES } from './verification.js';
+import { buildConfidenceFrontier } from './confidence-frontier.js';
+import { createReviewBudget } from './review-budget.js';
 
 test('runs and resumes a complete factory cycle through DagRunner with requirement trace and recertification', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'dag-factory-'));
@@ -18,8 +20,8 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
     compilerOptions: { target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', strict: true },
     include: ['src/**/*.ts'],
   }));
-  writeFileSync(join(root, 'src', 'auth.ts'), 'export function readPrincipal(): string { return "owner"; }\n');
-  writeFileSync(join(root, 'src', 'trace.ts'), 'export function readTrace(): string { return "span"; }\n');
+  writeFileSync(join(root, 'src', 'auth.ts'), 'export function readPrincipal(): string { return ""; }\n');
+  writeFileSync(join(root, 'src', 'trace.ts'), 'export function readTrace(): string { return ""; }\n');
   execFileSync('git', ['init'], { cwd: root, stdio: 'ignore' });
   execFileSync('git', ['config', 'user.email', 'factory-test@example.invalid'], { cwd: root });
   execFileSync('git', ['config', 'user.name', 'Factory Test'], { cwd: root });
@@ -48,9 +50,18 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
       recertification: { reviewCmd: 'fake recertify' },
     },
     coverage: { criticalFlow: 1, weightedRisk: 0.96 },
+    convergencePolicy: {
+      minimumMeaningfulReviewUnits: 1, maximumWeightedResidualRisk: 0,
+      minimumReleaseConfidence: 1, maximumNovelVerifiedDefectsPer1000Requests: 0,
+      minimumRequestsForYield: 1, minimumWeightedRiskCoverage: 0.95,
+      minimumCriticalFlowCoverage: 1, requiredCriticalFlowIds: ['async-context'],
+      requiredDeterministicCheckIds: ['regression-factory-claim-context-preservation-async-context'],
+      minimumRemainingBudget: { requests: 1 },
+    },
   };
 
   let firstImplementationFailed = false;
+  let recheckResolved = false;
   const executor: Executor = async (task, ctx, cmdOverride) => {
     let output = 'ok\n';
     let exitCode = 0;
@@ -82,6 +93,16 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
         evidenceFor: [{ evidenceId: evidence[1], rationale: 'The cited source and reachable call path reproduce the missing context.' }],
         evidenceAgainst: [], reasoning: 'The assertion fails on the reachable async path.',
       }) + '\n';
+    } else if (task.title.startsWith('Recheck repaired defect:')) {
+      const evidence = task.spec.match(/"id"\s*:\s*"(context:v1:[a-f0-9]+)"/);
+      assert.ok(evidence, 'fresh verification packet cites current source');
+      output = JSON.stringify({
+        verdict: recheckResolved ? 'rejected' : 'verified', confidence: 0.96,
+        reachability: recheckResolved ? 'refuted' : 'confirmed', inspectedCategories: [...VERIFICATION_CATEGORIES],
+        evidenceFor: recheckResolved ? [] : [{ evidenceId: evidence[1], rationale: 'The original failure remains reproducible.' }],
+        evidenceAgainst: recheckResolved ? [{ evidenceId: evidence[1], rationale: 'The current implementation carries the context value.' }] : [],
+        reasoning: recheckResolved ? 'The original failure is not reproducible after the fix.' : 'The original failure still reproduces.',
+      }) + '\n';
     } else if (task.title.startsWith('Assess shared root causes')) {
       const start = task.spec.lastIndexOf('\n[');
       assert.ok(start >= 0, 'root-cause task contains the verified defect records');
@@ -96,10 +117,10 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
         evidence: defects.map((item) => ({ defect_id: item.id, evidence_id: item.verification.evidence_for[0]!.evidenceId, rationale: 'The verified execution path loses its context value.' })),
       }]) + '\n';
     } else if (task.title.startsWith('Repair root cause:')) {
-      for (const path of ['src/auth.ts', 'src/trace.ts']) {
-        const file = join(ctx.cwd ?? root, path);
-        writeFileSync(file, `${readFileSync(file, 'utf8')}\n// context propagation remediation\n`);
-      }
+      writeFileSync(join(ctx.cwd ?? root, 'src', 'auth.ts'), 'export function readPrincipal(): string { return "owner"; }\n');
+      writeFileSync(join(ctx.cwd ?? root, 'src', 'trace.ts'), 'export function readTrace(): string { return "span"; }\n');
+      execFileSync('git', ['add', 'src/auth.ts', 'src/trace.ts'], { cwd: ctx.cwd ?? root });
+      execFileSync('git', ['commit', '-m', 'repair context propagation'], { cwd: ctx.cwd ?? root, stdio: 'ignore' });
       output = 'shared root cause repaired\n';
     }
     ctx.onOutput(output);
@@ -116,13 +137,54 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
   retryTask(persisted, implementationId, true);
   saveRun(persisted, runFile);
 
-  const resumed = await resumeFactory(runFile, { executor, cwd: root });
+  writeFileSync(join(root, 'src', 'auth.ts'), `${readFileSync(join(root, 'src', 'auth.ts'), 'utf8')}\n// uncommitted change\n`);
+  const dirty = await resumeFactory(runFile, { executor, cwd: root });
+  assert.equal(dirty.state.stage, 'quality');
+  assert.equal(dirty.state.status, 'waiting');
+  assert.match(dirty.state.lastError ?? '', /committed, clean source tree/);
+  execFileSync('git', ['restore', '--', 'src/auth.ts'], { cwd: root });
+
+  const unresolved = await resumeFactory(runFile, { executor, cwd: root });
+  assert.equal(unresolved.state.stage, 'remediation_verification');
+  assert.equal(unresolved.state.status, 'waiting');
+  assert.match(unresolved.state.lastError ?? '', /remains unresolved/);
+  const retryRun = loadRun(runFile);
+  for (const id of Object.values(unresolved.state.tasks.remediationVerification)) retryTask(retryRun, id, false);
+  saveRun(retryRun, runFile);
+  recheckResolved = true;
+
+  const pending = await resumeFactory(runFile, { executor, cwd: root });
+  assert.equal(pending.state.stage, 'convergence');
+  assert.equal(pending.state.status, 'waiting');
+  assert.match(pending.state.lastError ?? '', /convergence evidence/);
+  const finalReviewTaskId = Object.values(pending.state.tasks.recertification)[0]!;
+  const certEvidence = pending.certification!.reviewEvidence
+    .flatMap((item) => item.evidence).find((item) => item.uri.includes(`/task/${finalReviewTaskId}/`))!;
+  const evidence = { ...certEvidence, id: `evidence:v1:${certEvidence.sha256}` as const, kind: 'review' as const };
+  const frontier = buildConfidenceFrontier([], [], [], 0);
+  const assessment: NonNullable<FactoryControllerOptions['convergenceAssessment']> = {
+    confidenceFrontier: {
+      schemaVersion: 1, initialResidualRisk: frontier.initialResidualRisk,
+      residualRisk: frontier.residualRisk, unresolvedClaims: frontier.unresolvedClaims,
+      effortCurve: frontier.effortCurve, evidence: [evidence],
+    },
+    budget: { state: createReviewBudget({ limits: { requests: 2 } }), evidence: [evidence] },
+    criticalFlows: [{ flowId: 'async-context', certified: true, evidence: [evidence] }],
+    findings: [],
+    reviewUnits: [{ id: finalReviewTaskId, completedAt: new Date().toISOString(), status: 'completed', meaningful: true, requestCount: 1, evidence: [evidence], newFindings: [] }],
+  };
+  const notConverged = await resumeFactory(runFile, { executor, cwd: root, convergenceAssessment: { ...assessment, reviewUnits: [] } });
+  assert.equal(notConverged.state.stage, 'convergence');
+  assert.equal(notConverged.state.status, 'waiting');
+  assert.match(notConverged.state.lastError ?? '', /has not converged/);
+  const resumed = await resumeFactory(runFile, { executor, cwd: root, convergenceAssessment: assessment });
   assert.equal(resumed.state.status, 'completed', resumed.summary);
   assert.equal(resumed.state.stage, 'complete');
   assert.equal(resumed.certification?.status, 'certified');
   assert.equal(resumed.certification?.deterministicChecks.some((item) => item.id.startsWith('regression-')), true);
   assert.ok(Object.keys(resumed.state.tasks.verification).length >= 2);
   assert.ok(Object.keys(resumed.state.tasks.remediation).length >= 4);
+  assert.equal(Object.keys(resumed.state.tasks.remediationVerification).length, 2);
   assert.ok(Object.keys(resumed.state.tasks.recertification).length > 0);
 
   const savedRun = loadRun(runFile);
@@ -131,6 +193,7 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
     ...Object.values(resumed.state.tasks.implementation), ...Object.values(resumed.state.tasks.checks),
     ...(resumed.state.tasks.review ? [resumed.state.tasks.review] : []), ...Object.values(resumed.state.tasks.verification),
     ...(resumed.state.tasks.rootCause ? [resumed.state.tasks.rootCause] : []), ...Object.values(resumed.state.tasks.remediation),
+    ...Object.values(resumed.state.tasks.remediationVerification),
     ...(resumed.state.tasks.regression ? [resumed.state.tasks.regression] : []), ...Object.values(resumed.state.tasks.recertification),
   ];
   for (const id of taskIds) {

@@ -58,6 +58,18 @@ include `{spec}` when an agent command needs the task instructions.
   "certificationPolicy": {
     "minimumCriticalFlowCoverage": 1,
     "minimumWeightedRiskCoverage": 0.95
+  },
+  "convergencePolicy": {
+    "minimumMeaningfulReviewUnits": 3,
+    "maximumWeightedResidualRisk": 0.05,
+    "minimumReleaseConfidence": 0.9,
+    "maximumNovelVerifiedDefectsPer1000Requests": 1,
+    "minimumRequestsForYield": 1000,
+    "minimumWeightedRiskCoverage": 0.95,
+    "minimumCriticalFlowCoverage": 1,
+    "requiredCriticalFlowIds": ["owner-create"],
+    "requiredDeterministicCheckIds": ["regression-factory-claim-owner-field-owner-required"],
+    "minimumRemainingBudget": { "requests": 1 }
   }
 }
 ```
@@ -82,7 +94,7 @@ end with `VERDICT: PASS` or `VERDICT: FAIL: reason`.
 ```bash
 dag factory start --goal docs/factory/owner-field.json --file dag.run.json
 dag factory status --file dag.run.json
-dag factory resume --file dag.run.json
+dag factory resume --file dag.run.json --assessment measured-convergence.json
 ```
 
 The controller executes these phases in order:
@@ -93,9 +105,20 @@ The controller executes these phases in order:
    certified baseline.
 4. Run adversarial verification tasks for each hypothesis.
 5. Assess verified root causes and compile the remediation DAG.
-6. Execute remediation tasks through the same DAG runner.
+6. Execute remediation tasks, then independently recheck every verified defect
+   against fresh source evidence. Unresolved or inconclusive rechecks block certification.
 7. Run final regression checks and routed recertification reviews, then save a
    new certificate and certified baseline.
+8. Evaluate the measured convergence assessment against `convergencePolicy`.
+   Only a `stop` decision completes the factory; `continue` or `escalate` remains waiting.
+
+The assessment file supplies `confidenceFrontier`, `budget`, `criticalFlows`,
+`findings`, and `reviewUnits` in the `ConvergenceAssessment` shape. The controller
+supplies the run ID, final certificate, and current source commit itself. The
+assessment must contain evidence references and measured review request counts;
+the factory waits for it after recertification when `--assessment` is omitted.
+For a goal created before `convergencePolicy` was added, pass its policy JSON
+with `--policy policy.json` when resuming.
 
 The requirement, code, execution, and defect graphs are persisted as separate
 versioned artifacts with trace links between them. Tasks appear in normal DAG
@@ -107,7 +130,9 @@ runner's normal recovery path. For a permanently failed task, inspect its logs,
 run `dag retry --id <task-id> --cascade` (or `dag retry-failed --cascade`),
 then resume the factory. A different goal requires a new run file.
 
-The current repo must have a valid Git commit for certification. With
+The current repo must have a valid Git commit and a clean source tree for
+certification. Commit source changes made without task worktrees before
+resuming. With
 `--worktree task`, factory analysis follows the existing `dag/<runId>`
 integration branch; task work remains isolated by the existing runner.
 
@@ -124,10 +149,12 @@ dag.run.d/factory/hypotheses-v1.json
 dag.run.d/factory/verification-v1.json
 dag.run.d/factory/root-causes-v1.json
 dag.run.d/factory/remediation-plan-v1.json
+dag.run.d/factory/remediation-verification-v1.json
 dag.run.d/factory/impact-v1.json
 dag.run.d/factory/recertification-plan-v1.json
 dag.run.d/factory/certification-v1.json
 dag.run.d/factory/baseline-final-v1.json
+dag.run.d/factory/convergence-decision-v1.json
 ```
 
 Every manifest artifact reference includes a SHA-256 digest. A damaged or

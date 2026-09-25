@@ -6,7 +6,7 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { join, dirname, resolve, posix } from 'node:path';
+import { join, dirname, resolve, relative, posix } from 'node:path';
 import {
   addTask,
   atomicWriteJson,
@@ -37,6 +37,7 @@ import { createRecertificationPlan, completeRecertification, type Recertificatio
 import { createCertification, saveCertification, type Certification, type CertificationEvidence, type CertificationInput } from './certification.js';
 import { createBaseline, saveBaseline, type BaselinePolicy, type BaselinePromotion } from './baseline.js';
 import { validateCertificationClaims, type CertificationClaim } from './certification-invalidation.js';
+import { evaluateAndSaveConvergence, type ConvergenceAssessment, type ConvergencePolicy } from './convergence.js';
 
 export interface FactoryRequirementInput {
   id: string;
@@ -81,9 +82,10 @@ export interface StructuredFactoryGoal {
   };
   coverage: { criticalFlow: number; weightedRisk: number };
   certificationPolicy?: BaselinePolicy;
+  convergencePolicy?: ConvergencePolicy;
 }
 
-export type FactoryStage = 'implementation' | 'quality' | 'verification' | 'root_cause' | 'remediation' | 'recertification' | 'complete';
+export type FactoryStage = 'implementation' | 'quality' | 'verification' | 'root_cause' | 'remediation' | 'remediation_verification' | 'recertification' | 'convergence' | 'complete';
 export type FactoryStatus = 'ready' | 'running' | 'waiting' | 'completed';
 
 export interface FactoryTaskGroups {
@@ -93,6 +95,7 @@ export interface FactoryTaskGroups {
   verification: Record<string, string>;
   rootCause: string | null;
   remediation: Record<string, string>;
+  remediationVerification: Record<string, string>;
   regression: string | null;
   recertification: Record<string, string>;
 }
@@ -112,6 +115,8 @@ export interface FactoryControllerOptions {
   executor?: Executor;
   cwd?: string;
   onEvent?: (event: DagEvent) => void;
+  convergenceAssessment?: Omit<ConvergenceAssessment, 'runId' | 'certification' | 'currentCertificationState'>;
+  convergencePolicy?: ConvergencePolicy;
 }
 
 export interface FactoryControllerResult {
@@ -258,11 +263,20 @@ async function driveFactory(
           state.stage = 'remediation';
           break;
         case 'remediation':
+          prepareRemediationVerificationStage(run, state, file, goal, state.goalHash, factoryWorkingRoot(run, file, options.cwd ?? dirname(file)));
+          state.stage = 'remediation_verification';
+          break;
+        case 'remediation_verification':
+          processRemediationVerificationStage(run, state, file, state.goalHash);
           prepareRecertificationStage(run, state, file, goal, state.goalHash, factoryWorkingRoot(run, file, options.cwd ?? dirname(file)));
           state.stage = 'recertification';
           break;
         case 'recertification':
-          processRecertificationStage(run, state, file, goal, state.goalHash, options.cwd ?? dirname(file));
+          processRecertificationStage(run, state, file, goal, state.goalHash, factoryWorkingRoot(run, file, options.cwd ?? dirname(file)));
+          state.stage = 'convergence';
+          break;
+        case 'convergence':
+          processConvergenceStage(run, state, file, goal, options);
           state.stage = 'complete';
           state.status = 'completed';
           break;
@@ -387,7 +401,7 @@ function processQualityStage(
   }
 
   const initialEvidence = qualityEvidence(file, state, run, goal);
-  const currentCommit = repositoryCommit(rootDir, run);
+  const currentCommit = repositoryCommit(rootDir, run, file);
   const specHash = sha256(canonicalJson(model.graphs.requirement));
   const codeHash = sha256(canonicalJson(index.graph));
   const testHash = sha256(canonicalJson(initialEvidence.deterministicChecks));
@@ -558,6 +572,58 @@ function processRootCauseStage(run: Run, state: FactoryControllerState, file: st
   saveRun(run, file);
 }
 
+function prepareRemediationVerificationStage(run: Run, state: FactoryControllerState, file: string, goal: StructuredFactoryGoal, goalHash: string, rootDir: string): void {
+  const sourceCommit = repositoryCommit(rootDir, run, file);
+  const verification = loadArtifact<{ verifiedDefects: VerifiedDefect[] }>(file, goalHash, 'verification-v1.json');
+  if (verification.verifiedDefects.length > 0) {
+    const initial = loadArtifact<BaselinePromotion>(file, goalHash, 'baseline-initial-v1.json');
+    if (sourceCommit === initial.commit) throw new Error('verified defects require a committed source change before rechecking');
+  }
+  const hypotheses = loadArtifact<HypothesisSet>(file, goalHash, 'hypotheses-v1.json');
+  const observations = loadArtifact<ReturnType<typeof analyzeObservations>>(file, goalHash, 'observations-v1.json');
+  const index = buildGoalCodeGraph(goal, rootDir);
+  const packets: Record<string, VerificationPacket> = {};
+  for (const defect of verification.verifiedDefects) {
+    const hypothesis = hypotheses.hypotheses.find((item) =>
+      `defect:v1:defect.${sha256(item.id)}` === defect.id && item.status === 'verified');
+    if (!hypothesis) throw new Error(`verified defect ${defect.id} has no hypothesis to recheck`);
+    const linked = observations.observations.filter((item) => hypothesis.observations.includes(item.id as DefectHypothesis['observations'][number]));
+    const context = compileContext({
+      index, rootDir, request: `After remediation, try to reproduce: ${hypothesis.claim}`,
+      previousFindings: linked.map((item) => ({ id: item.id, title: item.title, content: JSON.stringify(item), sourcePath: item.files[0] })),
+    });
+    const preverification = preverifyHypothesis(hypothesis, { rootDir, observations: linked, codeGraph: index, graphIsComplete: true });
+    const packet = createVerificationPacket(hypothesis, context, preverification);
+    packets[defect.id] = packet;
+    const task = ensureTask(run, taskId(goalHash, 'remediation-verification', defect.id), {
+      title: `Recheck repaired defect: ${defect.title}`,
+      spec: `Check whether the original defect remains after remediation. A resolved defect needs a rejected verdict, refuted reachability, and citations to current evidence.\n${renderVerificationPrompt(packet)}`,
+      deps: Object.values(state.tasks.remediation),
+      cmd: goal.phases.verification.command,
+    });
+    state.tasks.remediationVerification[defect.id] = task.id;
+  }
+  saveArtifact(file, run.id, 'remediation-verification-packets-v1.json', packets);
+  saveArtifact(file, run.id, 'remediation-verification-source-v1.json', { sourceCommit });
+  saveRun(run, file);
+}
+
+function processRemediationVerificationStage(run: Run, state: FactoryControllerState, file: string, goalHash: string): void {
+  const verification = loadArtifact<{ verifiedDefects: VerifiedDefect[] }>(file, goalHash, 'verification-v1.json');
+  const packets = loadArtifact<Record<string, VerificationPacket>>(file, goalHash, 'remediation-verification-packets-v1.json');
+  const results: VerificationResult[] = [];
+  for (const defect of verification.verifiedDefects) {
+    const task = requiredTask(run, state.tasks.remediationVerification[defect.id], `post-remediation verification for ${defect.id}`);
+    const assessment = parseJsonOutput(taskOutput(file, task), `post-remediation verification for ${defect.id}`);
+    const result = adjudicateVerification(packets[defect.id]!, assessment);
+    results.push(result);
+    if (result.verdict !== 'rejected' || result.reachability !== 'refuted' || result.confidence < 0.8) {
+      throw new Error(`verified defect ${defect.id} remains unresolved or lacks conclusive post-remediation evidence`);
+    }
+  }
+  saveArtifact(file, run.id, 'remediation-verification-v1.json', { schemaVersion: 1, results });
+}
+
 function prepareRecertificationStage(
   run: Run,
   state: FactoryControllerState,
@@ -657,6 +723,21 @@ function processRecertificationStage(
   goalHash: string,
   rootDir: string,
 ): void {
+  const verification = loadArtifact<{ verifiedDefects: VerifiedDefect[]; results: VerificationResult[] }>(file, goalHash, 'verification-v1.json');
+  const verifiedDefects = verification.verifiedDefects;
+  if (verification.results.some((item) => item.verdict === 'inconclusive')) {
+    throw new Error('final certification requires every original defect hypothesis to be resolved or rejected');
+  }
+  const repairSource = loadArtifact<{ sourceCommit: string }>(file, goalHash, 'remediation-verification-source-v1.json');
+  if (repositoryCommit(rootDir, run, file) !== repairSource.sourceCommit) {
+    throw new Error('source changed after defect rechecks; post-remediation evidence is stale');
+  }
+  const repairChecks = loadArtifact<{ results: VerificationResult[] }>(file, goalHash, 'remediation-verification-v1.json');
+  if (repairChecks.results.length !== verifiedDefects.length || verifiedDefects.some((defect) =>
+    repairChecks.results.filter((item) => item.hypothesis_id === defect.verification.hypothesis_id &&
+      item.verdict === 'rejected' && item.reachability === 'refuted' && item.confidence >= 0.8).length !== 1)) {
+    throw new Error('final certification requires conclusive post-remediation checks for every verified defect');
+  }
   const baselinePromotion = loadArtifact<BaselinePromotion>(file, goalHash, 'baseline-initial-v1.json');
   const baseline = createCertification(baselinePromotion.certification);
   const plan = loadArtifact<RecertificationPlan>(file, goalHash, 'recertification-plan-v1.json');
@@ -687,7 +768,7 @@ function processRecertificationStage(
     deterministicChecks: [{ id: `regression-${safeKey(claimId)}`, status: 'pass' as const, evidence: [regressionEvidence] }],
     reviewEvidence: [reviewEvidenceFor(claimId)],
   }));
-  const currentCommit = repositoryCommit(rootDir, run);
+  const currentCommit = repositoryCommit(rootDir, run, file);
   const testStateHash = sha256(canonicalJson({ regressionTask: regression.id, evidence: regressionEvidence, output: taskOutput(file, regression) }));
   const recertified = completeRecertification({
     baseline,
@@ -712,6 +793,42 @@ function processRecertificationStage(
   saveArtifact(file, run.id, 'certification-claims-final-v1.json', recertified.claims);
   if (recertified.certification.status !== 'certified' || finalPromotion.status !== 'certified') {
     throw new Error(`final recertification did not certify the run: ${finalPromotion.reasons.join('; ')}`);
+  }
+}
+
+function processConvergenceStage(run: Run, state: FactoryControllerState, file: string, goal: StructuredFactoryGoal, options: FactoryControllerOptions): void {
+  const policy = options.convergencePolicy ?? goal.convergencePolicy;
+  if (!policy) throw new Error('factory completion requires a convergencePolicy in the goal or --policy');
+  if (!options.convergenceAssessment) throw new Error('factory completion requires measured convergence evidence; resume with --assessment');
+  const reviewTaskIds = new Set([
+    ...(state.tasks.review ? [state.tasks.review] : []),
+    ...Object.values(state.tasks.verification),
+    ...Object.values(state.tasks.remediationVerification),
+    ...Object.values(state.tasks.recertification),
+  ]);
+  for (const unit of options.convergenceAssessment.reviewUnits) {
+    if (!reviewTaskIds.has(unit.id)) throw new Error(`convergence review unit ${unit.id} is not a factory review task`);
+    const task = requiredTask(run, unit.id, `convergence review unit ${unit.id}`);
+    const actual = evidenceForTask(file, run, task, 'review');
+    if (!unit.evidence.some((item) => item.uri === actual.uri && item.sha256 === actual.sha256)) {
+      throw new Error(`convergence review unit ${unit.id} lacks its recorded task evidence`);
+    }
+  }
+  const certification = loadArtifact<Certification>(file, state.goalHash, 'certification-v1.json');
+  const decision = evaluateAndSaveConvergence(file, {
+    ...options.convergenceAssessment,
+    runId: run.id,
+    certification,
+    currentCertificationState: {
+      commit: repositoryCommit(factoryWorkingRoot(run, file, options.cwd ?? dirname(file)), run, file),
+      specificationGraphHash: certification.specificationGraphHash,
+      architectureGraphHash: certification.architectureGraphHash,
+      testStateHash: certification.testStateHash,
+    },
+  }, policy);
+  saveArtifact(file, run.id, 'convergence-decision-v1.json', decision);
+  if (decision.status !== 'stop') {
+    throw new Error(`factory has not converged (${decision.status}): ${decision.reasons.join('; ')}`);
   }
 }
 
@@ -981,7 +1098,9 @@ function stageTaskIds(state: FactoryControllerState): string[] {
     case 'verification': return Object.values(state.tasks.verification);
     case 'root_cause': return state.tasks.rootCause ? [state.tasks.rootCause] : [];
     case 'remediation': return Object.values(state.tasks.remediation);
+    case 'remediation_verification': return Object.values(state.tasks.remediationVerification);
     case 'recertification': return [...(state.tasks.regression ? [state.tasks.regression] : []), ...Object.values(state.tasks.recertification)];
+    case 'convergence': return [];
     case 'complete': return [];
   }
 }
@@ -1200,11 +1319,13 @@ function initializeManifest(file: string, runId: string): void {
 function loadControllerState(file: string, runId: string): FactoryControllerState {
   const raw = readJsonFileWithBackup<unknown>(join(runPaths(file).factory, CONTROLLER_FILE));
   if (!raw || !isRecord(raw) || raw.schemaVersion !== 1 || raw.runId !== runId || typeof raw.goalHash !== 'string' ||
-    !['implementation', 'quality', 'verification', 'root_cause', 'remediation', 'recertification', 'complete'].includes(String(raw.stage)) ||
+    !['implementation', 'quality', 'verification', 'root_cause', 'remediation', 'remediation_verification', 'recertification', 'convergence', 'complete'].includes(String(raw.stage)) ||
     !['ready', 'running', 'waiting', 'completed'].includes(String(raw.status)) || !isRecord(raw.tasks)) {
     throw new Error('missing or invalid factory controller checkpoint; start the factory from a structured goal');
   }
-  return raw as unknown as FactoryControllerState;
+  const state = raw as unknown as FactoryControllerState;
+  state.tasks.remediationVerification ??= {};
+  return state;
 }
 
 function validateManifest(value: unknown, runId: string): asserts value is FactorySidecarManifest {
@@ -1264,7 +1385,7 @@ function checkpoint(file: string, state: FactoryControllerState): void {
 }
 
 function emptyTaskGroups(): FactoryTaskGroups {
-  return { implementation: {}, checks: {}, review: null, verification: {}, rootCause: null, remediation: {}, regression: null, recertification: {} };
+  return { implementation: {}, checks: {}, review: null, verification: {}, rootCause: null, remediation: {}, remediationVerification: {}, regression: null, recertification: {} };
 }
 
 function resultOf(run: Run, state: FactoryControllerState, file: string): FactoryControllerResult {
@@ -1281,7 +1402,7 @@ function summarizeController(run: Run, state: FactoryControllerState): string {
   const tasks = [
     ...Object.values(state.tasks.implementation), ...Object.values(state.tasks.checks),
     ...(state.tasks.review ? [state.tasks.review] : []), ...Object.values(state.tasks.verification),
-    ...(state.tasks.rootCause ? [state.tasks.rootCause] : []), ...Object.values(state.tasks.remediation),
+    ...(state.tasks.rootCause ? [state.tasks.rootCause] : []), ...Object.values(state.tasks.remediation), ...Object.values(state.tasks.remediationVerification),
     ...(state.tasks.regression ? [state.tasks.regression] : []), ...Object.values(state.tasks.recertification),
   ];
   const completed = tasks.filter((id) => run.tasks[id]?.status === 'completed').length;
@@ -1330,10 +1451,28 @@ function balancedJsonCandidates(source: string): string[] {
   return result;
 }
 
-function repositoryCommit(rootDir: string, run: Run): string {
+function repositoryCommit(rootDir: string, run: Run, file: string): string {
   const ref = run.settings.worktree === 'task' ? `dag/${run.id}` : 'HEAD';
-  try { return execFileSync('git', ['rev-parse', ref], { cwd: rootDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim(); }
-  catch { throw new Error(`factory certification requires a Git commit in ${rootDir}`); }
+  try {
+    const commit = execFileSync('git', ['rev-parse', ref], { cwd: rootDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    const paths = runPaths(file);
+    const runtime = [paths.file, paths.dir, `${paths.file}.bak`, `${paths.file}.lock`]
+      .map((path) => relative(rootDir, path).replace(/\\/g, '/'))
+      .filter((path) => path && !path.startsWith('../') && !posix.isAbsolute(path));
+    const status = execFileSync('git', ['status', '--porcelain', '-z', '--untracked-files=all'], {
+      cwd: rootDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const dirty = status.split('\0').filter(Boolean).some((entry) => {
+      const path = entry.slice(3).replace(/\\/g, '/');
+      return !runtime.some((artifact) => path === artifact || path.startsWith(`${artifact}/`));
+    });
+    if (dirty) throw new Error('factory certification requires a committed, clean source tree; commit changes or use task worktrees');
+    return commit;
+  }
+  catch (error) {
+    if (error instanceof Error && error.message.startsWith('factory certification requires a committed')) throw error;
+    throw new Error(`factory certification requires a Git commit in ${rootDir}`);
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, any> { return typeof value === 'object' && value !== null && !Array.isArray(value); }

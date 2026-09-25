@@ -2,7 +2,7 @@
 // the existing DagRunner by the controller; this file only handles CLI I/O.
 import { readFileSync } from 'node:fs';
 import { emit, flag, flagRequired, guard, wantsJson } from '../cli-args.js';
-import { factoryStatus, resumeFactory, startFactory, type StructuredFactoryGoal } from '../factory/controller.js';
+import { factoryStatus, resumeFactory, startFactory, type StructuredFactoryGoal, type FactoryControllerOptions } from '../factory/controller.js';
 import type { DagEvent } from '../types.js';
 
 export async function factoryCmd(argv: string[]): Promise<void> {
@@ -15,7 +15,7 @@ export async function factoryCmd(argv: string[]): Promise<void> {
   }
 
   if (subcommand !== 'start' && subcommand !== 'resume') {
-    throw new Error('usage: dag factory start --goal goal.json [--file dag.run.json] | factory resume|status [--file dag.run.json]');
+    throw new Error('usage: dag factory start --goal goal.json [--file dag.run.json] | factory resume [--assessment evidence.json] [--policy policy.json] | factory status [--file dag.run.json]');
   }
   guard(file, argv);
   const onEvent = (event: DagEvent): void => {
@@ -24,9 +24,16 @@ export async function factoryCmd(argv: string[]): Promise<void> {
     if (wantsJson(argv)) console.error(line);
     else console.log(line);
   };
+  const assessmentFile = flag(argv, 'assessment');
+  const policyFile = flag(argv, 'policy');
+  const options: FactoryControllerOptions = {
+    onEvent,
+    ...(assessmentFile ? { convergenceAssessment: readAssessment(assessmentFile) } : {}),
+    ...(policyFile ? { convergencePolicy: readPolicy(policyFile) } : {}),
+  };
   const result = subcommand === 'start'
-    ? await startFactory(readGoal(flagRequired(argv, 'goal')), file, { onEvent })
-    : await resumeFactory(file, { onEvent });
+    ? await startFactory(readGoal(flagRequired(argv, 'goal')), file, options)
+    : await resumeFactory(file, options);
   emit(argv, result, () => result.summary);
   if (result.state.status !== 'completed') process.exitCode = 1;
 }
@@ -36,4 +43,14 @@ function readGoal(file: string): StructuredFactoryGoal {
   try { value = JSON.parse(readFileSync(file, 'utf8')); }
   catch (error) { throw new Error(`cannot read structured factory goal ${file}: ${error instanceof Error ? error.message : String(error)}`); }
   return value as StructuredFactoryGoal;
+}
+
+function readAssessment(file: string): NonNullable<FactoryControllerOptions['convergenceAssessment']> {
+  try { return JSON.parse(readFileSync(file, 'utf8')) as NonNullable<FactoryControllerOptions['convergenceAssessment']>; }
+  catch (error) { throw new Error(`cannot read convergence assessment ${file}: ${error instanceof Error ? error.message : String(error)}`); }
+}
+
+function readPolicy(file: string): NonNullable<FactoryControllerOptions['convergencePolicy']> {
+  try { return JSON.parse(readFileSync(file, 'utf8')) as NonNullable<FactoryControllerOptions['convergencePolicy']>; }
+  catch (error) { throw new Error(`cannot read convergence policy ${file}: ${error instanceof Error ? error.message : String(error)}`); }
 }
