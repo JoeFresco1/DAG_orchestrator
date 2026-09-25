@@ -119,7 +119,7 @@ export function normalizeObservations(raw: readonly RawObservation[]): {
     return {
       canonical,
       key: hash(JSON.stringify(canonical)),
-      sourceId: optionalText(item.id),
+      sourceId: optionalId(item.id),
       reviewer: optionalText(item.reviewer),
     };
   });
@@ -395,6 +395,14 @@ function optionalText(value: unknown): string | undefined {
   if (typeof value !== 'string') throw new Error('observation source id and reviewer must be strings');
   const normalized = cleanText(value);
   return normalized || undefined;
+}
+
+// Finding IDs are opaque identifiers: retain their case and punctuation so
+// links back to source systems remain exact (for example, F103).
+function optionalId(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string') throw new Error('observation source id must be a string');
+  return value.normalize('NFKC').trim() || undefined;
 }
 
 function isRecord(value: unknown): value is RawObservation {
