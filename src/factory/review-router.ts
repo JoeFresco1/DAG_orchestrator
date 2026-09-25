@@ -1,4 +1,5 @@
 import type { Reviewer } from '../review-policy.js';
+import { assignReviewIntensity, type ReviewIntensityDecision } from './review-intensity.js';
 
 export const REVIEW_STAGES = [
   'deterministic', 'local', 'dependency', 'subsystem', 'integration', 'security', 'e2e', 'independent',
@@ -20,6 +21,10 @@ export interface ReviewRouterEvidence {
   riskScore?: number;
   riskReasons?: string[];
   deterministicFindings?: string[];
+  /** New evidence since the preceding review pass. Each item is auditable in the saved plan. */
+  contradictions?: string[];
+  changedContracts?: string[];
+  verifiedDefects?: string[];
   testCoverage?: number;
   priorVerifiedDefects?: number;
   priorFalsePositives?: number;
@@ -50,6 +55,7 @@ export interface ReviewPlan {
   risk: 'low' | 'medium' | 'high' | 'critical';
   riskScore: number;
   riskReasons: string[];
+  intensity: ReviewIntensityDecision;
   depth: 'deterministic' | 'targeted' | 'deep' | 'escalated';
   modelClass: 'none' | 'cheap' | 'strong';
   reviewRequired: boolean;
@@ -78,7 +84,7 @@ export function createReviewPlan(evidence: ReviewRouterEvidence, configured: Rev
   if (evidence.diffLines !== null && evidence.diffLines > 500) { score += 15; reasons.push(`large change (${evidence.diffLines} diff lines)`); }
   else if (evidence.diffLines !== null && evidence.diffLines > 150) { score += 8; reasons.push(`substantial change (${evidence.diffLines} diff lines)`); }
   if (evidence.workExitCode !== null && evidence.workExitCode !== 0) { score += 25; reasons.push('deterministic work command failure'); }
-  if ((evidence.deterministicFindings?.length ?? 0) > 0) { score += 20; reasons.push('deterministic findings are present'); }
+  if ((evidence.deterministicFindings?.length ?? 0) > 0) { reasons.push('deterministic findings are present'); }
   if (evidence.testCoverage !== undefined && evidence.testCoverage < 0.6) { score += 15; reasons.push('low test coverage'); }
   if ((evidence.priorVerifiedDefects ?? 0) > 0) { score += 15; reasons.push('prior verified defects in this unit'); }
   if ((evidence.priorFalsePositives ?? 0) >= 3) { score -= 10; reasons.push('history contains repeated false positives'); }
@@ -95,8 +101,19 @@ export function createReviewPlan(evidence: ReviewRouterEvidence, configured: Rev
     reasons.push(...(evidence.riskReasons ?? ['risk score supplied by the repository risk engine']));
   }
   score = clamp(score);
+  const intensity = assignReviewIntensity({
+    riskScore: score,
+    triggers: {
+      'deterministic-finding': evidence.deterministicFindings?.length ?? 0,
+      contradiction: evidence.contradictions?.length ?? 0,
+      'changed-contract': evidence.changedContracts?.length ?? 0,
+      'verified-defect': evidence.verifiedDefects?.length ?? 0,
+    },
+  });
+  score = intensity.score;
 
-  const risk: ReviewPlan['risk'] = score >= 80 ? 'critical' : score >= 60 ? 'high' : score >= 35 ? 'medium' : 'low';
+  const risk: ReviewPlan['risk'] = score >= 90 ? 'critical' : score >= 60 ? 'high' : score >= 35 ? 'medium' : 'low';
+  reasons.push(...intensity.reasons);
   if (!reasons.length) reasons.push('no elevated risk signals; history and coverage are not available');
   const deterministic = configured.filter((reviewer) => reviewer.verdict === 'exit-code');
   const agents = configured.filter((reviewer) => reviewer.verdict !== 'exit-code');
@@ -127,17 +144,17 @@ export function createReviewPlan(evidence: ReviewRouterEvidence, configured: Rev
     if (candidate) { selectedNames.add(candidate.reviewer.name); stageReasons.set(stage, why); }
   };
 
-  if (risk === 'critical' || risk === 'high') {
-    selectStage('dependency', 'high impact change requires dependency impact review');
-    if (SECURITY.test(text) || evidence.graphSignals?.securitySensitive) selectStage('security', 'security-sensitive boundary requires specialist review');
-    if (INTEGRATION.test(text) || evidence.graphSignals?.integrationBoundary) selectStage('integration', 'contract or integration boundary requires cross-component review');
-    selectStage('independent', 'high-risk work requires an independent verifier');
-    selectStage('local', 'high-risk work requires a focused local review');
-    selectStage('subsystem', 'high-risk work requires subsystem context');
-    selectStage('e2e', 'high-risk behavior merits an end-to-end review');
-  } else {
-    selectStage('local', risk === 'medium' ? 'moderate risk merits one focused local review' : 'one focused review is retained because evidence is incomplete');
-    if ((INTEGRATION.test(text) || evidence.graphSignals?.integrationBoundary) && risk === 'medium') selectStage('integration', 'moderate-risk contract change crosses an integration boundary');
+  const stageWhy: Partial<Record<ReviewStage, string>> = {
+    local: `risk intensity ${score} requires focused local review (${intensity.tier} tier)`,
+    dependency: `risk intensity ${score} requires dependency impact review (${intensity.tier} tier)`,
+    integration: `risk intensity ${score} requires contract and integration review (${intensity.tier} tier)`,
+    subsystem: `risk intensity ${score} requires subsystem review (${intensity.tier} tier)`,
+    security: `risk intensity ${score} requires specialist review (${intensity.tier} tier)`,
+    e2e: `risk intensity ${score} requires end-to-end path review (${intensity.tier} tier)`,
+    independent: `risk intensity ${score} requires independent verification (${intensity.tier} tier)`,
+  };
+  for (const stage of intensity.requiredStages) {
+    if (stage !== 'deterministic') selectStage(stage as ReviewStage, stageWhy[stage as ReviewStage] ?? `required by ${intensity.tier} policy tier`);
   }
   for (const { reviewer } of classified) {
     if ((reviewer.when ?? '').split(';').some((clause) => clause.trim().toLowerCase() === 'on-reject')) {
@@ -196,7 +213,7 @@ export function createReviewPlan(evidence: ReviewRouterEvidence, configured: Rev
       : { stage, selected: false, reason: skipped?.reason ?? `no ${stage} reviewer is configured` };
   });
   const selectedAgentCount = reviewers.filter((reviewer) => reviewer.selected && reviewer.stage !== 'deterministic').length;
-  const verificationRequired = risk === 'high' || risk === 'critical' || selectedAgentCount > 1;
+  const verificationRequired = ['subsystem', 'specialist', 'independent'].includes(intensity.tier) || selectedAgentCount > 1;
   const priority = clamp(Math.round(score * 0.8 + (verificationRequired ? 12 : 0)));
   return {
     schemaVersion: 1,
@@ -204,8 +221,9 @@ export function createReviewPlan(evidence: ReviewRouterEvidence, configured: Rev
     risk,
     riskScore: score,
     riskReasons: reasons,
-    depth: risk === 'critical' ? 'escalated' : risk === 'high' ? 'deep' : risk === 'medium' ? 'targeted' : 'deterministic',
-    modelClass: selectedAgentCount === 0 ? 'none' : risk === 'high' || risk === 'critical' ? 'strong' : 'cheap',
+    intensity,
+    depth: intensity.tier === 'independent' ? 'escalated' : ['specialist', 'subsystem'].includes(intensity.tier) ? 'deep' : ['contract', 'local'].includes(intensity.tier) ? 'targeted' : 'deterministic',
+    modelClass: selectedAgentCount === 0 ? 'none' : ['specialist', 'independent'].includes(intensity.tier) ? 'strong' : 'cheap',
     reviewRequired: selectedAgentCount > 0 || deterministic.length > 0,
     deterministicSufficient,
     verificationRequired,
