@@ -26,6 +26,7 @@ import {
 } from './graph.js';
 import { attemptsForChain, planAttempt, type HarnessCandidate } from './harness-chain.js';
 import { findHarness } from './harnesses.js';
+import { createReviewPlan, type ReviewRouterEvidence } from './factory/review-router.js';
 import {
   decideReviewers,
   summarizeVerdicts,
@@ -35,6 +36,7 @@ import {
 import {
   acquireLock,
   attemptLogPath,
+  atomicWriteJson,
   heartbeatPath,
   lockHeldBy,
   logEvent,
@@ -398,6 +400,11 @@ export interface RunnerOptions {
   file?: string;
   // Working directory for spawned commands. Defaults to the run file's dir.
   cwd?: string;
+  /** Optional graph/risk/history evidence supplied to the adaptive review router. */
+  reviewEvidence?: (
+    task: Task,
+    diff: DiffStats | null,
+  ) => Partial<Omit<ReviewRouterEvidence, 'unit' | 'title' | 'spec' | 'changedFiles' | 'diffLines' | 'workExitCode'>>;
 }
 
 /** Final buckets for a settled run, plus recovery and end-of-run review facts. */
@@ -1526,12 +1533,47 @@ export class DagRunner {
     worktreePath?: string,
     planFile?: string,
     depsContext?: TokenContext,
+    workExitCode: number | null = task.exitCode,
   ): Promise<'pass' | 'requeue' | 'fail'> {
     const round = task.reviews + 1;
     const total = task.reviewRounds + 1;
     const reviewers = this.reviewersFor(task);
     const diff = this.diffStats(task);
     const decisions = decideReviewers(reviewers, diff, false);
+    const routedReviewers = reviewers.map((reviewer) => ({
+      ...reviewer,
+      verdict: reviewer.verdict ?? this.state.settings.reviewVerdict,
+    }));
+    const supplementalEvidence = this.opts.reviewEvidence?.(task, diff) ?? {};
+    const routerEvidence: ReviewRouterEvidence = {
+      unit: task.id,
+      title: task.title,
+      spec: task.spec ?? '',
+      changedFiles: diff?.files ?? [],
+      diffLines: diff?.lines ?? null,
+      workExitCode,
+      ...supplementalEvidence,
+      deterministicFindings: [
+        ...(workExitCode !== null && workExitCode !== 0 ? [`work command exited ${workExitCode}`] : []),
+        ...(supplementalEvidence.deterministicFindings ?? []),
+      ],
+    };
+    const plan = createReviewPlan(routerEvidence, routedReviewers);
+    const sidecar = runPaths(this.opts.file ?? join(tmpdir(), `dag-${this.state.id}.json`));
+    const planPath = join(
+      sidecar.dir,
+      'factory',
+      'review-plans',
+      `${task.id.replace(/[^a-zA-Z0-9_.-]/g, '_')}-attempt-${task.attempts}-round-${round}.json`,
+    );
+    atomicWriteJson(planPath, {
+      ...plan,
+      runId: this.state.id,
+      taskId: task.id,
+      attempt: task.attempts,
+      reviewRound: round,
+      evidence: routerEvidence,
+    });
     this.log(
       'task-review',
       task.id,
@@ -1543,6 +1585,16 @@ export class DagRunner {
     let rejected: { name: string; reason: string } | null = null;
     for (const decision of decisions) {
       const reviewer = decision.reviewer;
+      const route = plan.reviewers.find((item) => item.name === reviewer.name);
+      if (route && !route.selected) {
+        task.reviewerVerdicts[reviewer.name] = {
+          verdict: 'skipped',
+          reason: route.reason,
+          at: nowIso(),
+        };
+        this.log('task-review', task.id, `router skipped reviewer "${reviewer.name}": ${route.reason}`);
+        continue;
+      }
       if (!decision.run && !decision.onReject) {
         task.reviewerVerdicts[reviewer.name] = {
           verdict: 'skipped',
@@ -2197,14 +2249,12 @@ export class DagRunner {
 
       this.enforceExitPolicy(task, outcome);
 
-      if (this.reviewersFor(task).length > 0) {
-        const verdict = await this.reviewPass(task, execute, scope, worktreePath ?? undefined, planFile, depsContext);
-        if (this.tokens.get(task.id) !== token) return;
-        if (verdict !== 'pass') {
-          this.dropWorktree(task.id);
-          this.persist();
-          return;
-        }
+      const verdict = await this.reviewPass(task, execute, scope, worktreePath ?? undefined, planFile, depsContext, outcome.exitCode);
+      if (this.tokens.get(task.id) !== token) return;
+      if (verdict !== 'pass') {
+        this.dropWorktree(task.id);
+        this.persist();
+        return;
       }
 
       // Worktree mode: land the work before declaring success.
