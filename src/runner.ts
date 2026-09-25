@@ -25,6 +25,8 @@ import {
   transitiveDependentIds,
 } from './graph.js';
 import { attemptsForChain, planAttempt, type HarnessCandidate } from './harness-chain.js';
+import { routeModel, type ModelRouteCandidate, type ModelTier } from './factory/model-router.js';
+import type { ReviewerCalibrationReport } from './factory/reviewer-calibration.js';
 import { findHarness } from './harnesses.js';
 import { createReviewPlan, type ReviewRouterEvidence } from './factory/review-router.js';
 import {
@@ -405,6 +407,11 @@ export interface RunnerOptions {
     task: Task,
     diff: DiffStats | null,
   ) => Partial<Omit<ReviewRouterEvidence, 'unit' | 'title' | 'spec' | 'changedFiles' | 'diffLines' | 'workExitCode'>>;
+  /** Optional calibration and live remaining budget for model routing. */
+  modelRouting?: {
+    calibration?: ReviewerCalibrationReport;
+    remainingBudgetUsd?: (task: Task, attempt: number) => number | undefined;
+  };
 }
 
 /** Final buckets for a settled run, plus recovery and end-of-run review facts. */
@@ -494,6 +501,9 @@ export class DagRunner {
   // Coverage bundles are deterministic once their covered tasks finish, so cache
   // them per chain-review task rather than rebuilding on every attempt.
   private coverageCache = new Map<string, TaskCoverage | null>();
+  // Model values written by the active fallback chain are runner selections,
+  // not authored task overrides, so later chain attempts may replace them.
+  private chainSelectedModels = new Set<string>();
 
   constructor(
     readonly state: Run,
@@ -2141,17 +2151,52 @@ export class DagRunner {
   // preset owns the command, the candidate owns the model.
   private applyHarnessChain(task: Task, attempt: number): { cmd: string | null; planCmd: string | null } {
     const chain = this.effectiveChain(task);
-    const plan = planAttempt(chain, attempt);
+    let routeReason: string | null = null;
+    let routeOffset = 0;
+    if (attempt === 1 && chain && chain.length > 1 && task.model?.trim()) {
+      routeReason = 'explicit task model override preserved';
+    } else if (attempt === 1 && chain && chain.length > 1 && this.state.settings.model.trim()) {
+      routeReason = 'explicit run model override preserved';
+    } else if (attempt === 1 && chain && chain.length > 1) {
+      const candidates: ModelRouteCandidate[] = chain.map((candidate, index) => ({
+        ...candidate,
+        // An authored fallback chain is the available escalation ladder.
+        // With two choices, the second is the strong fallback; with three or
+        // more choices, use the first three levels and treat extras as strong.
+        tier: (chain.length === 2 ? (index === 0 ? 'cheap' : 'strong') : index === 0 ? 'cheap' : index === 1 ? 'medium' : 'strong') as ModelTier,
+      }));
+      const decision = routeModel({
+        taskTitle: task.title,
+        taskSpec: task.spec ?? '',
+        override: task.model ? { model: task.model } : undefined,
+        remainingBudgetUsd: this.opts.modelRouting?.remainingBudgetUsd?.(task, attempt),
+      }, candidates, this.opts.modelRouting?.calibration);
+      if (decision.candidate) {
+        routeOffset = chain.findIndex((candidate) => candidate.harness === decision.candidate!.harness &&
+          (candidate.model ?? null) === (decision.candidate!.model ?? null));
+        routeReason = decision.reason;
+      } else if (decision.tier === 'human' || decision.tier === 'deterministic') {
+        // The ordinary chain remains the fallback when no configured model is
+        // appropriate. Record the router's explicit disposition for auditing.
+        routeReason = decision.reason;
+      }
+    }
+    const plan = planAttempt(chain, Math.max(1, attempt + routeOffset));
     if (!plan) return { cmd: task.cmd, planCmd: task.planCmd };
     task.harness = plan.candidate.harness;
-    if (plan.candidate.model !== undefined) task.model = plan.candidate.model;
+    if (plan.candidate.model !== undefined && (!task.model?.trim() || this.chainSelectedModels.has(task.id)) && !this.state.settings.model.trim()) {
+      task.model = plan.candidate.model;
+      this.chainSelectedModels.add(task.id);
+    }
     if (plan.candidate.variant !== undefined) task.variant = plan.candidate.variant;
     this.log(
       'task-start',
       task.id,
-      plan.fellBack
-        ? `falling back to ${plan.candidate.harness} (candidate ${plan.index}/${chain?.length})`
-        : `using harness ${plan.candidate.harness}`,
+        routeReason
+        ? `${routeReason.startsWith('explicit ') ? 'using' : plan.fellBack ? 'escalating to' : 'routed to'} ${plan.candidate.harness} (candidate ${plan.index}/${chain?.length}); ${routeReason}`
+        : plan.fellBack
+          ? `falling back to ${plan.candidate.harness} (candidate ${plan.index}/${chain?.length})`
+          : `using harness ${plan.candidate.harness}`,
     );
     return {
       cmd: plan.harness.cmd,

@@ -127,6 +127,38 @@ describe('watchdog and failures', () => {
     assert.equal(run.tasks[a.id].model, 'gpt-5-codex');
   });
 
+  it('routes a high-risk task to the strong configured harness and records the reason', async () => {
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    run.tasks[a.id].title = 'Review authentication credential handling';
+    run.tasks[a.id].harnessChain = parseHarnessChain('opencode:fast,codex:strong');
+    const commands: string[] = [];
+    await new DagRunner(run, {
+      executor: async (_task, _ctx, cmd) => {
+        commands.push(cmd ?? '');
+        return { output: 'ok', exitCode: 0 };
+      },
+    }).start();
+    assert.equal(run.tasks[a.id].harness, 'codex');
+    assert.ok(commands.every((cmd) => /codex exec/.test(cmd)));
+    assert.ok(run.events.some((event) => /(?:routed|escalating) to codex.*risk 90/.test(event.message ?? '')));
+  });
+
+  it('keeps a task model override when a harness chain is configured', async () => {
+    const { run, a } = make(['a']) as { run: Run; a: Task };
+    run.tasks[a.id].title = 'Review authentication credential handling';
+    run.tasks[a.id].harnessChain = parseHarnessChain('opencode:fast,codex:strong');
+    run.tasks[a.id].model = 'fixed-model';
+    let cmd = '';
+    await new DagRunner(run, {
+      executor: async (_task, _ctx, command) => {
+        cmd = command ?? '';
+        return { output: 'ok', exitCode: 0 };
+      },
+    }).start();
+    assert.match(cmd, /opencode run/);
+    assert.match(cmd, /fixed-model/);
+  });
+
   it('falls back when a tool dies with a non-zero exit and nothing judges it', async () => {
     const { run, a } = make(['a']) as { run: Run; a: Task };
     run.tasks[a.id].harnessChain = parseHarnessChain('opencode,codex');
