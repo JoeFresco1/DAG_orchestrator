@@ -244,6 +244,22 @@ Per-task final review uses attributable worktree diffs. A rejection with rounds
 remaining requeues the task with the reviewer’s feedback. Without worktree
 isolation, DAG Orchestrator falls back to a run-level advisory review.
 
+## Closed-loop software factory
+
+Run a structured goal through requirement trace, implementation, review,
+hypothesis verification, root-cause remediation, regression checks, and
+recertification with the existing executor:
+
+```bash
+dag factory start --goal docs/factory/goal.json --file dag.run.json
+dag factory status --file dag.run.json
+dag factory resume --file dag.run.json
+```
+
+The controller stores versioned graph artifacts and its resume checkpoint in
+the run sidecar. See the [software factory operator guide](docs/software-factory.md)
+for the goal schema, command contracts, and recovery procedure.
+
 ## One host, many projects
 
 One hub can serve every registered project:

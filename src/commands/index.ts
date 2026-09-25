@@ -42,6 +42,7 @@ import { newRunCmd, runsCmd } from './runs.js';
 import { initCmd, projectsCmd } from './projects.js';
 import { scheduleCmd } from './schedule.js';
 import { launchCmd, serveCmd, serversCmd } from './viewer.js';
+import { factoryCmd } from './factory.js';
 
 /** Maps `dag <name>` to its handler; aliases share one handler on purpose. */
 export const COMMANDS: Record<string, CommandHandler> = {
@@ -59,6 +60,7 @@ export const COMMANDS: Record<string, CommandHandler> = {
   // Same handler as `schedule`; it checks `cmd` to choose queue vs worker.
   scheduler: scheduleCmd,
   // Run lifecycle
+  factory: factoryCmd,
   run: runCmd,
   resume: resumeCmd,
   'skip-blocked': skipBlockedCmd,
