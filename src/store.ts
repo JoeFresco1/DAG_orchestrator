@@ -58,6 +58,8 @@ import {
 export interface RunPaths {
   file: string;
   dir: string;
+  /** Factory-owned, versioned artifacts for this run. */
+  factory: string;
   state: string;
   events: string;
   logs: string;
@@ -73,6 +75,7 @@ export function runPaths(file: string): RunPaths {
   return {
     file: abs,
     dir,
+    factory: join(dir, 'factory'),
     state: join(dir, 'state.json'),
     events: join(dir, 'events.jsonl'),
     logs: join(dir, 'logs'),
