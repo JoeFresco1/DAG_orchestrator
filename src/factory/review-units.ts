@@ -51,6 +51,7 @@ export function generateReviewUnits(index: CodeGraphIndex, options: ReviewUnitOp
   const inbound = new Map<string, Set<string>>();
   const outbound = new Map<string, Set<string>>();
   const tests = new Map<string, Set<string>>();
+  const contracts = new Map<string, Set<string>>();
 
   const add = (map: Map<string, Set<string>>, key: string, value: string): void => {
     let values = map.get(key);
@@ -61,6 +62,10 @@ export function generateReviewUnits(index: CodeGraphIndex, options: ReviewUnitOp
     if (edge.type === 'tests') {
       add(tests, edge.to, edge.from);
       add(tests, edge.from, edge.to);
+      continue;
+    }
+    if (edge.type === 'uses' && CONTRACT_KINDS.has(entities.get(edge.to)?.kind ?? 'symbol')) {
+      add(contracts, edge.from, edge.to);
       continue;
     }
     if (!DEPENDENCY_EDGES.has(edge.type)) continue;
@@ -76,6 +81,7 @@ export function generateReviewUnits(index: CodeGraphIndex, options: ReviewUnitOp
   const inboundOrder = ordered(inbound);
   const outboundOrder = ordered(outbound);
   const testOrder = ordered(tests);
+  const contractOrder = ordered(contracts);
   const sorted = (map: Map<string, string[]>, id: string): string[] => map.get(id) ?? [];
   const nuclei = index.graph.entities
     .filter((entity) => nucleusKinds.has(entity.kind))
@@ -133,6 +139,7 @@ export function generateReviewUnits(index: CodeGraphIndex, options: ReviewUnitOp
       .filter((id) => entities.get(id)?.kind === 'test' || isTestEntity(entities.get(id)));
     addRole('tests', testIds, maxNeighbors);
     const contractIds = uniqueSorted(contextIds.flatMap((id) => [
+      ...(contractOrder.get(id) ?? []),
       ...sorted(inboundOrder, id).slice(0, maxNeighbors),
       ...sorted(outboundOrder, id).slice(0, maxNeighbors),
     ])).filter((id) => CONTRACT_KINDS.has(entities.get(id)?.kind ?? 'symbol'));
