@@ -752,6 +752,8 @@ export function touch(run: Run): void {
 // Caller-supplied fields for a new task. Dynamic/state fields are initialized
 // by addTask, not accepted here.
 export interface AddTaskInput {
+  /** Optional stable ID for idempotent, persisted workflow compilers. */
+  id?: string;
   title: string;
   spec: string;
   deps?: string[];
@@ -778,7 +780,9 @@ export function addTask(run: Run, input: AddTaskInput): Task {
   for (const d of deps) {
     if (!run.tasks[d]) throw new Error(`unknown dep ${d}`);
   }
-  const id = `task_${randomUUID().slice(0, 8)}`;
+  const id = input.id ?? `task_${randomUUID().slice(0, 8)}`;
+  if (!/^task_[A-Za-z0-9._-]+$/.test(id)) throw new Error(`invalid task id: ${id}`);
+  if (run.tasks[id]) throw new Error(`task already exists: ${id}`);
   const seq = Object.values(run.tasks).reduce((m, t) => Math.max(m, t.seq ?? 0), 0) + 1;
   const task: Task = {
     id,

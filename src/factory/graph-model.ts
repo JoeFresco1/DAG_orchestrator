@@ -82,16 +82,21 @@ export interface GraphEdgeTypeByKind {
 
 export type FactoryCrossGraphEdge =
   | FactoryEdge<'implemented_by', FactoryGraphEntityId<'requirement'>, FactoryGraphEntityId<'code'>> // requirement -> symbol
-  | FactoryEdge<'modified_by', FactoryGraphEntityId<'code'>, FactoryGraphEntityId<'execution'>> // symbol -> execution task
+  | FactoryEdge<'modified_by', FactoryGraphEntityId<'code'>, FactoryGraphEntityId<'execution'>> // code entity -> execution task
   | FactoryEdge<'produced', FactoryGraphEntityId<'execution'>, FactoryGraphEntityId<'defect'>> // execution task -> observation
   | FactoryEdge<'supports', FactoryGraphEntityId<'defect'>, FactoryGraphEntityId<'defect'>> // observation -> hypothesis or defect
   | FactoryEdge<'explained_by', FactoryGraphEntityId<'defect'>, FactoryGraphEntityId<'defect'>> // defect -> root cause
   | FactoryEdge<'repaired_by', FactoryGraphEntityId<'defect'>, FactoryGraphEntityId<'execution'>> // root cause -> remediation task
   | FactoryEdge<'involves', FactoryGraphEntityId<'code'>, FactoryGraphEntityId<'defect'>>; // code entity -> finding/defect
 
+const CODE_ENTITY_KINDS = [
+  'module', 'file', 'symbol', 'function', 'class', 'api', 'contract', 'data', 'schema',
+  'database_model', 'queue', 'event', 'test', 'configuration', 'external_service', 'execution_path',
+];
+
 const ENTITY_KINDS: Record<FactoryEntityKind, readonly string[]> = {
   requirement: ['goal', 'spec', 'requirement', 'acceptance_criterion'],
-  code: ['module', 'file', 'symbol', 'function', 'class', 'api', 'contract', 'data', 'schema', 'database_model', 'queue', 'event', 'test', 'configuration', 'external_service', 'execution_path'],
+  code: CODE_ENTITY_KINDS,
   execution: ['implementation_task', 'review_task', 'verification_task', 'remediation_task'],
   defect: ['observation', 'hypothesis', 'defect', 'dispute', 'root_cause', 'remediation'],
 };
@@ -127,7 +132,7 @@ const INTERNAL_EDGE_RULES: Record<FactoryEntityKind, Record<string, [string[], s
   },
   defect: {
     corroborates: [['observation'], ['observation']],
-    supports: [['observation'], ['hypothesis', 'defect']],
+    supports: [['observation', 'hypothesis'], ['hypothesis', 'defect']],
     explains: [['root_cause'], ['defect']],
     disputes: [['dispute'], ['hypothesis', 'defect', 'root_cause']],
     remediates: [['remediation'], ['defect', 'root_cause']],
@@ -136,7 +141,7 @@ const INTERNAL_EDGE_RULES: Record<FactoryEntityKind, Record<string, [string[], s
 
 const CROSS_EDGE_RULES: Record<FactoryCrossGraphEdge['type'], [FactoryEntityKind, string[], FactoryEntityKind, string[]]> = {
   implemented_by: ['requirement', ['requirement'], 'code', ['symbol']],
-  modified_by: ['code', ['symbol'], 'execution', ['implementation_task', 'remediation_task']],
+  modified_by: ['code', CODE_ENTITY_KINDS, 'execution', ['implementation_task', 'remediation_task']],
   produced: ['execution', ['implementation_task', 'review_task', 'verification_task', 'remediation_task'], 'defect', ['observation']],
   supports: ['defect', ['observation'], 'defect', ['hypothesis', 'defect']],
   explained_by: ['defect', ['defect'], 'defect', ['root_cause']],
@@ -173,7 +178,10 @@ export function validateFactoryGraphModel(value: unknown): asserts value is Fact
     for (const rawEntity of graph.entities) {
       if (!isRecord(rawEntity) || !isFactoryEntityId(rawEntity.id) || !rawEntity.id.startsWith(`${graphKind}:v1:`) ||
         typeof rawEntity.kind !== 'string' || !ENTITY_KINDS[graphKind].includes(rawEntity.kind) || typeof rawEntity.title !== 'string' || !rawEntity.title.trim()) {
-        throw new Error(`invalid entity in ${graphKind} graph`);
+        const details = isRecord(rawEntity)
+          ? ` (id=${String(rawEntity.id)}, kind=${String(rawEntity.kind)}, title=${String(rawEntity.title)})`
+          : '';
+        throw new Error(`invalid entity in ${graphKind} graph${details}`);
       }
       if (entities.has(rawEntity.id)) throw new Error(`duplicate entity id: ${rawEntity.id}`);
       entities.set(rawEntity.id, { graph: graphKind, kind: rawEntity.kind });

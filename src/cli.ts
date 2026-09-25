@@ -21,6 +21,10 @@ usage: dag <cmd> [flags]
   scheduler [--poll SEC] [--once] [--drain] [--watch] [--open]
                                run scheduled jobs one at a time
   init --objective "..."        new run file
+  factory start --goal goal.json [--file F]
+                               compile and run a structured software-factory cycle
+  factory resume|status [--file F]
+                               continue or inspect the persisted factory cycle
   add --title T --spec S [--deps a,b] [--cmd "..."] [--retries N]
       [--timeout SEC] [--silence SEC] [--plan-cmd "..."] [--review-cmd "..."]
       [--review-rounds N] [--repair-rounds N]

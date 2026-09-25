@@ -105,7 +105,13 @@ export function compileRemediation(input: RemediationCompilerInput): Remediation
  * Materialize a compiled plan through the existing store.addTask API and add
  * its trace entities/links to the existing optional four-graph model.
  */
-export function createRemediationTasks(run: Run, plan: RemediationPlan, model?: FactoryGraphModel): { tasks: Task[]; graph: FactoryGraphModel | undefined } {
+export function createRemediationTasks(
+  run: Run,
+  plan: RemediationPlan,
+  model?: FactoryGraphModel,
+  taskIdForNode?: (node: RemediationNode) => string,
+  prerequisiteTaskIds: readonly string[] = [],
+): { tasks: Task[]; graph: FactoryGraphModel | undefined } {
   if (plan.schemaVersion !== 1 || !Array.isArray(plan.nodes)) throw new Error('invalid remediation plan');
   if (model) validateFactoryGraphModel(model);
   const taskByPlanId = new Map<string, Task>();
@@ -116,7 +122,14 @@ export function createRemediationTasks(run: Run, plan: RemediationPlan, model?: 
       if (!task) throw new Error(`remediation plan has missing or forward dependency: ${id}`);
       return task.id;
     });
-    const task = addTask(run, { title: node.title, spec: node.spec, deps });
+    if (node.deps.length === 0) deps.unshift(...prerequisiteTaskIds);
+    const id = taskIdForNode?.(node);
+    const existing = id ? run.tasks[id] : undefined;
+    const task = existing ?? addTask(run, { ...(id ? { id } : {}), title: node.title, spec: node.spec, deps });
+    if (existing && (existing.title !== node.title || existing.spec !== node.spec ||
+      JSON.stringify(existing.deps) !== JSON.stringify(deps))) {
+      throw new Error(`persisted remediation task does not match plan: ${id}`);
+    }
     tasks.push(task);
     taskByPlanId.set(node.id, task);
     if (model) addGraphTrace(model, node, task);
@@ -208,6 +221,14 @@ function addGraphTrace(model: FactoryGraphModel, node: RemediationNode, task: Ta
   if (!model.graphs.execution.entities.some((entity) => entity.id === executionId)) {
     model.graphs.execution.entities.push({ id: executionId, kind: 'remediation_task', title: task.title, evidenceIds: node.trace.evidenceIds });
   }
+  for (const dependency of task.deps) {
+    const dependencyId = `execution:v1:${dependency}` as `execution:v1:${string}`;
+    if (!model.graphs.execution.entities.some((entity) => entity.id === dependencyId)) continue;
+    const edge = { type: 'depends_on' as const, from: executionId, to: dependencyId };
+    if (!model.graphs.execution.edges.some((item) => item.type === edge.type && item.from === edge.from && item.to === edge.to)) {
+      model.graphs.execution.edges.push(edge);
+    }
+  }
   for (const causeId of node.trace.rootCauseIds) {
     // Root causes are preserved as defect-graph entities and point to the real
     // DAG execution task through the cross-graph repaired_by edge.
@@ -220,7 +241,14 @@ function addGraphTrace(model: FactoryGraphModel, node: RemediationNode, task: Ta
     if (!node.trace.rootCauseIds.length) {
       // Factory graph's repaired_by is root-cause-only; represent direct defect
       // repair inside its defect graph and attach execution provenance in spec.
-      model.graphs.defect.edges.push({ type: 'remediates', from: `defect:v1:remediation.${task.id}`, to: defectId } as FactoryGraphModel['graphs']['defect']['edges'][number]);
+      const edge = {
+        type: 'remediates' as const,
+        from: `defect:v1:remediation.${task.id}` as `defect:v1:${string}`,
+        to: defectId as `defect:v1:${string}`,
+      };
+      if (!model.graphs.defect.edges.some((item) => item.type === edge.type && item.from === edge.from && item.to === edge.to)) {
+        model.graphs.defect.edges.push(edge);
+      }
       const remediationId = `defect:v1:remediation.${task.id}` as `defect:v1:${string}`;
       if (!model.graphs.defect.entities.some((entity) => entity.id === remediationId)) model.graphs.defect.entities.push({ id: remediationId, kind: 'remediation', title: task.title, evidenceIds: node.trace.evidenceIds });
     }

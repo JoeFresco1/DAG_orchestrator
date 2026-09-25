@@ -41,7 +41,9 @@ export interface FactorySidecarManifest {
   evidence: FactoryEvidenceRef[];
 }
 
-const ENTITY_ID = /^(requirement|code|execution|defect):v1:([A-Za-z0-9][A-Za-z0-9._/-]*)$/;
+// The code graph uses `#` to separate a source path from a qualified symbol
+// name (for example `code:v1:api/src/auth.ts#readPrincipal`).
+const ENTITY_ID = /^(requirement|code|execution|defect):v1:([A-Za-z0-9][A-Za-z0-9._/#-]*)$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 
 /** Runtime guard for IDs read from sidecars or imported graph artifacts. */
