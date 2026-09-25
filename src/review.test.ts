@@ -379,11 +379,13 @@ describe('reviewer panel', () => {
     });
     await runner.start();
     assert.equal(run.tasks[a.id].status, 'completed');
-    // quality is conditional; without a measurable diff it still runs (fail-closed).
-    assert.deepEqual(ran.filter((c) => c !== 'work'), ['pnpm test', 'agent', 'agent']);
+    // Successful deterministic validation is sufficient for this low-risk change.
+    assert.deepEqual(ran.filter((c) => c !== 'work'), ['pnpm test']);
     const verdicts = run.tasks[a.id].reviewerVerdicts;
     assert.equal(verdicts.regression.verdict, 'pass');
-    assert.equal(verdicts.contract.verdict, 'pass');
+    assert.equal(verdicts.contract.verdict, 'skipped');
+    assert.equal(verdicts.quality.verdict, 'skipped');
+    assert.match(verdicts.contract.reason ?? '', /deterministic validation is sufficient/);
     assert.match(run.tasks[a.id].reviewResult ?? '', /regression: pass/);
   });
 
@@ -468,6 +470,39 @@ describe('reviewer panel', () => {
   });
 });
 describe('reviewer agents and integration repair', () => {
+  it('persists the reproducible review plan in the run sidecar', async () => {
+    const dir = tempDir();
+    try {
+      const file = join(dir, 'factory.run.json');
+      const run = newRun('persist-review-plan');
+      const a = addTask(run, { title: 'format a label', spec: '', cmd: 'work' });
+      run.tasks[a.id].reviewCmd = 'agent-review';
+      saveRun(run, file);
+      await new DagRunner(run, {
+        file,
+        executor: async (_task, _ctx, command) => ({
+          output: command === 'agent-review' ? 'VERDICT: PASS' : 'ok',
+          exitCode: 0,
+        }),
+      }).start();
+      const plansDir = join(runPaths(file).dir, 'factory', 'review-plans');
+      const planFiles = (await import('node:fs')).readdirSync(plansDir);
+      assert.equal(planFiles.length, 1);
+      const plan = JSON.parse(readFileSync(join(plansDir, planFiles[0]!), 'utf8')) as {
+        schemaVersion: number;
+        taskId: string;
+        stages: { stage: string; reason: string }[];
+        reviewers: { name: string; selected: boolean; reason: string }[];
+      };
+      assert.equal(plan.schemaVersion, 1);
+      assert.equal(plan.taskId, a.id);
+      assert.ok(plan.stages.every((stage) => stage.reason.length > 0));
+      assert.ok(plan.reviewers.every((reviewer) => reviewer.reason.length > 0));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('completes when the reviewer accepts the work', async () => {
     const run = newRun('review-pass');
     const a = addTask(run, { title: 'build', spec: '' });
