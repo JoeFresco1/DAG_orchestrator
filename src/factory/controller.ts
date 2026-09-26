@@ -24,7 +24,7 @@ import { ensureIntegrationWorktree, snapshotExcludes } from '../git-worktree.js'
 import { createFactoryGraphModel, validateFactoryGraphModel, type FactoryGraphModel } from './graph-model.js';
 import type { FactoryEvidenceRef, FactorySidecarManifest } from './contracts.js';
 import { buildCodeGraph, validateCodeGraphIndex, type CodeGraphIndex } from './code-graph.js';
-import { compileContext, type ContextPacket } from './context-compiler.js';
+import { compileContext, expandContext, type ContextPacket } from './context-compiler.js';
 import { analyzeObservations, type NormalizedObservation, type RawObservation } from './observations.js';
 import { createHypotheses, validateHypothesisSet, type DefectHypothesis, type HypothesisSet } from './hypotheses.js';
 import { preverifyHypothesis, type PreverificationResult } from './preverification.js';
@@ -38,6 +38,8 @@ import { createCertification, saveCertification, type Certification, type Certif
 import { createBaseline, saveBaseline, type BaselinePolicy, type BaselinePromotion } from './baseline.js';
 import { validateCertificationClaims, type CertificationClaim } from './certification-invalidation.js';
 import { evaluateAndSaveConvergence, type ConvergenceAssessment, type ConvergencePolicy } from './convergence.js';
+import { buildConfidenceFrontier } from './confidence-frontier.js';
+import { accountReviewUsage, createReviewBudget } from './review-budget.js';
 
 export interface FactoryRequirementInput {
   id: string;
@@ -68,9 +70,11 @@ export interface FactoryCheckInput {
 
 export interface StructuredFactoryGoal {
   schemaVersion: 1;
+  mode?: 'build' | 'review';
   goal: { id: string; title: string; description: string };
   requirements: FactoryRequirementInput[];
   implementation: FactoryImplementationInput[];
+  review?: { codeUnits?: string[]; sourceRunFile?: string };
   checks: FactoryCheckInput[];
   phases: {
     review: { command: string };
@@ -203,6 +207,18 @@ export function factoryStatus(runFile: string): FactoryControllerResult {
   const run = loadRun(file);
   const state = loadControllerState(file, run.id);
   const certification = loadArtifact<Certification>(file, state.goalHash, 'certification-v1.json', true);
+  if (state.stage === 'complete' && certification) {
+    try {
+      const root = dirname(file);
+      const current = run.settings.worktree === 'task'
+        ? execFileSync('git', ['rev-parse', `dag/${run.id}`], { cwd: root, encoding: 'utf8' }).trim()
+        : repositoryCommit(root, run, file);
+      if (current !== certification.commit) throw new Error('source commit changed since certification');
+    } catch (error) {
+      const stale = { ...state, status: 'waiting' as const, lastError: `certificate is stale: ${error instanceof Error ? error.message : String(error)}; start a new review run` };
+      return { state: stale, runId: run.id, file, certification, summary: summarizeController(run, stale) };
+    }
+  }
   return { state, runId: run.id, file, certification, summary: summarizeController(run, state) };
 }
 
@@ -213,6 +229,7 @@ async function driveFactory(
   goal: StructuredFactoryGoal,
   options: FactoryControllerOptions,
 ): Promise<FactoryControllerResult> {
+  if (state.stage === 'complete') return factoryStatus(file);
   let turns = 0;
   state.lastError = null;
   while (state.stage !== 'complete' && turns++ < 12) {
@@ -323,7 +340,7 @@ function prepareQualityStage(run: Run, state: FactoryControllerState, file: stri
   }
   const review = ensureTask(run, taskId(goalHash, 'review', 'implementation'), {
     title: `Factory review: ${goal.goal.title}`,
-    spec: renderReviewSpec(goal),
+    spec: renderReviewSpec(goal, file, index),
     deps: implementationIds,
     cmd: goal.phases.review.command,
   });
@@ -583,18 +600,31 @@ function prepareRemediationVerificationStage(run: Run, state: FactoryControllerS
   const observations = loadArtifact<ReturnType<typeof analyzeObservations>>(file, goalHash, 'observations-v1.json');
   const index = buildGoalCodeGraph(goal, rootDir);
   const packets: Record<string, VerificationPacket> = {};
+  const sourceEvidenceIds: Record<string, string[]> = {};
   for (const defect of verification.verifiedDefects) {
     const hypothesis = hypotheses.hypotheses.find((item) =>
       `defect:v1:defect.${sha256(item.id)}` === defect.id && item.status === 'verified');
     if (!hypothesis) throw new Error(`verified defect ${defect.id} has no hypothesis to recheck`);
     const linked = observations.observations.filter((item) => hypothesis.observations.includes(item.id as DefectHypothesis['observations'][number]));
-    const context = compileContext({
+    const linkedPaths = new Set(linked.flatMap((item) => item.files.map(normalizeRepoPath)));
+    const contextOptions = {
       index, rootDir, request: `After remediation, try to reproduce: ${hypothesis.claim}`,
       previousFindings: linked.map((item) => ({ id: item.id, title: item.title, content: JSON.stringify(item), sourcePath: item.files[0] })),
+      maxEvidence: 120, maxChars: 100_000,
+    };
+    const initialContext = compileContext(contextOptions);
+    const context = expandContext(contextOptions, initialContext, {
+      entityIds: [...linkedPaths].map((path) => `code:v1:file/${path}` as const),
     });
     const preverification = preverifyHypothesis(hypothesis, { rootDir, observations: linked, codeGraph: index, graphIsComplete: true });
     const packet = createVerificationPacket(hypothesis, context, preverification);
+    const currentHashes = new Map(index.graph.entities.filter((entity) => entity.kind === 'file' && entity.sourcePath && entity.sourceHash)
+      .map((entity) => [entity.sourcePath!, entity.sourceHash!]));
+    const currentCitations = packet.evidence.filter((item) => item.category === 'implementation' &&
+      linkedPaths.has(item.source) && item.sha256 === currentHashes.get(item.source)).map((item) => item.id);
+    if (currentCitations.length === 0) throw new Error(`post-remediation packet for ${defect.id} lacks current source evidence`);
     packets[defect.id] = packet;
+    sourceEvidenceIds[defect.id] = currentCitations;
     const task = ensureTask(run, taskId(goalHash, 'remediation-verification', defect.id), {
       title: `Recheck repaired defect: ${defect.title}`,
       spec: `Check whether the original defect remains after remediation. A resolved defect needs a rejected verdict, refuted reachability, and citations to current evidence.\n${renderVerificationPrompt(packet)}`,
@@ -604,20 +634,23 @@ function prepareRemediationVerificationStage(run: Run, state: FactoryControllerS
     state.tasks.remediationVerification[defect.id] = task.id;
   }
   saveArtifact(file, run.id, 'remediation-verification-packets-v1.json', packets);
-  saveArtifact(file, run.id, 'remediation-verification-source-v1.json', { sourceCommit });
+  saveArtifact(file, run.id, 'remediation-verification-source-v1.json', { sourceCommit, sourceEvidenceIds });
   saveRun(run, file);
 }
 
 function processRemediationVerificationStage(run: Run, state: FactoryControllerState, file: string, goalHash: string): void {
   const verification = loadArtifact<{ verifiedDefects: VerifiedDefect[] }>(file, goalHash, 'verification-v1.json');
   const packets = loadArtifact<Record<string, VerificationPacket>>(file, goalHash, 'remediation-verification-packets-v1.json');
+  const source = loadArtifact<{ sourceEvidenceIds: Record<string, string[]> }>(file, goalHash, 'remediation-verification-source-v1.json');
   const results: VerificationResult[] = [];
   for (const defect of verification.verifiedDefects) {
     const task = requiredTask(run, state.tasks.remediationVerification[defect.id], `post-remediation verification for ${defect.id}`);
     const assessment = parseJsonOutput(taskOutput(file, task), `post-remediation verification for ${defect.id}`);
     const result = adjudicateVerification(packets[defect.id]!, assessment);
     results.push(result);
-    if (result.verdict !== 'rejected' || result.reachability !== 'refuted' || result.confidence < 0.8) {
+    const currentIds = new Set(source.sourceEvidenceIds[defect.id] ?? []);
+    if (result.verdict !== 'rejected' || result.reachability !== 'refuted' || result.confidence < 0.8 ||
+      !result.evidence_against.some((citation) => currentIds.has(citation.evidenceId))) {
       throw new Error(`verified defect ${defect.id} remains unresolved or lacks conclusive post-remediation evidence`);
     }
   }
@@ -797,26 +830,44 @@ function processRecertificationStage(
 }
 
 function processConvergenceStage(run: Run, state: FactoryControllerState, file: string, goal: StructuredFactoryGoal, options: FactoryControllerOptions): void {
-  const policy = options.convergencePolicy ?? goal.convergencePolicy;
+  const certification = loadArtifact<Certification>(file, state.goalHash, 'certification-v1.json');
+  const policy = options.convergencePolicy ?? goal.convergencePolicy ?? (goal.mode === 'review' ? defaultReviewConvergencePolicy(goal, certification) : undefined);
   if (!policy) throw new Error('factory completion requires a convergencePolicy in the goal or --policy');
-  if (!options.convergenceAssessment) throw new Error('factory completion requires measured convergence evidence; resume with --assessment');
+  const assessment = options.convergenceAssessment ?? (goal.mode === 'review' ? measuredReviewAssessment(run, state, file, policy, certification) : undefined);
+  if (!assessment) throw new Error('factory completion requires measured convergence evidence; resume with --assessment');
   const reviewTaskIds = new Set([
     ...(state.tasks.review ? [state.tasks.review] : []),
     ...Object.values(state.tasks.verification),
     ...Object.values(state.tasks.remediationVerification),
     ...Object.values(state.tasks.recertification),
   ]);
-  for (const unit of options.convergenceAssessment.reviewUnits) {
+  const verifiedDefects = loadArtifact<{ verifiedDefects: VerifiedDefect[] }>(file, state.goalHash, 'verification-v1.json').verifiedDefects;
+  const reviewUnits = assessment.reviewUnits.map((unit) => {
     if (!reviewTaskIds.has(unit.id)) throw new Error(`convergence review unit ${unit.id} is not a factory review task`);
     const task = requiredTask(run, unit.id, `convergence review unit ${unit.id}`);
     const actual = evidenceForTask(file, run, task, 'review');
     if (!unit.evidence.some((item) => item.uri === actual.uri && item.sha256 === actual.sha256)) {
       throw new Error(`convergence review unit ${unit.id} lacks its recorded task evidence`);
     }
-  }
-  const certification = loadArtifact<Certification>(file, state.goalHash, 'certification-v1.json');
+    if (!task.finishedAt) throw new Error(`convergence review unit ${unit.id} has no recorded completion time`);
+    const evidence = [toFactoryEvidence(actual, 'review')];
+    const newFindings = verifiedDefects.filter((defect) =>
+      state.tasks.verification[defect.verification.hypothesis_id] === unit.id).map((defect) => ({
+        id: defect.id, severity: defect.severity, verified: true, novel: true, evidence,
+      }));
+    return {
+      ...unit,
+      completedAt: task.finishedAt,
+      status: 'completed' as const,
+      meaningful: Boolean(taskOutput(file, task).trim()),
+      requestCount: task.attempts,
+      evidence,
+      newFindings,
+    };
+  });
   const decision = evaluateAndSaveConvergence(file, {
-    ...options.convergenceAssessment,
+    ...assessment,
+    reviewUnits,
     runId: run.id,
     certification,
     currentCertificationState: {
@@ -830,6 +881,65 @@ function processConvergenceStage(run: Run, state: FactoryControllerState, file: 
   if (decision.status !== 'stop') {
     throw new Error(`factory has not converged (${decision.status}): ${decision.reasons.join('; ')}`);
   }
+}
+
+function defaultReviewConvergencePolicy(goal: StructuredFactoryGoal, certification: Certification): ConvergencePolicy {
+  return {
+    minimumMeaningfulReviewUnits: 1,
+    maximumWeightedResidualRisk: 0,
+    minimumReleaseConfidence: 1,
+    maximumNovelVerifiedDefectsPer1000Requests: 0,
+    minimumRequestsForYield: 1,
+    minimumWeightedRiskCoverage: goal.coverage.weightedRisk,
+    minimumCriticalFlowCoverage: goal.coverage.criticalFlow,
+    requiredCriticalFlowIds: goal.requirements.map((requirement) => requirement.id),
+    requiredDeterministicCheckIds: certification.deterministicChecks.map((check) => check.id),
+    minimumRemainingBudget: { requests: 1 },
+  };
+}
+
+function measuredReviewAssessment(
+  run: Run, state: FactoryControllerState, file: string, policy: ConvergencePolicy, certification: Certification,
+): Omit<ConvergenceAssessment, 'runId' | 'certification' | 'currentCertificationState'> {
+  const reviewTaskIds = [
+    ...(state.tasks.review ? [state.tasks.review] : []),
+    ...Object.values(state.tasks.verification),
+    ...Object.values(state.tasks.remediationVerification),
+    ...Object.values(state.tasks.recertification),
+  ];
+  const reviewTasks = reviewTaskIds.map((id) => requiredTask(run, id, `convergence review unit ${id}`));
+  const regression = requiredTask(run, state.tasks.regression, 'regression check');
+  const regressionEvidence = toFactoryEvidence(evidenceForTask(file, run, regression, 'command'), 'command');
+  const frontier = buildConfidenceFrontier([], [], [], 0);
+  let budget = createReviewBudget();
+  const reviewUnits = reviewTasks.map((task) => {
+    if (!task.finishedAt) throw new Error(`convergence review unit ${task.id} has no recorded completion time`);
+    const evidence = toFactoryEvidence(evidenceForTask(file, run, task, 'review'), 'review');
+    budget = accountReviewUsage(budget, { id: task.id, covers: [] }, { requests: task.attempts });
+    return {
+      id: task.id, completedAt: task.finishedAt, status: 'completed' as const,
+      meaningful: Boolean(taskOutput(file, task).trim()), requestCount: task.attempts,
+      evidence: [evidence], newFindings: [],
+    };
+  });
+  const verifiedDefects = loadArtifact<{ verifiedDefects: VerifiedDefect[] }>(file, state.goalHash, 'verification-v1.json').verifiedDefects;
+  const findings = verifiedDefects.map((defect) => ({
+    id: defect.id, severity: defect.severity, status: 'resolved' as const, verified: true,
+    evidence: [regressionEvidence],
+  }));
+  return {
+    confidenceFrontier: {
+      schemaVersion: 1, initialResidualRisk: frontier.initialResidualRisk,
+      residualRisk: frontier.residualRisk, unresolvedClaims: frontier.unresolvedClaims,
+      effortCurve: frontier.effortCurve, evidence: [regressionEvidence],
+    },
+    budget: { state: budget, evidence: [regressionEvidence] },
+    criticalFlows: policy.requiredCriticalFlowIds.map((flowId) => ({
+      flowId, certified: certification.status === 'certified', evidence: [regressionEvidence],
+    })),
+    findings,
+    reviewUnits,
+  };
 }
 
 function compileImplementationTasks(
@@ -930,9 +1040,41 @@ function buildGoalCodeGraph(goal: StructuredFactoryGoal, rootDir: string): CodeG
       }
     }
   }
+  if (goal.mode === 'review') {
+    for (const path of reviewCodePaths(goal, index)) {
+      const fileId = `code:v1:file/${path}` as const;
+      const sourceFile = codeEntities.get(fileId);
+      if (!sourceFile) throw new Error(`review code unit is not in the code graph: ${path}`);
+      const symbolId = syntheticSymbolId(goal, 'review-scope', path);
+      if (!codeEntities.has(symbolId)) {
+        const symbol = { id: symbolId, kind: 'symbol' as const, title: `${path} — existing code review`, sourcePath: path, sourceHash: sourceFile.sourceHash };
+        index.graph.entities.push(symbol);
+        codeEntities.set(symbolId, symbol);
+      }
+      if (!index.graph.edges.some((edge) => edge.type === 'declares' && edge.from === fileId && edge.to === symbolId)) {
+        index.graph.edges.push({ type: 'declares', from: fileId, to: symbolId });
+      }
+      for (const requirement of goal.requirements) {
+        const from = factoryRequirementId(goal, requirement.id);
+        if (!index.links.some((link) => link.type === 'implemented_by' && link.from === from && link.to === symbolId)) {
+          index.links.push({ type: 'implemented_by', from, to: symbolId });
+        }
+      }
+    }
+  }
   index.graph.entities.push({ id: REGRESSION_TEST_ID, kind: 'test', title: 'Factory regression suite' });
   validateCodeGraphIndex(index);
   return index;
+}
+
+function reviewCodePaths(goal: StructuredFactoryGoal, index: CodeGraphIndex): string[] {
+  const available = new Set(index.graph.entities.filter((entity) => entity.kind === 'file' && entity.sourcePath)
+    .map((entity) => entity.sourcePath!));
+  const paths = goal.review?.codeUnits?.map(normalizeRepoPath) ?? [...available];
+  const unique = [...new Set(paths)].sort();
+  if (unique.length === 0) throw new Error('review-only factory found no code files; provide review.codeUnits');
+  for (const path of unique) if (!available.has(path)) throw new Error(`review code unit is not in the code graph: ${path}`);
+  return unique;
 }
 
 function attachCodeGraph(model: FactoryGraphModel, index: CodeGraphIndex, goal: StructuredFactoryGoal, goalHash: string): void {
@@ -978,7 +1120,9 @@ function createInitialClaims(goal: StructuredFactoryGoal, index: CodeGraphIndex,
   ];
   const claims: CertificationClaim[] = goal.requirements.map((requirement) => {
     const implementation = goal.implementation.filter((task) => task.requirementIds.includes(requirement.id));
-    const covers = implementation.flatMap((task) => task.codeUnits.map((path) => syntheticSymbolId(goal, task.id, normalizeRepoPath(path))));
+    const covers = goal.mode === 'review'
+      ? reviewCodePaths(goal, index).map((path) => syntheticSymbolId(goal, 'review-scope', path))
+      : implementation.flatMap((task) => task.codeUnits.map((path) => syntheticSymbolId(goal, task.id, normalizeRepoPath(path))));
     covers.push(REGRESSION_TEST_ID);
     return {
       id: `factory-claim:${safeKey(goal.goal.id)}:${safeKey(requirement.id)}`,
@@ -1023,10 +1167,24 @@ function renderCheckSpec(goal: StructuredFactoryGoal, check: FactoryCheckInput):
   ].join('\n');
 }
 
-function renderReviewSpec(goal: StructuredFactoryGoal): string {
+function renderReviewSpec(goal: StructuredFactoryGoal, file: string, index: CodeGraphIndex): string {
+  let sourceRunContext = '';
+  if (goal.mode === 'review' && goal.review?.sourceRunFile) {
+    const sourceFile = resolve(dirname(file), goal.review.sourceRunFile);
+    if (sourceFile === resolve(file)) throw new Error('review source run must differ from the new factory run file');
+    const sourceRun = loadRun(sourceFile);
+    sourceRunContext = [
+      `Prior DAG run ${sourceRun.id}: ${sourceRun.objective}`,
+      ...Object.values(sourceRun.tasks).sort((a, b) => a.seq - b.seq).map((task) =>
+        `- ${task.id} [${task.status}] ${task.title}; spec: ${task.spec.slice(0, 400)}; result: ${(task.result ?? '').slice(0, 400)}; commit: ${task.commit ?? 'none'}`),
+    ].join('\n').slice(0, 24_000);
+  }
   return [
-    `Review the completed implementation for goal ${goal.goal.id}: ${goal.goal.title}.`,
+    goal.mode === 'review'
+      ? `Review the existing application for goal ${goal.goal.id}: ${goal.goal.title}. Do not schedule new implementation work.`
+      : `Review the completed implementation for goal ${goal.goal.id}: ${goal.goal.title}.`,
     `Requirements: ${JSON.stringify(goal.requirements)}.`,
+    ...(goal.mode === 'review' ? [`Code scope: ${reviewCodePaths(goal, index).join(', ')}.`, ...(sourceRunContext ? [sourceRunContext] : [])] : []),
     'Inspect the code and tests. Return one JSON array of RawObservation objects; return [] when there are no findings.',
     'Each observation may include id, title, description, category, files, symbols, dependencies, failureScenario, executionPaths, semanticEvidence, evidenceIds, and reviewer.',
     'Do not repair the code during this review. Emit JSON only; no markdown fences or prose.',
@@ -1237,6 +1395,7 @@ function validateFactoryGoal(value: unknown): asserts value is StructuredFactory
     !Array.isArray(value.requirements) || !Array.isArray(value.implementation) || !Array.isArray(value.checks) ||
     !isRecord(value.phases) || !isRecord(value.coverage)) throw new Error('invalid structured factory goal: expected schemaVersion 1, goal, requirements, implementation, checks, phases, and coverage');
   const requirements = value.requirements as FactoryRequirementInput[];
+  if (value.mode === 'review' && requirements.length === 0) throw new Error('review-only factory needs at least one requirement');
   const requirementIds = new Set<string>();
   for (const requirement of requirements) {
     if (!isRecord(requirement) || !nonempty(requirement.id) || !nonempty(requirement.title) || !nonempty(requirement.description) ||
@@ -1247,7 +1406,17 @@ function validateFactoryGoal(value: unknown): asserts value is StructuredFactory
     requirementIds.add(requirement.id);
   }
   const implementation = value.implementation as FactoryImplementationInput[];
-  if (implementation.length === 0) throw new Error('structured goal needs at least one implementation task');
+  if (value.mode !== undefined && value.mode !== 'build' && value.mode !== 'review') throw new Error('factory mode must be build or review');
+  if (value.mode === 'review') {
+    if (implementation.length !== 0) throw new Error('review-only factory must not schedule implementation tasks');
+    if (value.review !== undefined && !isRecord(value.review)) throw new Error('review options must be an object');
+    if (value.review?.codeUnits !== undefined && (!Array.isArray(value.review.codeUnits) ||
+      value.review.codeUnits.length === 0 || !value.review.codeUnits.every(nonempty))) {
+      throw new Error('review codeUnits must be a non-empty list of repository-relative paths');
+    }
+    for (const path of value.review?.codeUnits ?? []) normalizeRepoPath(path);
+    if (value.review?.sourceRunFile !== undefined && !nonempty(value.review.sourceRunFile)) throw new Error('sourceRunFile must be a path');
+  } else if (implementation.length === 0) throw new Error('structured goal needs at least one implementation task');
   const implementationIds = new Set<string>();
   for (const task of implementation) {
     if (!isRecord(task) || !nonempty(task.id) || !nonempty(task.title) || !nonempty(task.spec) || !nonempty(task.cmd) ||

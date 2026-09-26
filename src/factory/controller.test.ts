@@ -5,9 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import type { Executor } from '../runner.js';
-import { loadRun, retryTask, runPaths, saveRun } from '../store.js';
+import { addTask, loadRun, newRun, retryTask, runPaths, saveRun } from '../store.js';
 import { traceRequirement } from './graph-model.js';
-import { resumeFactory, startFactory, type FactoryControllerOptions, type StructuredFactoryGoal } from './controller.js';
+import { factoryStatus, resumeFactory, startFactory, type FactoryControllerOptions, type StructuredFactoryGoal } from './controller.js';
 import { VERIFICATION_CATEGORIES } from './verification.js';
 import { buildConfidenceFrontier } from './confidence-frontier.js';
 import { createReviewBudget } from './review-budget.js';
@@ -61,7 +61,7 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
   };
 
   let firstImplementationFailed = false;
-  let recheckResolved = false;
+  let recheckMode: 'unresolved' | 'stale' | 'resolved' = 'unresolved';
   const executor: Executor = async (task, ctx, cmdOverride) => {
     let output = 'ok\n';
     let exitCode = 0;
@@ -96,12 +96,21 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
     } else if (task.title.startsWith('Recheck repaired defect:')) {
       const evidence = task.spec.match(/"id"\s*:\s*"(context:v1:[a-f0-9]+)"/);
       assert.ok(evidence, 'fresh verification packet cites current source');
+      const source = JSON.parse(readFileSync(join(runPaths(runFile).factory, 'remediation-verification-source-v1.json'), 'utf8')) as
+        { sourceEvidenceIds: Record<string, string[]> };
+      const currentEvidenceId = Object.values(source.sourceEvidenceIds).flat().find((id) => task.spec.includes(id));
+      assert.ok(currentEvidenceId, 'recheck cites source from the current commit');
+      const packets = JSON.parse(readFileSync(join(runPaths(runFile).factory, 'remediation-verification-packets-v1.json'), 'utf8')) as
+        Record<string, { sha256: string; evidence: Array<{ id: string; category: string }> }>;
+      const packet = Object.values(packets).find((item) => task.spec.includes(item.sha256))!;
+      const staleEvidenceId = packet.evidence.find((item) => item.category === 'counterevidence')?.id;
+      if (recheckMode === 'stale') assert.ok(staleEvidenceId, 'prior finding is present but cannot prove the repair');
       output = JSON.stringify({
-        verdict: recheckResolved ? 'rejected' : 'verified', confidence: 0.96,
-        reachability: recheckResolved ? 'refuted' : 'confirmed', inspectedCategories: [...VERIFICATION_CATEGORIES],
-        evidenceFor: recheckResolved ? [] : [{ evidenceId: evidence[1], rationale: 'The original failure remains reproducible.' }],
-        evidenceAgainst: recheckResolved ? [{ evidenceId: evidence[1], rationale: 'The current implementation carries the context value.' }] : [],
-        reasoning: recheckResolved ? 'The original failure is not reproducible after the fix.' : 'The original failure still reproduces.',
+        verdict: recheckMode === 'unresolved' ? 'verified' : 'rejected', confidence: 0.96,
+        reachability: recheckMode === 'unresolved' ? 'confirmed' : 'refuted', inspectedCategories: [...VERIFICATION_CATEGORIES],
+        evidenceFor: recheckMode === 'unresolved' ? [{ evidenceId: evidence[1], rationale: 'The original failure remains reproducible.' }] : [],
+        evidenceAgainst: recheckMode === 'unresolved' ? [] : [{ evidenceId: recheckMode === 'stale' ? staleEvidenceId : currentEvidenceId, rationale: 'The current implementation carries the context value.' }],
+        reasoning: recheckMode === 'resolved' ? 'The original failure is not reproducible after the fix.' : 'The original failure still needs current evidence.',
       }) + '\n';
     } else if (task.title.startsWith('Assess shared root causes')) {
       const start = task.spec.lastIndexOf('\n[');
@@ -151,7 +160,14 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
   const retryRun = loadRun(runFile);
   for (const id of Object.values(unresolved.state.tasks.remediationVerification)) retryTask(retryRun, id, false);
   saveRun(retryRun, runFile);
-  recheckResolved = true;
+  recheckMode = 'stale';
+  const staleCitation = await resumeFactory(runFile, { executor, cwd: root });
+  assert.equal(staleCitation.state.stage, 'remediation_verification');
+  assert.match(staleCitation.state.lastError ?? '', /lacks conclusive post-remediation evidence/);
+  const finalRetry = loadRun(runFile);
+  for (const id of Object.values(staleCitation.state.tasks.remediationVerification)) retryTask(finalRetry, id, false);
+  saveRun(finalRetry, runFile);
+  recheckMode = 'resolved';
 
   const pending = await resumeFactory(runFile, { executor, cwd: root });
   assert.equal(pending.state.stage, 'convergence');
@@ -173,7 +189,11 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
     findings: [],
     reviewUnits: [{ id: finalReviewTaskId, completedAt: new Date().toISOString(), status: 'completed', meaningful: true, requestCount: 1, evidence: [evidence], newFindings: [] }],
   };
-  const notConverged = await resumeFactory(runFile, { executor, cwd: root, convergenceAssessment: { ...assessment, reviewUnits: [] } });
+  const notConverged = await resumeFactory(runFile, {
+    executor, cwd: root,
+    convergencePolicy: { ...goal.convergencePolicy!, minimumRequestsForYield: 1000 },
+    convergenceAssessment: { ...assessment, reviewUnits: assessment.reviewUnits.map((unit) => ({ ...unit, requestCount: 1000 })) },
+  });
   assert.equal(notConverged.state.stage, 'convergence');
   assert.equal(notConverged.state.status, 'waiting');
   assert.match(notConverged.state.lastError ?? '', /has not converged/);
@@ -211,4 +231,99 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
   const repeated = await resumeFactory(runFile, { executor, cwd: root });
   assert.equal(repeated.state.status, 'completed');
   assert.equal(Object.keys(loadRun(runFile).tasks).length, Object.keys(savedRun.tasks).length);
+  writeFileSync(join(root, 'src', 'auth.ts'), 'export function readPrincipal(): string { return "changed"; }\n');
+  execFileSync('git', ['add', 'src/auth.ts'], { cwd: root });
+  execFileSync('git', ['commit', '-m', 'change after certification'], { cwd: root, stdio: 'ignore' });
+  assert.equal(factoryStatus(runFile).state.status, 'waiting');
+  assert.match(factoryStatus(runFile).state.lastError ?? '', /certificate is stale/);
+  assert.equal((await resumeFactory(runFile, { executor, cwd: root })).state.status, 'waiting');
+});
+
+test('reviews an existing repository and prior DAG without implementation tasks', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'dag-factory-existing-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'src'));
+  writeFileSync(join(root, '.gitignore'), 'dag*.json*\ndag*.d/\n');
+  writeFileSync(join(root, 'tsconfig.json'), JSON.stringify({
+    compilerOptions: { target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', strict: true },
+    include: ['src/**/*.ts'],
+  }));
+  writeFileSync(join(root, 'src', 'service.ts'), 'export function getOwner(): string { return "owner"; }\n');
+  execFileSync('git', ['init'], { cwd: root, stdio: 'ignore' });
+  execFileSync('git', ['config', 'user.email', 'factory-test@example.invalid'], { cwd: root });
+  execFileSync('git', ['config', 'user.name', 'Factory Test'], { cwd: root });
+  execFileSync('git', ['add', '.'], { cwd: root });
+  execFileSync('git', ['commit', '-m', 'existing app'], { cwd: root, stdio: 'ignore' });
+
+  const priorFile = join(root, 'dag.previous.json');
+  const prior = newRun('Original owner spec');
+  const built = addTask(prior, { title: 'Implement owner behavior', spec: 'The owner must be present.', cmd: 'fake implement' });
+  built.status = 'completed';
+  built.result = 'implemented';
+  saveRun(prior, priorFile);
+
+  const goal: StructuredFactoryGoal = {
+    schemaVersion: 1, mode: 'review',
+    goal: { id: 'owner-review', title: 'Review existing owner behavior', description: 'Audit the existing service.' },
+    requirements: [{ id: 'owner', title: 'Owner exists', description: 'Every service result has an owner.', acceptanceCriteria: ['getOwner returns a non-empty value.'] }],
+    implementation: [], review: { codeUnits: ['src/service.ts'], sourceRunFile: priorFile },
+    checks: [{ id: 'typecheck', title: 'Typecheck', cmd: 'fake typecheck' }],
+    phases: {
+      review: { command: 'fake review' }, verification: { command: 'fake verify' },
+      rootCause: { command: 'fake root-cause' }, remediation: { command: 'fake remediate' },
+      regression: { command: 'fake regression' }, recertification: { reviewCmd: 'fake recertify' },
+    },
+    coverage: { criticalFlow: 1, weightedRisk: 1 },
+  };
+  let reviewSpec = '';
+  const executor: Executor = async (task, ctx, cmdOverride) => {
+    if (task.title.startsWith('Factory review:')) reviewSpec = task.spec;
+    const output = cmdOverride === 'fake recertify' ? 'VERDICT: PASS\n' : task.title.startsWith('Factory review:') ? '[]\n' : 'ok\n';
+    ctx.onOutput(output);
+    ctx.setPid(null);
+    return { output, exitCode: 0 };
+  };
+  const file = join(root, 'dag.review.json');
+  const result = await startFactory(goal, file, { cwd: root, executor });
+  assert.equal(result.state.stage, 'complete', result.summary);
+  assert.equal(result.state.status, 'completed');
+  assert.equal(Object.keys(result.state.tasks.implementation).length, 0);
+  assert.ok(result.state.tasks.review);
+  assert.equal(result.certification?.status, 'certified');
+  assert.match(reviewSpec, /Original owner spec/);
+  assert.match(reviewSpec, /src\/service\.ts/);
+  assert.equal(loadRun(priorFile).tasks[built.id]?.status, 'completed');
+  const decision = JSON.parse(readFileSync(join(runPaths(file).factory, 'convergence-decision-v1.json'), 'utf8'));
+  assert.equal(decision.status, 'stop');
+  assert.equal(decision.summary.windowRequestCount, 1);
+
+  writeFileSync(join(root, 'review.cjs'), 'console.log("[]")\n');
+  writeFileSync(join(root, 'recert.cjs'), 'console.log("VERDICT: PASS")\n');
+  execFileSync('git', ['add', 'review.cjs', 'recert.cjs'], { cwd: root });
+  execFileSync('git', ['commit', '-m', 'review commands'], { cwd: root, stdio: 'ignore' });
+  const cliGoal = {
+    ...goal, mode: 'build', implementation: [{
+      id: 'unused', title: 'Would implement owner', spec: 'Do not run in review mode.',
+      cmd: 'node missing-implementer.cjs', requirementIds: ['owner'], codeUnits: ['src/service.ts'],
+    }],
+    phases: {
+      ...goal.phases,
+      review: { command: 'node review.cjs' },
+      regression: { command: 'node --version' },
+      recertification: { reviewCmd: 'node recert.cjs' },
+    },
+    checks: [{ id: 'node', title: 'Node available', cmd: 'node --version' }],
+  };
+  const goalFile = join(root, 'dag.goal.json');
+  const cliFile = join(root, 'dag.cli-review.json');
+  writeFileSync(goalFile, JSON.stringify(cliGoal));
+  try {
+    execFileSync(process.execPath, [join(process.cwd(), 'dist', 'cli.js'), 'factory', 'review', '--goal', goalFile,
+      '--source-run', priorFile, '--file', cliFile], { cwd: root, stdio: 'pipe' });
+  } catch (error) {
+    const gitStatus = execFileSync('git', ['status', '--short'], { cwd: root, encoding: 'utf8' });
+    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${(error as { stdout?: Buffer }).stdout?.toString() ?? ''}\ngit status: ${gitStatus}`);
+  }
+  assert.equal(factoryStatus(cliFile).state.status, 'completed');
+  assert.equal(Object.keys(loadRun(cliFile).tasks).some((id) => id.includes('unused')), false);
 });

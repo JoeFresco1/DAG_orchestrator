@@ -256,6 +256,15 @@ dag factory status --file dag.run.json
 dag factory resume --file dag.run.json
 ```
 
+For an existing application that only needs review, run a separate review
+campaign. The prior DAG is optional context; no implementation tasks are
+scheduled unless a verified defect needs remediation.
+
+```bash
+dag factory review --goal review-goal.json --source-run dag.run.json --file dag.review.json
+dag factory status --file dag.review.json
+```
+
 The controller stores versioned graph artifacts and its resume checkpoint in
 the run sidecar. See the [software factory operator guide](docs/software-factory.md)
 for the goal schema, command contracts, and recovery procedure.

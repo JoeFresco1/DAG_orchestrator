@@ -97,6 +97,31 @@ dag factory status --file dag.run.json
 dag factory resume --file dag.run.json --assessment measured-convergence.json
 ```
 
+## Review an existing application
+
+Use a structured goal with requirements, deterministic checks, phase commands,
+and coverage values as above. Set `"mode": "review"` and
+`"implementation": []`. Optionally set
+`"review": { "codeUnits": ["src/owner.ts"] }` to narrow the code scope;
+omitting `codeUnits` reviews all indexed code files. You can also pass an
+ordinary completed DAG run as context. The review reads that run and writes a
+separate factory run file.
+
+```bash
+dag factory review --goal review-goal.json --source-run dag.run.json --file dag.review.json
+dag factory status --file dag.review.json
+dag factory resume --file dag.review.json
+```
+
+`dag factory review` also accepts a build goal: it selects review mode and
+clears its implementation task list for the new run. It runs checks, code
+review, verification, and certification. Verified defects can generate
+remediation tasks; a clean review schedules no implementation tasks. Review
+mode derives its convergence assessment from completed task logs and attempts
+and uses a default policy when the goal has no `convergencePolicy`. Supply
+`--policy` and `--assessment` on resume when your project needs different
+thresholds or additional measured evidence.
+
 The controller executes these phases in order:
 
 1. Compile the requirement graph and implementation tasks.
@@ -112,7 +137,7 @@ The controller executes these phases in order:
 8. Evaluate the measured convergence assessment against `convergencePolicy`.
    Only a `stop` decision completes the factory; `continue` or `escalate` remains waiting.
 
-The assessment file supplies `confidenceFrontier`, `budget`, `criticalFlows`,
+For build mode, the assessment file supplies `confidenceFrontier`, `budget`, `criticalFlows`,
 `findings`, and `reviewUnits` in the `ConvergenceAssessment` shape. The controller
 supplies the run ID, final certificate, and current source commit itself. The
 assessment must contain evidence references and measured review request counts;
