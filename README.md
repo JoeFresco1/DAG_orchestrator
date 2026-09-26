@@ -31,6 +31,7 @@ plain JSON file in your repository, with logs and state beside it.
 | 🌿 | **One worktree per task** | Agents edit in isolation and successful work lands on a dedicated integration branch. |
 | ✅ | **Verification that gates progress** | Commands or reviewer agents must pass before a task completes. Missing verdicts fail closed. |
 | 🔁 | **Retries, repair, and fallback** | Retry failed subtrees, repair upstream work, or hand an attempt to another agent CLI. |
+| 🔍 | **Review after the build** | Audit a completed DAG or an existing repository, read verified findings, then decide whether to run repairs. |
 | 👁️ | **A live local viewer** | Watch the graph, queue, logs, attempts, plans, and verdicts from one browser tab. |
 | 📁 | **Portable state** | The graph, history, transcripts, and archived runs live with the project—not in a black box. |
 
@@ -246,30 +247,51 @@ isolation, DAG Orchestrator falls back to a run-level advisory review.
 
 ## Closed-loop software factory
 
-Run a structured goal through requirement trace, implementation, review,
-hypothesis verification, root-cause remediation, regression checks, and
-recertification with the existing executor:
+The factory uses the same DAG executor for checks, code review, independent
+finding verification, repair, and certification. Choose an entry point:
+
+| Starting point | Command | What happens |
+|---|---|---|
+| A structured goal to implement | `dag factory start --goal goal.json --file dag.factory.json` | Runs implementation and the full factory cycle. |
+| A completed ordinary DAG | `dag factory review --source-run dag.run.json --file dag.review.json` | Reads the prior run as context and reviews current code in a separate run. |
+| An existing TypeScript repository | `dag factory review --file dag.review.json` | Builds a narrow review goal from the repository; no goal JSON is needed. |
+
+The review command never reruns implementation tasks from a supplied goal or
+prior DAG. Add `--goal goal.json` when you want its requirements and coverage
+policy to guide the review. With no `--goal`, it indexes files from
+`tsconfig.json`, uses the Codex harness, and selects an npm `test`,
+`typecheck`, or `build` script as its
+deterministic check. Pass `--check "command"` if none exists; use `--harness`,
+`--cmd`, or `--code-units src/a.ts,src/b.ts` to override the reviewer or scope.
+The generated goal covers its configured check and records **zero product risk
+coverage**. Supply a structured goal when you need broader requirement and
+risk coverage.
+
+Every review produces an evidence-backed report:
 
 ```bash
-dag factory start --goal docs/factory/goal.json --file dag.run.json
-dag factory status --file dag.run.json
-dag factory resume --file dag.run.json
-```
-
-For an existing application that only needs review, run a separate review
-campaign. The prior DAG is optional context; no implementation tasks are
-scheduled unless a verified defect needs remediation.
-
-```bash
-dag factory review --goal review-goal.json --source-run dag.run.json --file dag.review.json
 dag factory status --file dag.review.json
+dag factory report --file dag.review.json       # add --json for the full record
 ```
 
-You can omit `--goal` to review the current TypeScript repository directly.
-Review-only runs save an evidence-backed report. Verified findings pause the
-run until `dag factory fix --file dag.review.json` or
-`dag factory close --file dag.review.json`; inspect them with
-`dag factory report --file dag.review.json`.
+If defects are verified, the review **pauses before creating repair tasks**.
+Choose whether to proceed:
+
+```bash
+dag factory fix --file dag.review.json          # create and run the repair DAG
+# or
+dag factory close --file dag.review.json        # finish with findings unresolved
+```
+
+`dag factory resume --file dag.review.json` restores interrupted work but does
+not choose repairs for you. A clean review continues to certification. A
+closed review records its findings without claiming they were fixed. Reports
+are tied to the source commit; changes to the code require a new review.
+
+For a build goal, use `dag factory status --file dag.factory.json` and
+`dag factory resume --file dag.factory.json` to inspect or continue the cycle.
+Build-mode completion requires a convergence policy and measured assessment;
+the [operator guide](docs/software-factory.md) shows the evidence format.
 
 The controller stores versioned graph artifacts and its resume checkpoint in
 the run sidecar. See the [software factory operator guide](docs/software-factory.md)
@@ -328,6 +350,7 @@ dag.run.d/logs/              per-attempt stdout and stderr
 dag.run.d/plans/             planner output
 dag.run.d/deps/              upstream evidence supplied to workers
 dag.run.d/reviews/           task and chain-review diffs
+dag.review.d/factory/        review report, evidence, graphs, and checkpoint
 dag.runs/<runId>/            archived runs
 ```
 
@@ -344,6 +367,7 @@ at the same time.
 | Execute it | `run`, `approve`, `reject`, `heartbeat` |
 | Recover | `retry`, `retry-failed`, `resume`, `kill-orphans`, `skip-blocked`, `gc` |
 | Verify | `review`, `reviewer`, `chain-review`, `final-review` |
+| Run a factory cycle | `factory start`, `factory review`, `factory report`, `factory fix`, `factory close` |
 | Choose workers | `harness`, `models`, `set --harness`, `set --harness-chain` |
 | Browse runs | `serve`, `launch`, `projects`, `runs`, `servers` |
 | Schedule | `schedule`, `scheduler` |
