@@ -2,8 +2,11 @@
 // the existing DagRunner by the controller; this file only handles CLI I/O.
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { emit, flag, flagRequired, guard, wantsJson } from '../cli-args.js';
-import { factoryStatus, resumeFactory, startFactory, type StructuredFactoryGoal, type FactoryControllerOptions } from '../factory/controller.js';
+import { emit, flag, flagRequired, guard, parseList, wantsJson } from '../cli-args.js';
+import { closeFactoryReview, factoryReviewReport, factoryStatus, fixFactoryReview, resumeFactory, startFactory, type StructuredFactoryGoal, type FactoryControllerOptions } from '../factory/controller.js';
+import { createRepoReviewGoal } from '../factory/repo-goal.js';
+import { findHarness } from '../harnesses.js';
+import { runPaths } from '../store.js';
 import type { DagEvent } from '../types.js';
 
 export async function factoryCmd(argv: string[]): Promise<void> {
@@ -14,9 +17,27 @@ export async function factoryCmd(argv: string[]): Promise<void> {
     emit(argv, result, () => `${result.summary}\n  run: ${result.runId}\n  checkpoint: ${result.state.stage}`);
     return;
   }
+  if (subcommand === 'report') {
+    const report = factoryReviewReport(file);
+    emit(argv, report, () => [
+      `Review report: ${report.goalTitle}`,
+      `Source commit: ${report.sourceCommit}`,
+      `Reviewed files: ${report.reviewedCodeUnits.length}; observations: ${report.observations.length}; verified defects: ${report.verifiedDefects.length}`,
+      ...report.verifiedDefects.map((defect) => `- [${defect.severity}] ${defect.title} (${defect.id})`),
+      `Root causes: ${report.rootCauses.length}; proposed repair tasks: ${report.proposedRemediationTasks}`,
+      `Full report: ${runPaths(resolve(file)).factory}/review-report-v1.json`,
+    ].join('\n'));
+    return;
+  }
+  if (subcommand === 'close') {
+    guard(file, argv);
+    const result = closeFactoryReview(file);
+    emit(argv, result, () => result.summary);
+    return;
+  }
 
-  if (subcommand !== 'start' && subcommand !== 'review' && subcommand !== 'resume') {
-    throw new Error('usage: dag factory start|review --goal goal.json [--source-run completed-run.json] [--file review-run.json] | factory resume [--assessment evidence.json] [--policy policy.json] | factory status --file run.json');
+  if (subcommand !== 'start' && subcommand !== 'review' && subcommand !== 'resume' && subcommand !== 'fix') {
+    throw new Error('usage: dag factory start --goal goal.json | review [--goal goal.json] [--check command] [--cmd agent-command] | report|fix|close|resume|status --file run.json');
   }
   guard(file, argv);
   const onEvent = (event: DagEvent): void => {
@@ -34,12 +55,30 @@ export async function factoryCmd(argv: string[]): Promise<void> {
   };
   const result = subcommand === 'resume'
     ? await resumeFactory(file, options)
-    : await startFactory(
-      subcommand === 'review' ? reviewGoal(readGoal(flagRequired(argv, 'goal')), flag(argv, 'source-run')) : readGoal(flagRequired(argv, 'goal')),
-      file, options,
-    );
+    : subcommand === 'fix'
+      ? await fixFactoryReview(file, options)
+      : await startFactory(
+        subcommand === 'review' ? reviewGoalInput(argv) : readGoal(flagRequired(argv, 'goal')),
+        file, options,
+      );
   emit(argv, result, () => result.summary);
-  if (result.state.status !== 'completed') process.exitCode = 1;
+  if (result.state.status !== 'completed' && result.state.stage !== 'report') process.exitCode = 1;
+}
+
+function reviewGoalInput(argv: string[]): StructuredFactoryGoal {
+  const sourceRun = flag(argv, 'source-run');
+  const goalFile = flag(argv, 'goal');
+  if (goalFile) return reviewGoal(readGoal(goalFile), sourceRun);
+  const harnessName = flag(argv, 'harness') ?? 'codex';
+  const harness = findHarness(harnessName);
+  const command = flag(argv, 'cmd') ?? harness?.cmd;
+  if (!command) throw new Error(`review harness ${harnessName} has no agent command; pass --cmd`);
+  const recertificationCommand = flag(argv, 'recert-cmd') ?? harness?.reviewCmd ?? command;
+  return createRepoReviewGoal(process.cwd(), {
+    command, recertificationCommand, checkCommand: flag(argv, 'check'),
+    ...(sourceRun ? { sourceRunFile: resolve(sourceRun) } : {}),
+    ...(flag(argv, 'code-units') ? { codeUnits: parseList(flag(argv, 'code-units')) } : {}),
+  });
 }
 
 function reviewGoal(goal: StructuredFactoryGoal, sourceRunFile: string | undefined): StructuredFactoryGoal {

@@ -7,7 +7,7 @@ import test from 'node:test';
 import type { Executor } from '../runner.js';
 import { addTask, loadRun, newRun, retryTask, runPaths, saveRun } from '../store.js';
 import { traceRequirement } from './graph-model.js';
-import { factoryStatus, resumeFactory, startFactory, type FactoryControllerOptions, type StructuredFactoryGoal } from './controller.js';
+import { factoryReviewReport, factoryStatus, fixFactoryReview, resumeFactory, startFactory, type FactoryControllerOptions, type StructuredFactoryGoal } from './controller.js';
 import { VERIFICATION_CATEGORIES } from './verification.js';
 import { buildConfidenceFrontier } from './confidence-frontier.js';
 import { createReviewBudget } from './review-budget.js';
@@ -326,4 +326,125 @@ test('reviews an existing repository and prior DAG without implementation tasks'
   }
   assert.equal(factoryStatus(cliFile).state.status, 'completed');
   assert.equal(Object.keys(loadRun(cliFile).tasks).some((id) => id.includes('unused')), false);
+
+  const repoFile = join(root, 'dag.repo-review.json');
+  try {
+    execFileSync(process.execPath, [join(process.cwd(), 'dist', 'cli.js'), 'factory', 'review', '--file', repoFile,
+      '--cmd', 'node review.cjs', '--recert-cmd', 'node recert.cjs', '--check', 'node --version'], { cwd: root, stdio: 'pipe' });
+  } catch (error) {
+    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${(error as { stdout?: Buffer }).stdout?.toString() ?? ''}`);
+  }
+  assert.equal(factoryStatus(repoFile).state.status, 'completed');
+  const generatedGoal = JSON.parse(readFileSync(join(runPaths(repoFile).factory, 'goal-v1.json'), 'utf8'));
+  assert.equal(generatedGoal.mode, 'review');
+  assert.deepEqual(generatedGoal.implementation, []);
+  assert.deepEqual(generatedGoal.coverage, { criticalFlow: 1, weightedRisk: 0 });
+  assert.deepEqual(generatedGoal.review.codeUnits, ['src/service.ts']);
+  const cliReport = JSON.parse(execFileSync(process.execPath, [join(process.cwd(), 'dist', 'cli.js'), 'factory', 'report',
+    '--file', repoFile, '--json'], { cwd: root, encoding: 'utf8' }));
+  assert.equal(cliReport.verifiedDefects.length, 0);
+
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'existing-app', scripts: { test: 'node --version' } }));
+  execFileSync('git', ['add', 'package.json'], { cwd: root });
+  execFileSync('git', ['commit', '-m', 'add test script'], { cwd: root, stdio: 'ignore' });
+  const autoCheckFile = join(root, 'dag.auto-check.json');
+  try {
+    execFileSync(process.execPath, [join(process.cwd(), 'dist', 'cli.js'), 'factory', 'review', '--file', autoCheckFile,
+      '--cmd', 'node review.cjs', '--recert-cmd', 'node recert.cjs'], { cwd: root, stdio: 'pipe' });
+  } catch (error) {
+    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${(error as { stdout?: Buffer }).stdout?.toString() ?? ''}`);
+  }
+  const autoGoal = JSON.parse(readFileSync(join(runPaths(autoCheckFile).factory, 'goal-v1.json'), 'utf8'));
+  assert.equal(autoGoal.checks[0].cmd, process.platform === 'win32' ? 'cmd /c npm run test' : 'npm run test');
+  assert.equal(factoryStatus(autoCheckFile).state.status, 'completed');
+});
+
+test('reports verified findings before creating repair tasks and requires an explicit fix decision', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'dag-factory-report-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'src'));
+  writeFileSync(join(root, '.gitignore'), 'dag*.json*\ndag*.d/\n');
+  writeFileSync(join(root, 'tsconfig.json'), JSON.stringify({
+    compilerOptions: { target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', strict: true },
+    include: ['src/**/*.ts'],
+  }));
+  writeFileSync(join(root, 'src', 'service.ts'), 'export function getOwner(): string { return ""; }\n');
+  execFileSync('git', ['init'], { cwd: root, stdio: 'ignore' });
+  execFileSync('git', ['config', 'user.email', 'factory-test@example.invalid'], { cwd: root });
+  execFileSync('git', ['config', 'user.name', 'Factory Test'], { cwd: root });
+  execFileSync('git', ['add', '.'], { cwd: root });
+  execFileSync('git', ['commit', '-m', 'existing app'], { cwd: root, stdio: 'ignore' });
+  const goal: StructuredFactoryGoal = {
+    schemaVersion: 1, mode: 'review',
+    goal: { id: 'owner', title: 'Review owner', description: 'Check existing owner behavior.' },
+    requirements: [{ id: 'owner', title: 'Owner required', description: 'Owner must be populated.', acceptanceCriteria: ['getOwner returns a value.'] }],
+    implementation: [], review: { codeUnits: ['src/service.ts'] },
+    checks: [{ id: 'node', title: 'Check tool', cmd: 'fake check' }],
+    phases: {
+      review: { command: 'fake review' }, verification: { command: 'fake verify' },
+      rootCause: { command: 'fake root-cause' }, remediation: { command: 'fake remediate' },
+      regression: { command: 'fake regression' }, recertification: { reviewCmd: 'fake recertify' },
+    },
+    coverage: { criticalFlow: 1, weightedRisk: 1 },
+  };
+  const executor: Executor = async (task, ctx) => {
+    let output = 'ok\n';
+    let exitCode = 0;
+    if (task.title.startsWith('Factory review:')) output = JSON.stringify([{
+      id: 'owner-empty', title: 'Owner is empty', description: 'The service returns an empty owner.',
+      category: 'correctness', files: ['src/service.ts'], failureScenario: 'getOwner returns an empty string.',
+    }]);
+    else if (task.title.startsWith('Verify defect hypothesis:')) {
+      const evidence = task.spec.match(/"id"\s*:\s*"(context:v1:[a-f0-9]+)"/);
+      assert.ok(evidence);
+      output = JSON.stringify({
+        verdict: 'verified', confidence: 0.96, reachability: 'confirmed', inspectedCategories: [...VERIFICATION_CATEGORIES],
+        evidenceFor: [{ evidenceId: evidence[1], rationale: 'Current source returns an empty owner.' }],
+        evidenceAgainst: [], reasoning: 'The failure is reachable.',
+      });
+    } else if (task.title.startsWith('Assess shared root causes')) output = '[]';
+    else if (task.title.startsWith('Fix verified defect:')) { output = 'repair failed'; exitCode = 1; }
+    ctx.onOutput(output);
+    ctx.setPid(null);
+    return { output, exitCode };
+  };
+  const file = join(root, 'dag.review.json');
+  const result = await startFactory(goal, file, { cwd: root, executor });
+  assert.equal(result.state.stage, 'report', result.summary);
+  assert.equal(result.state.status, 'waiting');
+  assert.equal(Object.keys(result.state.tasks.remediation).length, 0);
+  const report = factoryReviewReport(file);
+  assert.equal(report.verifiedDefects.length, 1);
+  assert.ok(report.proposedRemediationTasks > 0);
+  assert.equal((await resumeFactory(file, { cwd: root, executor })).state.stage, 'report');
+  assert.equal(Object.keys(loadRun(file).tasks).some((id) => loadRun(file).tasks[id]?.title.startsWith('Fix verified defect:')), false);
+  const cliReport = JSON.parse(execFileSync(process.execPath, [join(process.cwd(), 'dist', 'cli.js'), 'factory', 'report',
+    '--file', file, '--json'], { cwd: root, encoding: 'utf8' }));
+  assert.equal(cliReport.verifiedDefects.length, 1);
+  execFileSync(process.execPath, [join(process.cwd(), 'dist', 'cli.js'), 'factory', 'close', '--file', file], { cwd: root, stdio: 'pipe' });
+  assert.equal(factoryStatus(file).state.stage, 'reported');
+  assert.equal(factoryStatus(file).state.status, 'completed');
+  writeFileSync(join(root, 'src', 'service.ts'), 'export function getOwner(): string { return "changed"; }\n');
+  assert.equal(factoryStatus(file).state.status, 'waiting');
+  await assert.rejects(() => fixFactoryReview(file, { cwd: root, executor }), /source tree|source changed/);
+  execFileSync('git', ['restore', '--', 'src/service.ts'], { cwd: root });
+  const fixing = await fixFactoryReview(file, { cwd: root, executor });
+  assert.equal(fixing.state.stage, 'remediation');
+  assert.ok(Object.keys(fixing.state.tasks.remediation).length > 0);
+  assert.equal(fixing.state.status, 'waiting');
+
+  const changingExecutor: Executor = async (task, ctx) => {
+    if (task.title.startsWith('Factory review:')) {
+      writeFileSync(join(root, 'src', 'service.ts'), 'export function getOwner(): string { return "changed early"; }\n');
+      execFileSync('git', ['add', 'src/service.ts'], { cwd: root });
+      execFileSync('git', ['commit', '-m', 'unexpected review edit'], { cwd: root, stdio: 'ignore' });
+    }
+    const output = task.title.startsWith('Factory review:') ? '[]\n' : 'ok\n';
+    ctx.onOutput(output);
+    ctx.setPid(null);
+    return { output, exitCode: 0 };
+  };
+  const changedEarly = await startFactory(goal, join(root, 'dag.unsafe-review.json'), { cwd: root, executor: changingExecutor });
+  assert.equal(changedEarly.state.stage, 'quality');
+  assert.match(changedEarly.state.lastError ?? '', /review source changed before the report/);
 });

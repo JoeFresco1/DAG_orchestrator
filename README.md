@@ -265,6 +265,12 @@ dag factory review --goal review-goal.json --source-run dag.run.json --file dag.
 dag factory status --file dag.review.json
 ```
 
+You can omit `--goal` to review the current TypeScript repository directly.
+Review-only runs save an evidence-backed report. Verified findings pause the
+run until `dag factory fix --file dag.review.json` or
+`dag factory close --file dag.review.json`; inspect them with
+`dag factory report --file dag.review.json`.
+
 The controller stores versioned graph artifacts and its resume checkpoint in
 the run sidecar. See the [software factory operator guide](docs/software-factory.md)
 for the goal schema, command contracts, and recovery procedure.

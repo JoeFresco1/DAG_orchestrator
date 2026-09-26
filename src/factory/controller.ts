@@ -89,7 +89,7 @@ export interface StructuredFactoryGoal {
   convergencePolicy?: ConvergencePolicy;
 }
 
-export type FactoryStage = 'implementation' | 'quality' | 'verification' | 'root_cause' | 'remediation' | 'remediation_verification' | 'recertification' | 'convergence' | 'complete';
+export type FactoryStage = 'implementation' | 'quality' | 'verification' | 'root_cause' | 'report' | 'reported' | 'remediation' | 'remediation_verification' | 'recertification' | 'convergence' | 'complete';
 export type FactoryStatus = 'ready' | 'running' | 'waiting' | 'completed';
 
 export interface FactoryTaskGroups {
@@ -112,7 +112,21 @@ export interface FactoryControllerState {
   status: FactoryStatus;
   tasks: FactoryTaskGroups;
   lastError: string | null;
+  reviewSourceCommit?: string;
   updatedAt: string;
+}
+
+export interface FactoryReviewReport {
+  schemaVersion: 1;
+  runId: string;
+  goalTitle: string;
+  sourceCommit: string;
+  reviewedCodeUnits: string[];
+  observations: ReturnType<typeof analyzeObservations>['observations'];
+  verificationResults: VerificationResult[];
+  verifiedDefects: VerifiedDefect[];
+  rootCauses: ReturnType<typeof createRootCauseGraph>['root_causes'];
+  proposedRemediationTasks: number;
 }
 
 export interface FactoryControllerOptions {
@@ -178,6 +192,9 @@ export async function startFactory(
       status: 'ready',
       tasks: emptyTaskGroups(),
       lastError: null,
+      ...(goal.mode === 'review' ? { reviewSourceCommit: execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: options.cwd ?? dirname(file), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim() } : {}),
       updatedAt: new Date().toISOString(),
     };
     compileImplementationTasks(run, goal, state, graph, goalHash);
@@ -201,12 +218,70 @@ export async function resumeFactory(runFile: string, options: FactoryControllerO
   return driveFactory(run, state, file, goal, options);
 }
 
+/** Read the review report without changing the run or authorizing repairs. */
+export function factoryReviewReport(runFile: string): FactoryReviewReport {
+  const file = resolve(runFile);
+  const run = loadRun(file);
+  const state = loadControllerState(file, run.id);
+  return loadArtifact<FactoryReviewReport>(file, state.goalHash, 'review-report-v1.json');
+}
+
+/** Explicitly authorize the proposed remediation DAG after inspecting the report. */
+export async function fixFactoryReview(runFile: string, options: FactoryControllerOptions = {}): Promise<FactoryControllerResult> {
+  const file = resolve(runFile);
+  const run = loadRun(file);
+  const state = loadControllerState(file, run.id);
+  if (state.stage !== 'report' && state.stage !== 'reported') throw new Error('factory review has no pending repair decision');
+  const goal = loadArtifact<StructuredFactoryGoal>(file, state.goalHash, 'goal-v1.json');
+  validateFactoryGoal(goal);
+  const report = factoryReviewReport(file);
+  if (report.verifiedDefects.length === 0) throw new Error('review report has no verified defects to repair');
+  const root = factoryWorkingRoot(run, file, options.cwd ?? dirname(file));
+  if (repositoryCommit(root, run, file) !== report.sourceCommit) {
+    throw new Error('source changed since the review report; start a fresh review before repairing');
+  }
+  scheduleRemediationStage(run, state, file, goal, state.goalHash);
+  state.stage = 'remediation';
+  state.status = 'ready';
+  state.lastError = null;
+  checkpoint(file, state);
+  saveRun(run, file);
+  return driveFactory(run, state, file, goal, options);
+}
+
+/** Finish a review with unresolved findings recorded, without running repairs. */
+export function closeFactoryReview(runFile: string): FactoryControllerResult {
+  const file = resolve(runFile);
+  const run = loadRun(file);
+  const state = loadControllerState(file, run.id);
+  if (state.stage !== 'report') throw new Error('factory review is not awaiting a repair decision');
+  factoryReviewReport(file);
+  state.stage = 'reported';
+  state.status = 'completed';
+  state.lastError = null;
+  checkpoint(file, state);
+  return factoryStatus(file);
+}
+
 /** Read the versioned controller checkpoint without modifying the run. */
 export function factoryStatus(runFile: string): FactoryControllerResult {
   const file = resolve(runFile);
   const run = loadRun(file);
   const state = loadControllerState(file, run.id);
   const certification = loadArtifact<Certification>(file, state.goalHash, 'certification-v1.json', true);
+  if (state.stage === 'report' || state.stage === 'reported') {
+    const report = factoryReviewReport(file);
+    try {
+      const root = dirname(file);
+      const current = run.settings.worktree === 'task'
+        ? execFileSync('git', ['rev-parse', `dag/${run.id}`], { cwd: root, encoding: 'utf8' }).trim()
+        : repositoryCommit(root, run, file);
+      if (current !== report.sourceCommit) throw new Error('source commit changed since the report');
+    } catch (error) {
+      const stale = { ...state, status: 'waiting' as const, lastError: `review report is stale: ${error instanceof Error ? error.message : String(error)}; start a new review run` };
+      return { state: stale, runId: run.id, file, certification, summary: summarizeController(run, stale) };
+    }
+  }
   if (state.stage === 'complete' && certification) {
     try {
       const root = dirname(file);
@@ -230,6 +305,13 @@ async function driveFactory(
   options: FactoryControllerOptions,
 ): Promise<FactoryControllerResult> {
   if (state.stage === 'complete') return factoryStatus(file);
+  if (state.stage === 'reported') return factoryStatus(file);
+  if (state.stage === 'report') {
+    state.status = 'waiting';
+    state.lastError = 'review report ready; inspect dag factory report, then run dag factory fix or dag factory close';
+    checkpoint(file, state);
+    return factoryStatus(file);
+  }
   let turns = 0;
   state.lastError = null;
   while (state.stage !== 'complete' && turns++ < 12) {
@@ -276,8 +358,10 @@ async function driveFactory(
           state.stage = 'root_cause';
           break;
         case 'root_cause':
-          processRootCauseStage(run, state, file, goal, state.goalHash);
-          state.stage = 'remediation';
+          processRootCauseStage(run, state, file, goal, state.goalHash, factoryWorkingRoot(run, file, options.cwd ?? dirname(file)));
+          state.stage = goal.mode === 'review' && factoryReviewReport(file).verifiedDefects.length > 0 ? 'report' : 'remediation';
+          break;
+        case 'report':
           break;
         case 'remediation':
           prepareRemediationVerificationStage(run, state, file, goal, state.goalHash, factoryWorkingRoot(run, file, options.cwd ?? dirname(file)));
@@ -419,6 +503,9 @@ function processQualityStage(
 
   const initialEvidence = qualityEvidence(file, state, run, goal);
   const currentCommit = repositoryCommit(rootDir, run, file);
+  if (goal.mode === 'review' && currentCommit !== state.reviewSourceCommit) {
+    throw new Error('review source changed before the report; start a fresh review without source edits');
+  }
   const specHash = sha256(canonicalJson(model.graphs.requirement));
   const codeHash = sha256(canonicalJson(index.graph));
   const testHash = sha256(canonicalJson(initialEvidence.deterministicChecks));
@@ -539,8 +626,8 @@ function processVerificationStage(run: Run, state: FactoryControllerState, file:
   saveRun(run, file);
 }
 
-function processRootCauseStage(run: Run, state: FactoryControllerState, file: string, goal: StructuredFactoryGoal, goalHash: string): void {
-  const verification = loadArtifact<{ verifiedDefects: VerifiedDefect[] }>(file, goalHash, 'verification-v1.json');
+function processRootCauseStage(run: Run, state: FactoryControllerState, file: string, goal: StructuredFactoryGoal, goalHash: string, rootDir: string): void {
+  const verification = loadArtifact<{ verifiedDefects: VerifiedDefect[]; results: VerificationResult[] }>(file, goalHash, 'verification-v1.json');
   let assessments: RootCauseAssessment[] = [];
   if (verification.verifiedDefects.length > 0) {
     const task = requiredTask(run, state.tasks.rootCause, 'root-cause assessment');
@@ -570,6 +657,31 @@ function processRootCauseStage(run: Run, state: FactoryControllerState, file: st
     maxTasks: goal.phases.remediation.maxTasks,
   });
   saveArtifact(file, run.id, 'remediation-plan-v1.json', remediation);
+  const observations = loadArtifact<ReturnType<typeof analyzeObservations>>(file, goalHash, 'observations-v1.json');
+  const report: FactoryReviewReport = {
+    schemaVersion: 1, runId: run.id, goalTitle: goal.goal.title,
+    sourceCommit: repositoryCommit(rootDir, run, file),
+    reviewedCodeUnits: goal.mode === 'review' ? reviewCodePaths(goal, codeGraph) : goal.implementation.flatMap((task) => task.codeUnits),
+    observations: observations.observations,
+    verificationResults: verification.results,
+    verifiedDefects: verification.verifiedDefects,
+    rootCauses: graph.root_causes,
+    proposedRemediationTasks: remediation.nodes.length,
+  };
+  if (goal.mode === 'review' && report.sourceCommit !== state.reviewSourceCommit) {
+    throw new Error('review source changed before the report; start a fresh review without source edits');
+  }
+  saveArtifact(file, run.id, 'review-report-v1.json', report);
+  validateFactoryGraphModel(model);
+  saveArtifact(file, run.id, GRAPH_FILE, model);
+  if (goal.mode !== 'review' || verification.verifiedDefects.length === 0) {
+    scheduleRemediationStage(run, state, file, goal, goalHash);
+  }
+}
+
+function scheduleRemediationStage(run: Run, state: FactoryControllerState, file: string, goal: StructuredFactoryGoal, goalHash: string): void {
+  const model = loadArtifact<FactoryGraphModel>(file, goalHash, GRAPH_FILE);
+  const remediation = loadArtifact<ReturnType<typeof compileRemediation>>(file, goalHash, 'remediation-plan-v1.json');
   const prerequisiteIds = state.tasks.rootCause ? [state.tasks.rootCause] : Object.values(state.tasks.verification);
   const created = createRemediationTasks(
     run,
@@ -1255,6 +1367,8 @@ function stageTaskIds(state: FactoryControllerState): string[] {
     case 'quality': return [...Object.values(state.tasks.checks), ...(state.tasks.review ? [state.tasks.review] : [])];
     case 'verification': return Object.values(state.tasks.verification);
     case 'root_cause': return state.tasks.rootCause ? [state.tasks.rootCause] : [];
+    case 'report': return [];
+    case 'reported': return [];
     case 'remediation': return Object.values(state.tasks.remediation);
     case 'remediation_verification': return Object.values(state.tasks.remediationVerification);
     case 'recertification': return [...(state.tasks.regression ? [state.tasks.regression] : []), ...Object.values(state.tasks.recertification)];
@@ -1488,7 +1602,7 @@ function initializeManifest(file: string, runId: string): void {
 function loadControllerState(file: string, runId: string): FactoryControllerState {
   const raw = readJsonFileWithBackup<unknown>(join(runPaths(file).factory, CONTROLLER_FILE));
   if (!raw || !isRecord(raw) || raw.schemaVersion !== 1 || raw.runId !== runId || typeof raw.goalHash !== 'string' ||
-    !['implementation', 'quality', 'verification', 'root_cause', 'remediation', 'remediation_verification', 'recertification', 'convergence', 'complete'].includes(String(raw.stage)) ||
+    !['implementation', 'quality', 'verification', 'root_cause', 'report', 'reported', 'remediation', 'remediation_verification', 'recertification', 'convergence', 'complete'].includes(String(raw.stage)) ||
     !['ready', 'running', 'waiting', 'completed'].includes(String(raw.status)) || !isRecord(raw.tasks)) {
     throw new Error('missing or invalid factory controller checkpoint; start the factory from a structured goal');
   }

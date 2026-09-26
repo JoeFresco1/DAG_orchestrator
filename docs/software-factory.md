@@ -115,12 +115,43 @@ dag factory resume --file dag.review.json
 
 `dag factory review` also accepts a build goal: it selects review mode and
 clears its implementation task list for the new run. It runs checks, code
-review, verification, and certification. Verified defects can generate
-remediation tasks; a clean review schedules no implementation tasks. Review
+review, verification, and certification. The review report is saved under the
+run's factory sidecar and can be read with `dag factory report --file
+dag.review.json` (add `--json` for the full evidence record). If verified
+defects remain, the run pauses at `report` with a proposed remediation plan.
+No repair tasks exist until you choose one of these commands:
+
+```bash
+dag factory fix --file dag.review.json    # create and run the proposed repair DAG
+dag factory close --file dag.review.json  # finish with findings still unresolved
+```
+
+`dag factory resume` stays at the report checkpoint until you make that
+choice. The report is tied to the source commit; if source changes, start a
+new review before repairing. A clean review proceeds to certification. Review
 mode derives its convergence assessment from completed task logs and attempts
 and uses a default policy when the goal has no `convergencePolicy`. Supply
 `--policy` and `--assessment` on resume when your project needs different
 thresholds or additional measured evidence.
+
+### Start from the repository without a goal file
+
+From a committed TypeScript repository with `tsconfig.json`:
+
+```bash
+dag factory review --file dag.review.json
+dag factory report --file dag.review.json
+```
+
+This creates a review goal from the indexed files and uses the Codex harness.
+It selects `npm run test`, `npm run typecheck`, or `npm run build` when that
+script exists, in that order. If the repository has no such script, pass
+`--check "command"`. Use `--harness`, `--cmd`, `--recert-cmd`, and
+`--code-units src/a.ts,src/b.ts` to control the reviewer or scope. You may
+also pass `--source-run` for read-only context from an earlier DAG. The
+generated goal declares only the configured check as its critical flow and
+records zero weighted product-risk coverage; a structured goal is needed to
+claim broader coverage.
 
 The controller executes these phases in order:
 
@@ -173,6 +204,7 @@ dag.run.d/factory/observations-v1.json
 dag.run.d/factory/hypotheses-v1.json
 dag.run.d/factory/verification-v1.json
 dag.run.d/factory/root-causes-v1.json
+dag.run.d/factory/review-report-v1.json
 dag.run.d/factory/remediation-plan-v1.json
 dag.run.d/factory/remediation-verification-v1.json
 dag.run.d/factory/impact-v1.json

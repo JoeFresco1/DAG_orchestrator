@@ -23,6 +23,11 @@ usage: dag <cmd> [flags]
   init --objective "..."        new run file
   factory start --goal goal.json [--file F]
                                compile and run a structured software-factory cycle
+  factory review [--goal goal.json] [--file F] [--source-run F]
+      [--harness codex] [--cmd C] [--recert-cmd C] [--check C]
+                               review an existing repository and save a report
+  factory report|fix|close [--file F]
+                               inspect findings, authorize repairs, or close the review
   factory resume|status [--file F]
                                continue or inspect the persisted factory cycle
   add --title T --spec S [--deps a,b] [--cmd "..."] [--retries N]
