@@ -179,6 +179,9 @@ aside {
   box-shadow: 0 0 26px rgba(0, 229, 255, .07);
 }
 .sec { display: flex; flex-direction: column; min-height: 0; border-bottom: 1px solid var(--line); }
+.sec.factory { flex: none; }
+#factorySummary { padding: 8px 12px; font-size: 11px; line-height: 1.5; color: var(--text); }
+#factorySummary .muted { color: var(--muted); }
 .sec.queue { flex: 1.2; } .sec.inspect { flex: 1.2; } .sec.log { flex: .9; border-bottom: none; }
 .sechead {
   padding: 6px 12px; font-size: 9.5px; letter-spacing: .16em; text-transform: uppercase;
@@ -270,6 +273,10 @@ aside {
     <button class="mini" id="zoomReset" title="zoom to fit the whole graph">reset</button>
   </div>
   <aside>
+    <div class="sec factory" id="factoryPanel" style="display:none">
+      <div class="sechead"><span class="seclabel">Software factory</span></div>
+      <div id="factorySummary"></div>
+    </div>
     <div class="sec queue" data-sec="queue">
       <div class="sechead">
         <span class="chev" title="collapse / expand">▾</span>
@@ -606,6 +613,26 @@ function applySummary(s) {
   if (changed.length) nodes.update(changed);
   renderHeader(s);
   renderQueue();
+}
+async function refreshFactory() {
+  try {
+    const response = await fetch(`${API}/factory`);
+    if (response.status === 404) { $('factoryPanel').style.display = 'none'; return; }
+    if (!response.ok) return;
+    const data = await response.json();
+    const state = data.controller;
+    if (!state) return;
+    $('factoryPanel').style.display = '';
+    const report = data.report;
+    const weighted = data.coverage?.riskCoverage?.weightedRisk?.percent;
+    const decision = data.convergence;
+    $('factorySummary').innerHTML =
+      `<b>${esc(state.stage || 'unknown')}</b> · ${esc(state.status || 'unknown')}` +
+      (report ? `<br>${report.verifiedDefects?.length || 0} verified defects` : '') +
+      (weighted == null ? '' : ` · ${Math.round(weighted * 100)}% reviewed risk`) +
+      (decision ? `<br>Convergence: ${esc(decision.status || 'pending')}` : '') +
+      (state.lastError ? `<br><span class="muted">${esc(state.lastError)}</span>` : '');
+  } catch { /* server restarting */ }
 }
 function titleOf(id) { return titleById.get(id) ?? id; }
 
@@ -1109,6 +1136,7 @@ async function poll() {
       initialized = true;
     }
     applySummary(s);
+    await refreshFactory();
     if (inspected && detail && detail.status === 'running') {
       await fetchDetail(inspected);
       renderInspector();

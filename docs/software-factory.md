@@ -54,23 +54,7 @@ include `{spec}` when an agent command needs the task instructions.
       "reviewCmd": "codex exec --full-auto \"{spec}\""
     }
   },
-  "coverage": { "criticalFlow": 1, "weightedRisk": 0.95 },
-  "certificationPolicy": {
-    "minimumCriticalFlowCoverage": 1,
-    "minimumWeightedRiskCoverage": 0.95
-  },
-  "convergencePolicy": {
-    "minimumMeaningfulReviewUnits": 3,
-    "maximumWeightedResidualRisk": 0.05,
-    "minimumReleaseConfidence": 0.9,
-    "maximumNovelVerifiedDefectsPer1000Requests": 1,
-    "minimumRequestsForYield": 1000,
-    "minimumWeightedRiskCoverage": 0.95,
-    "minimumCriticalFlowCoverage": 1,
-    "requiredCriticalFlowIds": ["owner-create"],
-    "requiredDeterministicCheckIds": ["regression-factory-claim-owner-field-owner-required"],
-    "minimumRemainingBudget": { "requests": 1 }
-  }
+  "coverage": { "criticalFlow": 1, "weightedRisk": 0.95 }
 }
 ```
 
@@ -80,8 +64,12 @@ implements. Files must exist in the code graph after implementation. The
 coverage values should come from the risk and critical-flow evidence used by
 your project.
 
-The review command returns a JSON array of observations (or
-`{"observations": [...]}`). Verification returns one JSON
+The review command returns `{"observations": [...], "reviewedFiles": ["src/owner.ts"]}`.
+List only code-scope files actually inspected. The controller records these
+against the code graph snapshot; changed files also need passing scoped
+recertification review. Older observation arrays are accepted for finding
+extraction but supply no coverage evidence, so automatic convergence waits.
+Verification returns one JSON
 `VerificationAssessment` per generated hypothesis, following the schema in
 the task prompt and citing its supplied evidence IDs. The root-cause command
 returns a JSON array of `RootCauseAssessment` objects; return `[]` when no
@@ -94,7 +82,7 @@ end with `VERDICT: PASS` or `VERDICT: FAIL: reason`.
 ```bash
 dag factory start --goal docs/factory/owner-field.json --file dag.run.json
 dag factory status --file dag.run.json
-dag factory resume --file dag.run.json --assessment measured-convergence.json
+dag factory resume --file dag.run.json
 ```
 
 ## Review an existing application
@@ -168,13 +156,15 @@ The controller executes these phases in order:
 8. Evaluate the measured convergence assessment against `convergencePolicy`.
    Only a `stop` decision completes the factory; `continue` or `escalate` remains waiting.
 
-For build mode, the assessment file supplies `confidenceFrontier`, `budget`, `criticalFlows`,
-`findings`, and `reviewUnits` in the `ConvergenceAssessment` shape. The controller
-supplies the run ID, final certificate, and current source commit itself. The
-assessment must contain evidence references and measured review request counts;
-the factory waits for it after recertification when `--assessment` is omitted.
-For a goal created before `convergencePolicy` was added, pass its policy JSON
-with `--policy policy.json` when resuming.
+Build and review modes derive `confidenceFrontier`, `budget`, `criticalFlows`,
+`findings`, and `reviewUnits` from recorded review output, file coverage,
+defect rechecks, recertification, and task attempts. Review coverage is
+risk-weighted using the code graph and saved in `risk-coverage-v1.json`.
+The default convergence policy requires full inspected-file coverage and a
+quiet review window. A custom `convergencePolicy` can set stricter thresholds;
+for example, `minimumRequestsForYield: 1000` needs 1,000 actual requests in
+the window and will keep a short run waiting. `--assessment` remains an
+explicit override for measurements made outside the controller.
 
 The requirement, code, execution, and defect graphs are persisted as separate
 versioned artifacts with trace links between them. Tasks appear in normal DAG

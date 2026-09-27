@@ -290,8 +290,14 @@ are tied to the source commit; changes to the code require a new review.
 
 For a build goal, use `dag factory status --file dag.factory.json` and
 `dag factory resume --file dag.factory.json` to inspect or continue the cycle.
-Build-mode completion requires a convergence policy and measured assessment;
-the [operator guide](docs/software-factory.md) shows the evidence format.
+Build and review runs now derive convergence from review task output, inspected
+files, defect rechecks, recertification reviews, and recorded task attempts.
+The reviewer must return `{"observations":[],"reviewedFiles":["src/example.ts"]}`
+with the files it inspected. An older array-only response remains readable, but
+leaves measured coverage at zero and holds convergence. The controller saves
+`review-coverage-v1.json` and `risk-coverage-v1.json` in the factory sidecar.
+An explicit `--assessment` remains available for externally measured evidence;
+see the [operator guide](docs/software-factory.md).
 
 The controller stores versioned graph artifacts and its resume checkpoint in
 the run sidecar. See the [software factory operator guide](docs/software-factory.md)

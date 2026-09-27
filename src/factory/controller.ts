@@ -40,6 +40,9 @@ import { validateCertificationClaims, type CertificationClaim } from './certific
 import { evaluateAndSaveConvergence, type ConvergenceAssessment, type ConvergencePolicy } from './convergence.js';
 import { buildConfidenceFrontier } from './confidence-frontier.js';
 import { accountReviewUsage, createReviewBudget } from './review-budget.js';
+import { calculateRiskCoverage } from './risk-coverage.js';
+import { rankReviewableUnits } from './risk.js';
+import { summarizeFactoryTelemetry } from './telemetry.js';
 
 export interface FactoryRequirementInput {
   id: string;
@@ -448,6 +451,14 @@ function processQualityStage(
   const reviewOutput = parseJsonOutput(taskOutput(file, reviewTask), 'review observations');
   const raw = normalizeRawObservations(reviewOutput);
   const index = loadArtifact<CodeGraphIndex>(file, goalHash, CODE_GRAPH_FILE);
+  const requestedFiles = goal.mode === 'review' ? reviewCodePaths(goal, index) :
+    [...new Set(goal.implementation.flatMap((task) => task.codeUnits.map(normalizeRepoPath)))].sort();
+  const reviewedFiles = normalizeReviewedFiles(reviewOutput, requestedFiles);
+  saveArtifact(file, run.id, 'review-coverage-v1.json', {
+    schemaVersion: 1, requestedFiles, reviewedFiles,
+    sourceFiles: index.files.filter((entry) => requestedFiles.includes(entry.path)),
+    reviewTaskId: reviewTask.id,
+  });
   const analyzed = analyzeObservations(raw, { codeGraph: index });
   const hypotheses = createHypotheses(analyzed.observations, analyzed.clusters);
   validateHypothesisSet(hypotheses);
@@ -658,10 +669,11 @@ function processRootCauseStage(run: Run, state: FactoryControllerState, file: st
   });
   saveArtifact(file, run.id, 'remediation-plan-v1.json', remediation);
   const observations = loadArtifact<ReturnType<typeof analyzeObservations>>(file, goalHash, 'observations-v1.json');
+  const reviewCoverage = loadArtifact<{ reviewedFiles: string[] }>(file, goalHash, 'review-coverage-v1.json');
   const report: FactoryReviewReport = {
     schemaVersion: 1, runId: run.id, goalTitle: goal.goal.title,
     sourceCommit: repositoryCommit(rootDir, run, file),
-    reviewedCodeUnits: goal.mode === 'review' ? reviewCodePaths(goal, codeGraph) : goal.implementation.flatMap((task) => task.codeUnits),
+    reviewedCodeUnits: reviewCoverage.reviewedFiles,
     observations: observations.observations,
     verificationResults: verification.results,
     verifiedDefects: verification.verifiedDefects,
@@ -943,10 +955,8 @@ function processRecertificationStage(
 
 function processConvergenceStage(run: Run, state: FactoryControllerState, file: string, goal: StructuredFactoryGoal, options: FactoryControllerOptions): void {
   const certification = loadArtifact<Certification>(file, state.goalHash, 'certification-v1.json');
-  const policy = options.convergencePolicy ?? goal.convergencePolicy ?? (goal.mode === 'review' ? defaultReviewConvergencePolicy(goal, certification) : undefined);
-  if (!policy) throw new Error('factory completion requires a convergencePolicy in the goal or --policy');
-  const assessment = options.convergenceAssessment ?? (goal.mode === 'review' ? measuredReviewAssessment(run, state, file, policy, certification) : undefined);
-  if (!assessment) throw new Error('factory completion requires measured convergence evidence; resume with --assessment');
+  const policy = options.convergencePolicy ?? goal.convergencePolicy ?? defaultReviewConvergencePolicy(goal, certification);
+  const assessment = options.convergenceAssessment ?? measuredReviewAssessment(run, state, file, goal, policy, certification);
   const reviewTaskIds = new Set([
     ...(state.tasks.review ? [state.tasks.review] : []),
     ...Object.values(state.tasks.verification),
@@ -990,6 +1000,16 @@ function processConvergenceStage(run: Run, state: FactoryControllerState, file: 
     },
   }, policy);
   saveArtifact(file, run.id, 'convergence-decision-v1.json', decision);
+  const coverage = loadArtifact<ReturnType<typeof calculateRiskCoverage>>(file, state.goalHash, 'risk-coverage-v1.json', true);
+  saveArtifact(file, run.id, 'telemetry-v1.json', summarizeFactoryTelemetry(run, {
+    requests: reviewUnits.reduce((sum, unit) => sum + unit.requestCount, 0),
+    findings: verifiedDefects.map((defect) => ({ id: defect.id, verified: true,
+      remediated: assessment.findings.some((finding) => finding.id === defect.id && finding.status === 'resolved') })),
+    riskCoverage: coverage ? [{
+      totalRisk: coverage.riskCoverage.weightedRisk.totalRisk,
+      inspectedRisk: coverage.riskCoverage.weightedRisk.inspectedRisk,
+    }] : [],
+  }));
   if (decision.status !== 'stop') {
     throw new Error(`factory has not converged (${decision.status}): ${decision.reasons.join('; ')}`);
   }
@@ -1011,7 +1031,7 @@ function defaultReviewConvergencePolicy(goal: StructuredFactoryGoal, certificati
 }
 
 function measuredReviewAssessment(
-  run: Run, state: FactoryControllerState, file: string, policy: ConvergencePolicy, certification: Certification,
+  run: Run, state: FactoryControllerState, file: string, goal: StructuredFactoryGoal, policy: ConvergencePolicy, certification: Certification,
 ): Omit<ConvergenceAssessment, 'runId' | 'certification' | 'currentCertificationState'> {
   const reviewTaskIds = [
     ...(state.tasks.review ? [state.tasks.review] : []),
@@ -1022,7 +1042,47 @@ function measuredReviewAssessment(
   const reviewTasks = reviewTaskIds.map((id) => requiredTask(run, id, `convergence review unit ${id}`));
   const regression = requiredTask(run, state.tasks.regression, 'regression check');
   const regressionEvidence = toFactoryEvidence(evidenceForTask(file, run, regression, 'command'), 'command');
-  const frontier = buildConfidenceFrontier([], [], [], 0);
+  const coverageArtifact = loadArtifact<{
+    requestedFiles: string[]; reviewedFiles: string[]; sourceFiles: Array<{ path: string; sha256: string }>;
+  }>(file, state.goalHash, 'review-coverage-v1.json');
+  const index = loadArtifact<CodeGraphIndex>(file, state.goalHash, CODE_GRAPH_FILE);
+  const currentFiles = new Map(index.files.map((entry) => [entry.path, entry.sha256]));
+  const recertification = loadArtifact<RecertificationPlan>(file, state.goalHash, 'recertification-plan-v1.json');
+  const recertifiedFiles = new Set(recertification.reviewPlans.filter((plan) => {
+    const id = state.tasks.recertification[plan.unit];
+    if (!id) return false;
+    const task = requiredTask(run, id, `recertification review for ${plan.unit}`);
+    const verdicts = Object.values(task.reviewerVerdicts);
+    return verdicts.length > 0 && verdicts.every((verdict) => verdict.verdict === 'pass');
+  }).map((plan) => index.graph.entities.find((entity) => entity.id === plan.unit)?.sourcePath)
+    .filter((path): path is string => Boolean(path)));
+  const reviewed = new Set(coverageArtifact.requestedFiles.filter((path) =>
+    coverageArtifact.reviewedFiles.includes(path) &&
+    (coverageArtifact.sourceFiles.some((entry) => entry.path === path && currentFiles.get(path) === entry.sha256) ||
+      recertifiedFiles.has(path))));
+  const scores = new Map(rankReviewableUnits(index, {
+    units: coverageArtifact.requestedFiles.map((path) => `code:v1:file/${path}` as const),
+  }).map((score) => [score.unit, score.risk_score]));
+  const units = coverageArtifact.requestedFiles.map((path) => ({
+    id: path, kind: 'code' as const,
+    riskWeight: Math.max(1, scores.get(`code:v1:file/${path}`) ?? 0), reviewed: reviewed.has(path),
+  }));
+  const coverage = calculateRiskCoverage(units, { files: { total: coverageArtifact.requestedFiles, reviewed: [...reviewed] } });
+  saveArtifact(file, run.id, 'risk-coverage-v1.json', coverage);
+  if ((coverage.riskCoverage.weightedRisk.percent ?? 0) < policy.minimumWeightedRiskCoverage) {
+    throw new Error(`measured reviewed-file risk coverage ${(coverage.riskCoverage.weightedRisk.percent ?? 0).toFixed(3)} is below policy ${policy.minimumWeightedRiskCoverage}`);
+  }
+  const total = Math.max(1, units.reduce((sum, unit) => sum + unit.riskWeight, 0));
+  const frontier = buildConfidenceFrontier(coverageArtifact.requestedFiles.map((path) => ({
+    id: `review-file:${path}`, claim: `Source file ${path} was inspected`,
+    status: reviewed.has(path) ? 'resolved' as const : 'unresolved' as const,
+    releaseImpact: (units.find((unit) => unit.id === path)?.riskWeight ?? 0) / total,
+    confidence: reviewed.has(path) ? 1 : 0,
+  })), [], [{
+    actionId: state.tasks.review!, unit: 'review-scope', reviewType: 'source-inspection',
+    effort: Math.max(1, requiredTask(run, state.tasks.review, 'implementation review').attempts),
+    observedRiskReduction: units.filter((unit) => unit.reviewed).reduce((sum, unit) => sum + unit.riskWeight, 0) / total,
+  }], 1);
   let budget = createReviewBudget();
   const reviewUnits = reviewTasks.map((task) => {
     if (!task.finishedAt) throw new Error(`convergence review unit ${task.id} has no recorded completion time`);
@@ -1035,9 +1095,13 @@ function measuredReviewAssessment(
     };
   });
   const verifiedDefects = loadArtifact<{ verifiedDefects: VerifiedDefect[] }>(file, state.goalHash, 'verification-v1.json').verifiedDefects;
+  const rechecks = loadArtifact<{ results: VerificationResult[] }>(file, state.goalHash, 'remediation-verification-v1.json');
   const findings = verifiedDefects.map((defect) => ({
-    id: defect.id, severity: defect.severity, status: 'resolved' as const, verified: true,
-    evidence: [regressionEvidence],
+    id: defect.id, severity: defect.severity,
+    status: rechecks.results.some((result) => result.hypothesis_id === defect.verification.hypothesis_id &&
+      result.verdict === 'rejected' && result.reachability === 'refuted' && result.confidence >= 0.8)
+      ? 'resolved' as const : 'open' as const,
+    verified: true, evidence: [regressionEvidence],
   }));
   return {
     confidenceFrontier: {
@@ -1047,7 +1111,10 @@ function measuredReviewAssessment(
     },
     budget: { state: budget, evidence: [regressionEvidence] },
     criticalFlows: policy.requiredCriticalFlowIds.map((flowId) => ({
-      flowId, certified: certification.status === 'certified', evidence: [regressionEvidence],
+      flowId, certified: certification.status === 'certified' &&
+        goal.requirements.some((requirement) => requirement.id === flowId) &&
+        certification.deterministicChecks.some((check) => check.status === 'pass' && check.id.includes(safeKey(flowId))),
+      evidence: [regressionEvidence],
     })),
     findings,
     reviewUnits,
@@ -1296,8 +1363,10 @@ function renderReviewSpec(goal: StructuredFactoryGoal, file: string, index: Code
       ? `Review the existing application for goal ${goal.goal.id}: ${goal.goal.title}. Do not schedule new implementation work.`
       : `Review the completed implementation for goal ${goal.goal.id}: ${goal.goal.title}.`,
     `Requirements: ${JSON.stringify(goal.requirements)}.`,
-    ...(goal.mode === 'review' ? [`Code scope: ${reviewCodePaths(goal, index).join(', ')}.`, ...(sourceRunContext ? [sourceRunContext] : [])] : []),
-    'Inspect the code and tests. Return one JSON array of RawObservation objects; return [] when there are no findings.',
+    `Code scope: ${(goal.mode === 'review' ? reviewCodePaths(goal, index) :
+      [...new Set(goal.implementation.flatMap((task) => task.codeUnits.map(normalizeRepoPath)))].sort()).join(', ')}.`,
+    ...(sourceRunContext ? [sourceRunContext] : []),
+    'Inspect the code and tests. Return one JSON object with observations (an array of RawObservation objects) and reviewedFiles (the repository-relative code-scope files actually inspected). Use an empty observations array when there are no findings.',
     'Each observation may include id, title, description, category, files, symbols, dependencies, failureScenario, executionPaths, semanticEvidence, evidenceIds, and reviewer.',
     'Do not repair the code during this review. Emit JSON only; no markdown fences or prose.',
   ].join('\n');
@@ -1325,6 +1394,17 @@ function normalizeRawObservations(value: unknown): RawObservation[] {
   const observations = Array.isArray(value) ? value : isRecord(value) && Array.isArray(value.observations) ? value.observations : null;
   if (!observations) throw new Error('review command must emit a JSON array or {"observations": [...]}');
   return observations as RawObservation[];
+}
+
+function normalizeReviewedFiles(value: unknown, requestedFiles: string[]): string[] {
+  if (!isRecord(value) || !Array.isArray(value.reviewedFiles)) return [];
+  const requested = new Set(requestedFiles);
+  const paths = value.reviewedFiles.map((path) => {
+    if (typeof path !== 'string') throw new Error('reviewedFiles must contain repository-relative paths');
+    return normalizeRepoPath(path);
+  });
+  for (const path of paths) if (!requested.has(path)) throw new Error(`reviewed file is outside the declared code scope: ${path}`);
+  return [...new Set(paths)].sort();
 }
 
 function implementationTasksForHypothesis(

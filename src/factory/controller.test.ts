@@ -7,10 +7,8 @@ import test from 'node:test';
 import type { Executor } from '../runner.js';
 import { addTask, loadRun, newRun, retryTask, runPaths, saveRun } from '../store.js';
 import { traceRequirement } from './graph-model.js';
-import { factoryReviewReport, factoryStatus, fixFactoryReview, resumeFactory, startFactory, type FactoryControllerOptions, type StructuredFactoryGoal } from './controller.js';
+import { factoryReviewReport, factoryStatus, fixFactoryReview, resumeFactory, startFactory, type StructuredFactoryGoal } from './controller.js';
 import { VERIFICATION_CATEGORIES } from './verification.js';
-import { buildConfidenceFrontier } from './confidence-frontier.js';
-import { createReviewBudget } from './review-budget.js';
 
 test('runs and resumes a complete factory cycle through DagRunner with requirement trace and recertification', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'dag-factory-'));
@@ -72,7 +70,7 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
       output = 'temporary failure\n';
       exitCode = 1;
     } else if (task.title.startsWith('Factory review:')) {
-      output = JSON.stringify([
+      output = JSON.stringify({ reviewedFiles: ['src/auth.ts', 'src/trace.ts'], observations: [
         {
           id: 'F-auth', title: 'Authentication context disappears after await',
           description: 'Authorization reads no principal after the asynchronous boundary.',
@@ -83,7 +81,7 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
           description: 'The exporter receives no span when the callback returns.',
           category: 'observability', files: ['src/trace.ts'], failureScenario: 'The exporter has no trace span after the callback returns.',
         },
-      ]) + '\n';
+      ] }) + '\n';
     } else if (task.title.startsWith('Verify defect hypothesis:')) {
       const evidence = task.spec.match(/"id"\s*:\s*"(context:v1:[a-f0-9]+)"/);
       assert.ok(evidence, 'verification packet includes source-linked evidence');
@@ -169,35 +167,13 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
   saveRun(finalRetry, runFile);
   recheckMode = 'resolved';
 
-  const pending = await resumeFactory(runFile, { executor, cwd: root });
-  assert.equal(pending.state.stage, 'convergence');
-  assert.equal(pending.state.status, 'waiting');
-  assert.match(pending.state.lastError ?? '', /convergence evidence/);
-  const finalReviewTaskId = Object.values(pending.state.tasks.recertification)[0]!;
-  const certEvidence = pending.certification!.reviewEvidence
-    .flatMap((item) => item.evidence).find((item) => item.uri.includes(`/task/${finalReviewTaskId}/`))!;
-  const evidence = { ...certEvidence, id: `evidence:v1:${certEvidence.sha256}` as const, kind: 'review' as const };
-  const frontier = buildConfidenceFrontier([], [], [], 0);
-  const assessment: NonNullable<FactoryControllerOptions['convergenceAssessment']> = {
-    confidenceFrontier: {
-      schemaVersion: 1, initialResidualRisk: frontier.initialResidualRisk,
-      residualRisk: frontier.residualRisk, unresolvedClaims: frontier.unresolvedClaims,
-      effortCurve: frontier.effortCurve, evidence: [evidence],
-    },
-    budget: { state: createReviewBudget({ limits: { requests: 2 } }), evidence: [evidence] },
-    criticalFlows: [{ flowId: 'async-context', certified: true, evidence: [evidence] }],
-    findings: [],
-    reviewUnits: [{ id: finalReviewTaskId, completedAt: new Date().toISOString(), status: 'completed', meaningful: true, requestCount: 1, evidence: [evidence], newFindings: [] }],
-  };
   const notConverged = await resumeFactory(runFile, {
-    executor, cwd: root,
-    convergencePolicy: { ...goal.convergencePolicy!, minimumRequestsForYield: 1000 },
-    convergenceAssessment: { ...assessment, reviewUnits: assessment.reviewUnits.map((unit) => ({ ...unit, requestCount: 1000 })) },
+    executor, cwd: root, convergencePolicy: { ...goal.convergencePolicy!, minimumRequestsForYield: 1000 },
   });
   assert.equal(notConverged.state.stage, 'convergence');
   assert.equal(notConverged.state.status, 'waiting');
   assert.match(notConverged.state.lastError ?? '', /has not converged/);
-  const resumed = await resumeFactory(runFile, { executor, cwd: root, convergenceAssessment: assessment });
+  const resumed = await resumeFactory(runFile, { executor, cwd: root });
   assert.equal(resumed.state.status, 'completed', resumed.summary);
   assert.equal(resumed.state.stage, 'complete');
   assert.equal(resumed.certification?.status, 'certified');
@@ -278,7 +254,7 @@ test('reviews an existing repository and prior DAG without implementation tasks'
   let reviewSpec = '';
   const executor: Executor = async (task, ctx, cmdOverride) => {
     if (task.title.startsWith('Factory review:')) reviewSpec = task.spec;
-    const output = cmdOverride === 'fake recertify' ? 'VERDICT: PASS\n' : task.title.startsWith('Factory review:') ? '[]\n' : 'ok\n';
+    const output = cmdOverride === 'fake recertify' ? 'VERDICT: PASS\n' : task.title.startsWith('Factory review:') ? '{"observations":[],"reviewedFiles":["src/service.ts"]}\n' : 'ok\n';
     ctx.onOutput(output);
     ctx.setPid(null);
     return { output, exitCode: 0 };
@@ -297,7 +273,19 @@ test('reviews an existing repository and prior DAG without implementation tasks'
   assert.equal(decision.status, 'stop');
   assert.equal(decision.summary.windowRequestCount, 1);
 
-  writeFileSync(join(root, 'review.cjs'), 'console.log("[]")\n');
+  const legacyExecutor: Executor = async (task, ctx, cmdOverride) => {
+    const output = cmdOverride === 'fake recertify' ? 'VERDICT: PASS\n' :
+      task.title.startsWith('Factory review:') ? '[]\n' : 'ok\n';
+    ctx.onOutput(output);
+    ctx.setPid(null);
+    return { output, exitCode: 0 };
+  };
+  const legacy = await startFactory(goal, join(root, 'dag.legacy-review.json'), { cwd: root, executor: legacyExecutor });
+  assert.equal(legacy.state.stage, 'convergence');
+  assert.equal(legacy.state.status, 'waiting');
+  assert.match(legacy.state.lastError ?? '', /measured reviewed-file risk coverage/);
+
+  writeFileSync(join(root, 'review.cjs'), 'console.log(JSON.stringify({observations:[],reviewedFiles:["src/service.ts"]}))\n');
   writeFileSync(join(root, 'recert.cjs'), 'console.log("VERDICT: PASS")\n');
   execFileSync('git', ['add', 'review.cjs', 'recert.cjs'], { cwd: root });
   execFileSync('git', ['commit', '-m', 'review commands'], { cwd: root, stdio: 'ignore' });

@@ -17,8 +17,10 @@ import {
   mutate,
   readAttemptLog,
   readEventTail,
+  readJsonFileWithBackup,
   retryFailed,
   retryTask,
+  runPaths,
   saveRun,
   skipBlocked,
   skipGated,
@@ -677,6 +679,25 @@ export function startServer(opts: ServeOptions): void {
       json(res, 200, definitionPayload(currentRun(rt)));
     };
 
+    const getFactory = (): void => {
+      const dir = runPaths(file).factory;
+      const controllerFile = join(dir, 'controller-v1.json');
+      if (!existsSync(controllerFile)) {
+        json(res, 404, { error: 'this run has no factory controller' });
+        return;
+      }
+      const read = (name: string): unknown => {
+        const path = join(dir, name);
+        return existsSync(path) ? readJsonFileWithBackup<unknown>(path) : null;
+      };
+      json(res, 200, {
+        controller: read('controller-v1.json'),
+        report: read('review-report-v1.json'),
+        coverage: read('risk-coverage-v1.json'),
+        convergence: read('convergence-decision-v1.json'),
+      });
+    };
+
     // Incremental event tail: `since` is the last seq the client saw, and the
     // response is capped so a long-idle page cannot pull the whole history.
     const getEvents = (): void => {
@@ -859,6 +880,7 @@ export function startServer(opts: ServeOptions): void {
     const runRoutes: RunRoute[] = [
       { method: 'GET', match: /^\/run$/, handle: getRun },
       { method: 'GET', match: /^\/summary$/, handle: getSummary },
+      { method: 'GET', match: /^\/factory$/, handle: getFactory },
       { method: 'GET', match: /^\/definition$/, handle: getDefinition },
       { method: 'GET', match: /^\/events$/, handle: getEvents },
       { method: 'POST', match: /^\/run\/start$/, handle: startRunRoute },
