@@ -19,6 +19,8 @@ Analytical work is often managed as notebooks, scripts, conversations, and repor
 
 A DAG is useful for ordered, parallel, retryable execution. It is insufficient as the entire analytical model because inquiry changes as evidence arrives. Exploration may produce a new question; a failed assumption check may require a different method; a finding may need confirmation on fresh data. The system must preserve both execution order and the evolution of the inquiry.
 
+The first demo should prevent two failures that a notebook can easily hide: **an exploratory observation presented later as a pre-specified test** and **a denominator change between source and analysis without an explanation**. These are concrete claims of value. The prototype must show them being detected in an answer the worker actually produces, not merely store metadata that nobody uses.
+
 The initial target user is someone who delegates an analytical question to a worker and expects the worker to do the work, using Python, R, or SQL as needed. The user may be an analyst, researcher, or domain expert; they should not have to author every plan or run every check themselves. The worker can generate follow-up questions during exploration, while recording where each came from. External publication and consequential decisions remain separately governed actions. Exploration must remain easy to start; a demanding intake form would push users away. The rigor increases when the worker advances from observations to directed claims.
 
 ## 3. Analytical modes
@@ -55,16 +57,16 @@ The two graphs should be linked by stable identifiers: an execution references i
 
 1. **Q1:** “What relates to customer churn?” An exploratory profile of development data produces **R1**, an observed usage difference.
 2. **Q2:** R1 suggests, “Does a 30-day usage drop predict 90-day churn in active subscribers?” The source of Q2 is recorded as exploratory.
-3. **P1:** The worker defines the population, target, split, baseline, metric, and model-selection rule, then locks P1 before accessing sealed evaluation outcomes. A configured policy may require user review of the plan.
-4. **E1 → R2:** Execution E1 trains on development data and produces R2. Deterministic checks pass; a reviewer approves the interpretation. A single planned evaluation on sealed data produces **R3**.
+3. **P1:** The worker defines the population, target, split, baseline, metric, and model-selection rule, then locks P1 before the designated evaluation outcomes are released through the workflow. A configured policy may require user review of the plan.
+4. **E1 → R2:** Execution E1 trains on development data and produces R2. Deterministic checks pass; a reviewer approves the interpretation. A single planned evaluation on the designated evaluation partition produces **R3**.
 5. **C1:** R2 and R3 support the bounded claim “Usage drop improves out-of-sample churn prediction over the stated baseline.” C1 says nothing causal.
 6. A later independent cohort produces **R4**, which challenges C1. C1 remains in history with its original support and a new conflicting-evidence link. The worker opens **Q3**, asking whether the relationship varies by cohort; a new plan supersedes P1 for that inquiry. No old question, plan, result, or claim is overwritten.
 
-This thread records both what was learned and when it was learned. If the analyst had seen sealed outcomes before locking P1, the system could not call R3 an independent confirmation for that lineage.
+This thread records both what was learned and when it was learned. If the worker had seen evaluation outcomes before locking P1, the system could not call R3 an independent confirmation for that lineage. A partition merely withheld by workflow convention is not truly sealed from a worker that can read the same filesystem; see Section 7.
 
 ## 5. Durable objects and independent states
 
-The following is a candidate conceptual model, not a demand to implement every object in the first slice.
+The following is a candidate conceptual model, not a demand to implement every object in the first slice. The **first implementation kernel** is Question, versioned Plan, Execution, Result, and Claim, with `produces` and `supports/challenges` links. Dataset and artifact references support that thread. Transformations and checks are required evidence for the two failure cases in Section 2. Study, Decision, reusable Environment, and a richer Review object can follow once the thread has a working reader and an actual consumer. The conceptual distinctions remain even before each gets a separate stored record.
 
 | Object | Minimum recorded fields |
 | --- | --- |
@@ -105,16 +107,22 @@ outputs:
   - kind: metrics
     name: held_out_evaluation
 checks:
-  - split_integrity
-  - no_target_leakage
-  - baseline_comparison
-  - subgroup_performance
+  - name: split_integrity
+    command: python checks/split_integrity.py --manifest outputs/split.json
+    verdict: exit-code
+    evidence: outputs/split-check.json
+  - name: baseline_comparison
+    command: python checks/baseline.py --metrics outputs/metrics.json
+    verdict: exit-code
+    evidence: outputs/baseline-check.json
 policy_ref: predictive_policy_v1
 ```
 
-The example is illustrative: the contract schema, validator names, and source adapter are open design questions. Validation must happen **at registration**, before a task can run. The canonical contract should have a versioned machine-readable schema with mode-specific required fields. Because the orchestration engine is TypeScript and analysis is often Python, a shared JSON Schema with a TypeScript validator and an optional Pydantic adapter is more portable than making a Python class the sole source of truth. Conformance tests should ensure both validators accept and reject the same examples.
+The example is illustrative: the contract schema, validator names, and source adapter are open design questions. A check name alone does nothing. Each check needs an executor or a reference to a registered check implementation, a verdict rule, and an evidence artifact. The first slice should map these to the runner's existing named reviewer/command mechanism, then add a structured payload (observed value, policy version, evidence reference) where the present pass/fail verdict is too thin. Analytical check failures must not automatically trigger a work retry. A separate check abstraction is justified only if the reviewer mechanism cannot express these semantics.
 
-An exploratory task should need little more than a dataset reference, a purpose, and output locations. A directed inferential, predictive, or causal task must reference a plan with the fields its mode needs. Versioned **policy packs** can define the required checks for a mode and the rule for reporting missing or inconclusive evidence. A policy pack is not a claim that all statistical judgment can be automated.
+The worker authors these contracts from the user's question and dataset. Validation happens **at registration**, before a task can run, so malformed generated contracts fail early without making users fill out the form. The canonical contract should have a versioned machine-readable schema. Because the orchestration engine is TypeScript and analysis is often Python, a shared JSON Schema with a TypeScript validator and an optional Pydantic adapter is more portable than making a Python class the sole source of truth. Conformance tests should ensure both validators accept and reject the same examples.
+
+An exploratory task should register with only a dataset reference, a purpose, and output locations; lightweight does not mean unrecorded. A directed task must reference a plan with the fields its mode needs. The first implementation supports that minimal exploratory contract and one predictive profile. The other modes in Section 3 describe the future analytical vocabulary, not a five-mode schema matrix to build now. Versioned **policy packs** can define required checks for each implemented mode and the rule for reporting missing or inconclusive evidence. A policy pack is not a claim that all statistical judgment can be automated.
 
 A directed analysis should generally follow **define → lock plan → prepare → execute → validate → interpret → review → record claim**. Locking preserves the plan and exposure history; it does not certify the method. An exploratory task may instead produce candidate questions and a profiling artifact. A changed plan after results are observed creates a new version and cannot inherit the old plan's pre-observation label. Recording a claim here means making it available inside the study; external publication is separate.
 
@@ -130,9 +138,9 @@ Record at least: source snapshot/version, code revision, dependency environment,
 
 **Transformation lineage is essential.** A filtered, joined, imputed, or feature-engineered table is a new dataset version, linked to the source versions and its producing execution. Record row counts, schema changes, and exclusion reasons. A reviewer must be able to explain why an analysis used 14,271 rows when the source had 14,608 without reconstructing a notebook by hand.
 
-**Data exposure is part of provenance.** Record which analyst or agent was given access to each data partition or result, especially sealed evaluation outcomes. A claim of independent evaluation needs more than disjoint row IDs: its plan and model-selection process must not have been informed by the sealed outcomes. Exposure records cannot prove what a person already knew outside the tool, so the system should label its guarantee accurately. The first slice can enforce partition access within its own workflow and mark an evaluation lineage contaminated when results are exposed before a subsequent plan or model revision.
+**Data exposure is part of provenance.** Record which analyst or agent was given access to each data partition or result, especially evaluation outcomes. A claim of independent evaluation needs more than disjoint row IDs: its plan and model-selection process must not have been informed by those outcomes. Exposure records cannot prove what a person already knew outside the tool. More concretely, a worker with command access to a filesystem containing the evaluation file can read it regardless of workflow rules; a log written by that worker is not an access-control guarantee. The first slice may use a **workflow-withheld evaluation partition**, and must label it as such. It must not call it sealed or claim enforced independence. A genuine sealed evaluation requires an access boundary outside the worker's authority, such as a separate credential or host and a runner-controlled evaluation step. That stronger design is a later, explicit milestone. Any observed evaluation results followed by a plan or model revision mark that lineage as post-observation.
 
-The runner will eventually need resource requests and limits (CPU, memory, GPU, wall time, and possibly monetary budget). Scheduling must avoid launching several memory-heavy jobs simply because their dependencies are ready. Remote compute may be valuable later, but the first prototype should run locally and expose the resource contract before introducing a distributed executor.
+The first slice needs a bounded worker budget: maximum wall time, agent requests or tokens where measurable, command attempts, and local compute concurrency. Exhaustion should stop new work and report the unfinished question and evidence, not silently continue or reinterpret failure as an answer. Record actual usage where available. CPU, memory, GPU, and monetary limits can become richer scheduler controls later. Remote compute is outside the first slice.
 
 **Recovery and analytical iteration have different semantics.** A transient process or network failure may justify an infrastructure retry of the same immutable plan and inputs. A changed method, seed, population, split, or parameter after inspecting results is an analytical rerun and creates a new execution and provenance event. It must not appear as an ordinary retry or overwrite the earlier result. Data, methodological, validation, access, resource, and review failures need distinct dispositions; a scheduler must not retry its way out of an unfavorable analytical outcome.
 
