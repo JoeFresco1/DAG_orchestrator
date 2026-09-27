@@ -182,52 +182,70 @@ We are building the analytics worker and its inquiry model. It may use existing 
 
 The distinguishing capability is a worker that conducts analysis while maintaining an **inquiry and claim model**: question origin, locked plans, data exposure, result-to-claim links, conflicting evidence, review authority, and decision provenance across runs. Tool integrations should support that workflow. The analytics domain should accept external dataset, check, and run identifiers through adapters while owning stable inquiry links.
 
+### Integration lesson from the software factory
+
+An implemented module is not an integrated capability. In the current factory code, `review-budget`, `risk-coverage`, and `telemetry` have controller consumers; `confidence`, `negative-evidence`, `information-gain`, `disputes`, and `existing-run-reviewer` appear to have no production imports. That makes the blanket claim that all of them are orphaned inaccurate, while the underlying lesson remains strong: each analytical mechanism needs a real caller, observable output, and an end-to-end check. Reuse the existing code only after checking whether its contracts fit analytical evidence. Factory-specific concepts such as repository commits and defect severity should not be lifted into a shared kernel unchanged. Finishing every factory integration is not a prerequisite for an analytics prototype.
+
+The analytics domain should start under `src/analytics/` with a separately versioned sidecar under the run's sidecar directory. Keep the shared run schema and scheduler stable until a concrete requirement calls for changing them. Extract shared evidence or budget utilities only when both domains have working consumers. The viewer already has a basic factory summary; analytics needs a deeper, clickable evidence trace rather than another summary badge.
+
 ## 11. First vertical slice
 
-Build one end-to-end worker workflow on a public or synthetic tabular dataset. The user supplies an initial question and dataset; the worker performs the analysis and returns an evidence-linked answer. Use an existing tool or simple immutable local files for dataset and artifact storage; choose an existing validation library if it reduces work. Focus custom implementation on the worker's analytical process, inquiry history, and their links to execution.
+Build one end-to-end worker workflow on a public or synthetic tabular dataset. The user supplies an initial question and dataset; the worker performs the analysis and returns an evidence-linked answer. Use an existing tool or simple immutable local files for dataset and artifact storage; choose an existing validation library if it reduces work. Focus custom implementation on the worker's analytical process, inquiry history, and their links to execution. Set a wall-time and request budget before the worker starts.
 
 1. Register an immutable dataset reference; record a raw-to-analysis transformation with row counts and validation results.
-2. Create development and sealed evaluation partitions. Run a lightweight exploratory profile on development data and preserve its outputs.
+2. Create development and workflow-withheld evaluation partitions. Run a lightweight exploratory profile on development data and preserve its outputs. Do not claim the evaluation partition is technically sealed in this local prototype.
 3. Capture a candidate question prompted by exploration and label its origin.
 4. Have the worker define and lock one predictive plan, including population, target, baseline, metric, split, method, checks, and exposure state. Validate its typed contract at registration.
 5. Execute the plan using a deterministic command. Produce structured Results and Check Results linked to artifacts and execution IDs.
-6. Evaluate once on sealed data under the locked plan. Record who or what received the evaluation results.
+6. Evaluate once on the workflow-withheld data under the locked plan. Record who or what received the evaluation results and label the independence limit accurately.
 7. Have the worker create a bounded Claim supported by Results and perform a separate review pass. Assemble a short report sentence from the reviewed claim and evidence links. Use a human gate only if the configured policy requires one.
 8. Re-run from recorded inputs. Record reproducibility separately from execution and analytical validity.
+9. In the viewer, let a reviewer open a reported number or claim and follow its links to the result, check, execution, transformation, and source dataset version. Show the plan's origin and revision history alongside that trace.
 
 The demonstration should include a train/evaluation overlap and a post-observation plan change. The former must fail validation without erasing the result; the latter must create a new plan version and must not inherit the original pre-observation label. A changed denominator should remain visible through transformation lineage. A later conflicting Result should challenge the Claim without deleting its original evidence.
 
 ### Acceptance criteria for the slice
 
 - A reviewer can trace each reported value from report sentence to Claim, Result, artifact, execution, transformation, and source dataset version.
+- The trace is inspectable in the viewer; the reviewer does not need to read the raw sidecar to find the evidence.
 - The exact dataset partitions, plan version, policy version, and exposure history remain visible after the run.
-- Exploratory origin, post-observation revision, and independent evaluation status are represented accurately.
+- Exploratory origin, post-observation revision, and the evaluation partition's actual access guarantee are represented accurately.
 - Execution, validation, evidence, reproducibility, and review states are shown independently.
 - A failed or inconclusive check prevents unsupported claim approval without deleting evidence.
 - A clean rerun reproduces deterministic outputs or reports a specific mismatch; an analytical rerun retains prior results.
+- The worker stops within its configured time and request limits and reports partial evidence when a limit is reached.
 - Given the initial question and dataset, the worker completes the routine analytical steps without requiring the user to write the plan, code, checks, or report. Deterministic computation and checks remain executable without an LLM.
+
+### Implementation order
+
+1. Connect named checks to actual commands and structured evidence through the existing reviewer seam; ensure analytical failure does not trigger a blind work retry.
+2. Run one worker thread that records the five-object kernel, the source-to-analysis row-count change, and a post-observation plan revision. Make the worker's answer consume those records.
+3. Add the clickable viewer trace and use it to inspect that same thread. A field with no producer or reader should not count as complete.
+4. Add the workflow-withheld evaluation, conflict case, reproduction check, and bounded budget. Expand the object model or extract shared factory code only in response to a concrete consumer.
 
 ## 12. Deferred scope
 
-Defer distributed compute, a notebook editor, automatic causal identification, broad database connectors, collaborative permissions, a universal statistical test catalog, fully automated report generation, and autonomous publication. Also defer building a native artifact store or a full database of inquiry events until the prototype demonstrates that simpler versioned sidecar storage is insufficient. These may be important later, but none is required to test the central proposition: whether a DAG plus explicit inquiry and evidence provenance makes analysis more trustworthy and easier to review.
+Defer distributed compute, a notebook editor, automatic causal identification, broad database connectors, collaborative permissions, a universal statistical test catalog, fully automated report generation, and autonomous publication. A truly sealed evaluation service needs a separate access boundary and is deferred; the prototype must be honest about its weaker workflow-withheld partition. Also defer building a native artifact store or a full database of inquiry events until the prototype demonstrates that simpler versioned sidecar storage is insufficient. These may be important later, but none is required to test the central proposition: whether a DAG plus explicit inquiry and evidence provenance makes analysis more trustworthy and easier to review.
 
 ## 13. Decisions for the review council
 
 1. **Primary user and workflow:** Is the first target an individual analyst, an analytics team, or a research group? Which real question and dataset should anchor the prototype?
 2. **Tool integration:** Which existing components simplify snapshots, run tracking, or validation without making the worker dependent on an unnecessary stack?
 3. **Inquiry representation:** Which objects and relationships must exist in the first slice? Is a small append-only sidecar sufficient across multiple runs?
-4. **Data versioning and exposure:** Is an immutable local snapshot enough initially? What guarantee can we honestly make about sealed evaluation data and prior human/agent exposure?
+4. **Data versioning and exposure:** Is an immutable local snapshot enough initially? What guarantee can we honestly make about workflow-withheld evaluation data and prior human/agent exposure? When is a genuinely separate access boundary needed?
 5. **Contract friction:** Which fields must be required by mode, and how can exploration stay genuinely lightweight?
 6. **Evidence and authority:** What independent states are displayed? Which judgments can the worker review itself, and which require a separate reviewer or human gate?
 7. **Review design:** Which checks are deterministic, which require methodological judgment, and where is an LLM useful only as an assistant?
-8. **Execution boundary:** Can existing tasks host typed analytics contracts and artifacts without coupling the runner to one analytical framework?
-9. **Product boundary:** Should analytics initially be a package in this repository or a separate application using the engine? What concrete divergence would justify a fork?
+8. **Execution boundary:** Can existing named reviewers host executable analytical checks and structured evidence without coupling the runner to one analytical framework?
+9. **Trace and budget:** What minimum viewer interaction proves the lineage is usable, and what initial time/request limits bound the worker without stopping ordinary analysis prematurely?
 
 Council feedback should challenge the assumptions and prioritize a concrete first workflow. The next deliverable should be a revised spec with object schemas, one executable example, and a small implementation plan.
 
 ## 14. Disposition of external review suggestions
 
 The reviews materially improved this draft. The central changes adopted here are Result/Claim/Review/Decision separation, independent evidence states, transformation and exposure lineage, append-only plan history, analytical rerun semantics, mode-specific policies, registration-time contract validation, an agent-input trust boundary, and a worker prototype focused on inquiry and execution. Existing tools may serve as components; the worker remains responsible for the analysis.
+
+A later repository-grounded critique sharpened the implementation order: connect checks to executors, prove one thread through the viewer, bound the worker, and avoid claiming a local evaluation file is sealed. Its proposed reuse of factory modules is an audit candidate, not a prerequisite; several of the modules it called orphaned already have production consumers, and others carry software-specific assumptions.
 
 Several detailed prescriptions remain hypotheses rather than requirements:
 
