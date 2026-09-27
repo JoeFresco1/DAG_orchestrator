@@ -62,7 +62,7 @@ The two graphs should be linked by stable identifiers: an execution references i
 5. **C1:** R2 and R3 support the bounded claim “Usage drop improves out-of-sample churn prediction over the stated baseline.” C1 says nothing causal.
 6. A later independent cohort produces **R4**, which challenges C1. C1 remains in history with its original support and a new conflicting-evidence link. The worker opens **Q3**, asking whether the relationship varies by cohort; a new plan supersedes P1 for that inquiry. No old question, plan, result, or claim is overwritten.
 
-This thread records both what was learned and when it was learned. If the worker had seen evaluation outcomes before locking P1, the system could not call R3 an independent confirmation for that lineage. A partition merely withheld by workflow convention is not truly sealed from a worker that can read the same filesystem; see Section 7.
+This thread records both what was learned and when it was learned. In the local prototype R3 is labeled **workflow-withheld evaluation**, never independent confirmation: the worker could read a file available to its command environment even if the workflow did not offer it. If evaluation outcomes are observed before a later plan revision, that revision is explicitly post-observation; see Section 7.
 
 ## 5. Durable objects and independent states
 
@@ -219,9 +219,9 @@ The demonstration should include a train/evaluation overlap and a post-observati
 ### Implementation order
 
 1. Connect named checks to actual commands and structured evidence through the existing reviewer seam; ensure analytical failure does not trigger a blind work retry.
-2. Run one worker thread that records the five-object kernel, the source-to-analysis row-count change, and a post-observation plan revision. Make the worker's answer consume those records.
+2. Run one worker thread within the runner's initial time and attempt limits. Record the five-object kernel, the source-to-analysis row-count change, and a post-observation plan revision. Make the worker's answer consume those records.
 3. Add the clickable viewer trace and use it to inspect that same thread. A field with no producer or reader should not count as complete.
-4. Add the workflow-withheld evaluation, conflict case, reproduction check, and bounded budget. Expand the object model or extract shared factory code only in response to a concrete consumer.
+4. Add the workflow-withheld evaluation, conflict case, reproduction check, and request/token accounting where measurable. Expand the object model or extract shared factory code only in response to a concrete consumer.
 
 ## 12. Deferred scope
 
