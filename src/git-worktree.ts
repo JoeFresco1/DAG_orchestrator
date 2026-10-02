@@ -1,8 +1,8 @@
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 
 // Worktree isolation: one integration branch per run, one worktree per task
 // branched from it, merged back on success. A downstream task sees its
@@ -173,25 +173,33 @@ export function ensureIntegrationWorktree(
   excludes?: SnapshotExcludes,
 ): { path: string; branch: string; base: string } {
   const branch = `dag/${runId}`;
-  const path = join(worktreeRoot(repoDir, runId), 'integration');
-  if (existsSync(join(path, '.git'))) {
-    // Reuse an earlier attempt's worktree — but only if it still belongs to
-    // this repo and branch. A leftover directory from a deleted repo would
-    // otherwise run agents in a checkout whose git dir no longer exists.
-    const usable =
-      git(path, ['rev-parse', '--verify', 'HEAD']).code === 0 &&
-      git(repoDir, ['rev-parse', '--verify', branch]).code === 0;
-    if (usable) {
-      return { path, branch, base: git(path, ['rev-parse', 'HEAD']).stdout };
-    }
-    git(repoDir, ['worktree', 'remove', '--force', path]);
-    rmSync(longPath(path), { recursive: true, force: true });
+  const registered = registeredWorktreeForBranch(repoDir, branch);
+  if (registered) {
+    return { path: registered, branch, base: git(registered, ['rev-parse', '--verify', 'HEAD']).stdout };
   }
+
+  const root = worktreeRoot(repoDir, runId);
+  const preferredPath = join(root, 'integration');
+  let path = preferredPath;
+  // Keep any occupant of the predictable temp path. It may be an unrelated
+  // directory or a worktree for another ref; only reuse Git's registered,
+  // validated checkout above.
+  if (existsSync(path)) {
+    let allocated = false;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const candidate = join(root, `integration-${randomUUID().replace(/-/g, '').slice(0, 12)}`);
+      if (existsSync(candidate)) continue;
+      path = candidate;
+      allocated = true;
+      break;
+    }
+    if (!allocated) throw new Error(`could not allocate an integration worktree path for run ${runId}`);
+  }
+
   // A previous process may have died leaving this path registered (or the temp
-  // directory cleaned): prune stale registrations before re-adding.
+  // directory cleaned): prune stale registrations before adding the branch.
   git(repoDir, ['worktree', 'prune']);
-  mkdirSync(path, { recursive: true });
-  rmSync(path, { recursive: true, force: true });
+  mkdirSync(root, { recursive: true });
   // Prefer the caller's base; otherwise snapshot dirty work so uncommitted
   // edits are visible, falling back to HEAD when the tree is clean.
   let resolvedBase =
@@ -208,14 +216,61 @@ export function ensureIntegrationWorktree(
     : ['worktree', 'add', '-b', branch, path, resolvedBase];
   const res = git(repoDir, args);
   if (res.code !== 0) {
-    // One more prune, in case another process registered it in between.
+    // Another process may have registered the branch since the first lookup.
     git(repoDir, ['worktree', 'prune']);
-    const retry = git(repoDir, ['worktree', 'add', '-b', branch, path, resolvedBase]);
+    const raced = registeredWorktreeForBranch(repoDir, branch);
+    if (raced) {
+      return { path: raced, branch, base: git(raced, ['rev-parse', '--verify', 'HEAD']).stdout };
+    }
+    // Retry the same non-resetting operation. Never use `-b` for an existing
+    // branch or move its ref to the caller's current HEAD.
+    const retry = git(repoDir, args);
     if (retry.code !== 0) {
       throw new Error(`worktree add failed: ${retry.stderr || retry.stdout}`);
     }
   }
   return { path, branch, base: git(path, ['rev-parse', 'HEAD']).stdout };
+}
+
+function registeredWorktreeForBranch(repoDir: string, branch: string): string | null {
+  const listed = git(repoDir, ['worktree', 'list', '--porcelain']);
+  if (listed.code !== 0) return null;
+  const ref = `branch refs/heads/${branch}`;
+  const candidates = listed.stdout.split(/\r?\n\r?\n/).flatMap((record) => {
+    const lines = record.split(/\r?\n/);
+    const worktree = lines.find((line) => line.startsWith('worktree '));
+    return worktree && lines.includes(ref) ? [worktree.slice('worktree '.length)] : [];
+  });
+  const repoCommonDir = realCommonGitDir(repoDir);
+  if (!repoCommonDir) return null;
+  for (const path of candidates) {
+    const head = git(path, ['rev-parse', '--verify', 'HEAD']);
+    const checkedOutBranch = git(path, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+    const branchHead = git(repoDir, ['rev-parse', '--verify', branch]);
+    const worktreeCommonDir = realCommonGitDir(path);
+    if (
+      head.code === 0 &&
+      checkedOutBranch.code === 0 &&
+      checkedOutBranch.stdout === branch &&
+      branchHead.code === 0 &&
+      head.stdout === branchHead.stdout &&
+      worktreeCommonDir &&
+      samePath(worktreeCommonDir, repoCommonDir)
+    ) {
+      return path;
+    }
+  }
+  return null;
+}
+
+function realCommonGitDir(dir: string): string | null {
+  const common = git(dir, ['rev-parse', '--git-common-dir']);
+  if (common.code !== 0 || !common.stdout) return null;
+  try {
+    return realpathSync(resolve(dir, common.stdout));
+  } catch {
+    return null;
+  }
 }
 
 // Task ids come from a JSON map key, so they are untrusted input for a path.
@@ -239,20 +294,60 @@ export function createTaskWorktree(
   // Flat ref: git refs are a directory tree, so `dag/<run>` and
   // `dag/<run>/<task>` cannot coexist. Task branches live under dag-task/.
   const safe = safeTaskId(taskId);
-  const branch = `dag-task/${runId}-${safe}`;
-  const path = join(worktreeRoot(repoDir, runId), safe);
+  const taskBranch = `dag-task/${runId}-${safe}`;
+  const root = worktreeRoot(repoDir, runId);
+  const originalPath = join(root, safe);
   // A hard kill leaves the worktree registered; without a prune the add below
   // fails with "branch already used by worktree" and the task dies on resume.
   git(repoDir, ['worktree', 'prune']);
-  rmSync(path, { recursive: true, force: true });
+  // Only remove a path Git recognizes as one of this repo's worktrees. A locked
+  // checkout or an unrelated directory can survive best-effort cleanup; use a
+  // fresh attempt path in that case instead of letting rmSync's EPERM abort the
+  // retry or deleting an unknown directory.
+  removeWorktree(repoDir, originalPath);
+  const branchInUse = worktreeUsesBranch(repoDir, taskBranch);
+  let path = originalPath;
+  let branch = taskBranch;
+  if (existsSync(originalPath) || branchInUse) {
+    const identity = createHash('sha1').update(`${runId}:${safe}`).digest('hex').slice(0, 10);
+    let allocated = false;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const suffix = randomUUID().replace(/-/g, '').slice(0, 12);
+      const candidatePath = join(root, `task-${identity}-${suffix}`);
+      const candidateBranch = `dag-task/${identity}-retry-${suffix}`;
+      if (existsSync(candidatePath)) continue;
+      if (
+        branchInUse &&
+        git(repoDir, ['show-ref', '--verify', '--quiet', `refs/heads/${candidateBranch}`]).code === 0
+      ) {
+        continue;
+      }
+      path = candidatePath;
+      if (branchInUse) branch = candidateBranch;
+      allocated = true;
+      break;
+    }
+    if (!allocated) throw new Error(`could not allocate a fresh worktree path for task ${taskId}`);
+  }
   // -B resets an existing branch, so retries start from the current base.
-  let res = git(repoDir, ['worktree', 'add', '--force', '-B', branch, path, fromBranch]);
+  let res =
+    branch === taskBranch
+      ? git(repoDir, ['worktree', 'add', '--force', '-B', branch, path, fromBranch])
+      : git(repoDir, ['worktree', 'add', '-b', branch, path, fromBranch]);
   if (res.code !== 0) {
     git(repoDir, ['worktree', 'prune']);
-    res = git(repoDir, ['worktree', 'add', '--force', '-B', branch, path, fromBranch]);
+    res =
+      branch === taskBranch
+        ? git(repoDir, ['worktree', 'add', '--force', '-B', branch, path, fromBranch])
+        : git(repoDir, ['worktree', 'add', '-b', branch, path, fromBranch]);
   }
   if (res.code !== 0) throw new Error(`worktree add failed: ${res.stderr || res.stdout}`);
   return { path, branch };
+}
+
+function worktreeUsesBranch(repoDir: string, branch: string): boolean {
+  const ref = `branch refs/heads/${branch}`;
+  return git(repoDir, ['worktree', 'list', '--porcelain']).stdout.split('\n').some((line) => line === ref);
 }
 
 /**

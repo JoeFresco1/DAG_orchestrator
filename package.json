@@ -11,6 +11,7 @@
     "dist",
     "viewer",
     "scripts",
+    "vendor",
     "README.md",
     "LICENSE"
   ],
@@ -38,6 +39,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@dag-orchestrator/neutral-execution": "file:vendor/dag-orchestrator-neutral-execution-1.0.0.tgz",
     "vis-network": "^10.1.2"
   }
 }

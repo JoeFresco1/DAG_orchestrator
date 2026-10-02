@@ -14,6 +14,7 @@ import {
   removeWorktree,
   snapshotCommit,
   snapshotExcludes,
+  worktreeRoot,
 } from './git-worktree.js';
 import { tempDir, gitRepo } from './test-helpers.js';
 describe('worktree isolation', () => {
@@ -54,6 +55,108 @@ describe('worktree isolation', () => {
       removeWorktree(repo, integration2.path);
     } finally {
       rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('reuses the registered integration worktree when TEMP changes', () => {
+    const repo = gitRepo();
+    const runId = 'run_temp_changed';
+    const firstTemp = tempDir();
+    const secondTemp = tempDir();
+    const oldTemp = process.env.TEMP;
+    const oldTmp = process.env.TMP;
+    const oldTmpdir = process.env.TMPDIR;
+    let integration: ReturnType<typeof ensureIntegrationWorktree> | undefined;
+    const setTemp = (path: string): void => {
+      process.env.TEMP = path;
+      process.env.TMP = path;
+      process.env.TMPDIR = path;
+    };
+    const restoreTemp = (key: 'TEMP' | 'TMP' | 'TMPDIR', value: string | undefined): void => {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    };
+    try {
+      setTemp(firstTemp);
+      const firstRoot = worktreeRoot(repo, runId);
+      integration = ensureIntegrationWorktree(repo, runId);
+      assert.ok(integration.path.startsWith(firstRoot));
+      const callerHead = git(repo, ['rev-parse', 'HEAD']).stdout;
+      writeFileSync(join(integration.path, 'dependency.txt'), 'merged dependency\n');
+      const dependencyCommit = commitAll(integration.path, 'dag: dependency output').commit;
+      assert.ok(dependencyCommit);
+
+      setTemp(secondTemp);
+      assert.notEqual(worktreeRoot(repo, runId), firstRoot, 'the process now has a different temp root');
+      const resumed = ensureIntegrationWorktree(repo, runId);
+      assert.equal(
+        resumed.path.replace(/\\/g, '/').toLowerCase(),
+        integration.path.replace(/\\/g, '/').toLowerCase(),
+      );
+      assert.equal(resumed.branch, integration.branch);
+      assert.equal(resumed.base, dependencyCommit);
+      assert.equal(git(repo, ['rev-parse', resumed.branch]).stdout, dependencyCommit);
+      assert.equal(git(resumed.path, ['show', 'HEAD:dependency.txt']).stdout, 'merged dependency');
+      assert.equal(git(repo, ['rev-parse', 'HEAD']).stdout, callerHead, 'caller checkout remains unchanged');
+    } finally {
+      restoreTemp('TEMP', oldTemp);
+      restoreTemp('TMP', oldTmp);
+      restoreTemp('TMPDIR', oldTmpdir);
+      if (integration) removeWorktree(repo, integration.path);
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(firstTemp, { recursive: true, force: true });
+      rmSync(secondTemp, { recursive: true, force: true });
+    }
+  });
+
+  it('retries a locked task worktree on a fresh path and ref while preserving salvage and downstream work', () => {
+    const repo = gitRepo();
+    const runId = 'run_locked_retry';
+    const taskId = 'task_locked';
+    const root = worktreeRoot(repo, runId);
+    let integration: ReturnType<typeof ensureIntegrationWorktree> | undefined;
+    let previous: ReturnType<typeof createTaskWorktree> | undefined;
+    let retried: ReturnType<typeof createTaskWorktree> | undefined;
+    let downstream: ReturnType<typeof createTaskWorktree> | undefined;
+    try {
+      integration = ensureIntegrationWorktree(repo, runId);
+      previous = createTaskWorktree(repo, runId, taskId, integration.branch);
+      writeFileSync(join(previous.path, 'salvage.txt'), 'keep this checkpoint\n');
+      const saved = commitAll(previous.path, 'dag: WIP task_locked');
+      assert.ok(saved.commit);
+      const salvageRef = `refs/dag-salvage/${runId}-${taskId}-attempt-1`;
+      assert.equal(git(repo, ['update-ref', salvageRef, saved.commit!]).code, 0);
+      // Git's lock makes ordinary worktree removal fail and keeps the task ref
+      // attached, which means `--force -B` cannot safely be reused on retry.
+      assert.equal(git(repo, ['worktree', 'lock', '--reason', 'retry regression', previous.path]).code, 0);
+
+      retried = createTaskWorktree(repo, runId, taskId, integration.branch);
+      assert.notEqual(retried.path, previous.path);
+      assert.notEqual(retried.branch, previous.branch);
+      assert.equal(git(repo, ['rev-parse', previous.branch]).stdout, saved.commit);
+      assert.equal(git(repo, ['rev-parse', salvageRef]).stdout, saved.commit);
+      assert.equal(git(retried.path, ['rev-parse', '--abbrev-ref', 'HEAD']).stdout, retried.branch);
+
+      writeFileSync(join(retried.path, 'landed.txt'), 'from retry\n');
+      assert.ok(commitAll(retried.path, 'dag: task_locked retry').commit);
+      assert.equal(mergeIntoIntegration(integration.path, retried.branch, taskId).merged, true);
+
+      // An unregistered occupant at the predictable path is left alone; the
+      // dependent gets a fresh checkout and still sees the merged task output.
+      const occupied = join(root, 'task_downstream');
+      mkdirSync(occupied, { recursive: true });
+      writeFileSync(join(occupied, 'keep.txt'), 'unowned data\n');
+      downstream = createTaskWorktree(repo, runId, 'task_downstream', integration.branch);
+      assert.notEqual(downstream.path, occupied);
+      assert.equal(existsSync(join(occupied, 'keep.txt')), true);
+      assert.equal(existsSync(join(downstream.path, 'landed.txt')), true);
+    } finally {
+      if (previous) git(repo, ['worktree', 'unlock', previous.path]);
+      for (const worktree of [downstream, retried, previous, integration]) {
+        if (worktree) removeWorktree(repo, worktree.path);
+      }
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

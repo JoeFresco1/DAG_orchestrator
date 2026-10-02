@@ -7,6 +7,9 @@ import { COMMANDS } from './commands/index.js';
 const HELP = `DAG Orchestrator
 usage: dag <cmd> [flags]
 
+  neutral-run --file request.json
+                               execute a legacy-shaped task graph via neutral v1
+
   launch [--all | --dir F ...] [--open] [--auto-resume]
                                one server per project, stable port each
   servers [--json] | servers --stop --all|--dir F

@@ -43,6 +43,7 @@ import { initCmd, projectsCmd } from './projects.js';
 import { scheduleCmd } from './schedule.js';
 import { launchCmd, serveCmd, serversCmd } from './viewer.js';
 import { factoryCmd } from './factory.js';
+import { neutralRunCmd } from './neutral.js';
 
 /** Maps `dag <name>` to its handler; aliases share one handler on purpose. */
 export const COMMANDS: Record<string, CommandHandler> = {
@@ -61,6 +62,7 @@ export const COMMANDS: Record<string, CommandHandler> = {
   scheduler: scheduleCmd,
   // Run lifecycle
   factory: factoryCmd,
+  'neutral-run': neutralRunCmd,
   run: runCmd,
   resume: resumeCmd,
   'skip-blocked': skipBlockedCmd,
