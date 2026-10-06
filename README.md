@@ -201,6 +201,12 @@ Failures keep their kind (`exit`, `spawn`, `timeout`, `stalled`, `review`,
 `merge`, `plan`, and more), exit code, and output tail. Recovery does not
 require hand-editing state.
 
+Use `dag diagnose --id task_ab12cd34 --cwd <saved-task-checkout> --json` for
+a bounded, read-only Luna diagnosis after repeated review failures. Preview
+eligibility with `--dry-run`. The command records evidence without approving or
+requeuing the task. See [failure diagnostics](docs/failure-diagnostics.md) for
+the reusable automatic-controller hook and worker/reviewer profile pinning.
+
 ## Reviews that understand the graph
 
 ### Integration tasks

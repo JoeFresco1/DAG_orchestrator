@@ -44,6 +44,7 @@ import { scheduleCmd } from './schedule.js';
 import { launchCmd, serveCmd, serversCmd } from './viewer.js';
 import { factoryCmd } from './factory.js';
 import { neutralRunCmd } from './neutral.js';
+import { diagnoseCmd } from './diagnostics.js';
 
 /** Maps `dag <name>` to its handler; aliases share one handler on purpose. */
 export const COMMANDS: Record<string, CommandHandler> = {
@@ -72,6 +73,7 @@ export const COMMANDS: Record<string, CommandHandler> = {
   // Execution controls
   retry: retryCmd,
   'retry-failed': retryFailedCmd,
+  diagnose: diagnoseCmd,
   // Task graph editing and inspection
   add: addCmd,
   edit: editCmd,

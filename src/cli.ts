@@ -43,6 +43,9 @@ usage: dag <cmd> [flags]
   list [--status S] [--limit N] | status | ready | blocked
   retry --id ID [--cascade]    requeue failed task (cascade: its failed subtree)
   retry-failed [--cascade]     requeue every failed task
+  diagnose --id ID [--after 3] [--cwd F] [--dry-run]
+      [--model gpt-6-luna] [--reasoning xhigh] [--timeout 300]
+                               bounded read-only failure diagnosis; never auto-approves
   review --of a,b --cmd "check" [--title T] [--repair-rounds N]
                                scaffold an integration node (repairs upstream on failure)
   review --id X --review-cmd "check" [--review-rounds N]
