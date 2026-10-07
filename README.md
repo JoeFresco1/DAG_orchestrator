@@ -434,3 +434,7 @@ not fetch runtime assets from the network.
 ## License
 
 [MIT](LICENSE) © Joe Fresco
+
+## Reliable execution (opt-in)
+
+`dag reliable preflight|run|resume|status|audit --config reliability.json` adds a durable recovery controller around the existing runner. Registered ownership, executable input probes, typed failure routing, model budgets, independent review and verified publication govern each attempt. See [controller configuration and rollout limits](docs/reliable-execution.md).

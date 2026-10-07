@@ -402,9 +402,21 @@ export function lockHeldBy(file: string): boolean {
 }
 
 export function assertNoForeignLock(file: string, force = false): void {
+  assertControllerOwnership(file);
   if (force) return;
   const cur = foreignLock(file);
   if (cur) throw new Error(lockedMessage(cur));
+}
+
+/** A live reliability controller owns dispatch even between engine attempts. */
+function assertControllerOwnership(file: string): void {
+  const path = join(runPaths(file).dir, 'reliability', 'controller.lock');
+  if (!existsSync(path)) return;
+  const lease = JSON.parse(readFileSync(path, 'utf8')) as {token:string;owner:{pid:number}};
+  if (!Number.isSafeInteger(lease.owner?.pid) || !lease.token) throw new Error('Invalid controller lease');
+  if (!isProcessAlive(lease.owner.pid) || lease.owner.pid === process.pid) return;
+  if (lease.owner.pid === process.ppid && process.env.DAG_CONTROLLER_TOKEN === lease.token) return;
+  throw new Error(`Reliability controller ${lease.owner.pid} owns dispatch; stop it before editing or starting another run`);
 }
 
 // Synchronous sleep for the lock loop and for atomic-write rename retries:
@@ -415,6 +427,7 @@ function syncSleep(ms: number): void {
 }
 
 export function acquireLock(file: string, note: string, force = false): () => void {
+  assertControllerOwnership(file);
   const paths = runPaths(file);
   mkdirSync(dirname(paths.lock), { recursive: true });
   const mine: LockInfo = {

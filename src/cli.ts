@@ -7,6 +7,11 @@ import { COMMANDS } from './commands/index.js';
 const HELP = `DAG Orchestrator
 usage: dag <cmd> [flags]
 
+  reliable preflight|run|resume|status|audit --config F
+                               bounded recovery with ownership and structured review
+  reliable amend --config F --reason R [--release task_a,task_b]
+                               stopped contract amendment; preserves attempt budgets
+
   neutral-run --file request.json
                                execute a legacy-shaped task graph via neutral v1
 

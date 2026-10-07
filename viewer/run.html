@@ -654,12 +654,13 @@ function renderHeader(s) {
   $('pbar-skip').style.width = pct(c.skipped);
   $('pbar-run').style.width = pct((c.running || 0) + (c.ready || 0));
 
-  const running = job.running;
+  const controlled = job.reliability?.running;
+  const running = job.running || controlled;
   const external = job.external;
   // Nothing checked means "run everything runnable", so the button stays live.
   $('runBtn').disabled = running || job.stopping || !!external;
-  $('runBtn').textContent = job.stopping ? 'Stopping…' : running ? `Running (${job.current.length})` : 'Run';
-  $('stopBtn').disabled = !running || job.stopping;
+  $('runBtn').textContent = job.stopping ? 'Stopping…' : controlled ? 'Controller running' : running ? `Running (${job.current.length})` : 'Run';
+  $('stopBtn').disabled = controlled || !running || job.stopping;
   $('retryBtn').disabled = running || !!external || !c.failed;
   $('skipBtn').disabled = running || !!external;
   $('orphanBtn').disabled = running || !!external;
@@ -669,7 +670,17 @@ function renderHeader(s) {
     note('server is running an older build — restart `dag serve` to load the current code', 'error');
     return;
   }
-  if (job.stopping) note('stopping: killing running tasks…');
+  if (controlled) {
+    const r = job.reliability;
+    const attempt = r.taskId ? r.attempts?.[r.taskId]?.at(-1) : null;
+    const model = attempt?.profile ? `${attempt.profile.model} ${attempt.profile.reasoning}` : '';
+    note(`Recovery controller: ${r.stage}${r.taskId ? ' · ' + r.taskId : ''}${model ? ' · ' + model : ''} · ${Math.ceil(r.remainingWallMs / 60000)} min budget · ${Object.keys(r.suspended || {}).length} suspended`);
+  }
+  else if (job.reliability && Object.keys(job.reliability.suspended || {}).length) {
+    const entries = Object.entries(job.reliability.suspended).map(([id, e]) => `${id}: ${e.reason}`);
+    note('Controller suspended work: ' + entries.join('; '), 'error');
+  }
+  else if (job.stopping) note('stopping: killing running tasks…');
   else if (running) note(`running ${job.current.length} of ${job.scope?.length ?? '?'} selected`);
   else if (external) {
     const since = external.startedAt ? external.startedAt.slice(11, 19) : '?';
@@ -797,7 +808,7 @@ function renderInspector() {
   `;
   const btns = document.createElement('div');
   btns.className = 'btns';
-  const busy = !!(job && (job.running || job.external || job.stopping));
+  const busy = !!(job && (job.running || job.external || job.stopping || job.reliability?.running));
   const mk = (label, fn, cls) => {
     const b = document.createElement('button');
     b.className = 'mini' + (cls ? ' ' + cls : '');

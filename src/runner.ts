@@ -385,6 +385,13 @@ function tailOf(output: string): string {
  * All optional: an unset value falls back to the run's settings, then defaults.
  */
 export interface RunnerOptions {
+  /** A durable controller owns retry routing; this runner executes one attempt. */
+  controllerManaged?: boolean;
+  workCommand?: (task: Task) => string;
+  prepareCommand?: (task: Task) => string;
+  timeoutFor?: (task: Task) => number;
+  contractGuard?: (task: Task, cwd: string, base: string) => Promise<void>;
+  postcondition?: (task: Task, cwd: string, base: string) => Promise<void>;
   executor?: Executor;
   persist?: (run: Run) => void;
   onEvent?: (ev: DagEvent) => void;
@@ -856,7 +863,7 @@ export class DagRunner {
 
     // Work converges, then an end-of-run review may send some of it back and
     // we go around again — that is the only reason this is a loop of loops.
-    const reviewMode = run.settings.finalReview ?? 'off';
+    const reviewMode = this.opts.controllerManaged ? 'off' : run.settings.finalReview ?? 'off';
     const roundsLeftOf = (): number =>
       Math.max(0, (run.settings.finalReviewRounds ?? 1) - this.reviewRounds);
     for (;;) {
@@ -1280,7 +1287,7 @@ export class DagRunner {
     planFile?: string,
     depsContext?: TokenContext,
   ): Promise<'ok' | 'fail' | 'skipped'> {
-    const cmd = task.prepareCmd ?? this.state.settings.worktreePrepareCmd ?? '';
+    const cmd = this.opts.prepareCommand?.(task) ?? task.prepareCmd ?? this.state.settings.worktreePrepareCmd ?? '';
     if (!cmd.trim()) return 'skipped';
     if (!worktreePath) {
       this.log('note', task.id, 'worktreePrepareCmd set but worktree isolation is off; skipping it');
@@ -1373,7 +1380,7 @@ export class DagRunner {
     depsContext?: TokenContext,
     specOverride?: string,
   ): Promise<ExecOutcome> {
-    const timeoutMs = task.timeoutMs ?? this.opts.timeoutMs ?? this.state.settings.timeoutMs;
+    const timeoutMs = this.opts.timeoutFor?.(task) ?? task.timeoutMs ?? this.opts.timeoutMs ?? this.state.settings.timeoutMs;
     const silenceMs = task.silenceMs ?? this.opts.silenceMs ?? this.state.settings.silenceMs;
     let lastOutputMs = Date.now();
     let warnCount = 0;
@@ -1742,7 +1749,7 @@ export class DagRunner {
   // fail it and give an integration node the chance to repair its upstream.
   private handleRejection(task: Task, message: string, scope: Set<string> | null): 'requeue' | 'fail' {
     task.reviews += 1;
-    if (task.reviews <= task.reviewRounds) {
+    if (!this.opts.controllerManaged && task.reviews <= task.reviewRounds) {
       this.log(
         'task-review',
         task.id,
@@ -1768,6 +1775,7 @@ export class DagRunner {
   // Repair only touches upstream tasks that the current run can actually
   // relaunch: requeueing an out-of-scope dep would deadlock the scope.
   private tryRepair(task: Task, scope: Set<string> | null = null): boolean {
+    if (this.opts.controllerManaged) return false;
     if (task.repairRounds <= 0 || task.repairs >= task.repairRounds || task.deps.length === 0) {
       return false;
     }
@@ -2144,6 +2152,7 @@ export class DagRunner {
 
   // A chain of N tools means N attempts at least, so a fallback can happen.
   private maxAttemptsFor(task: Task): number {
+    if (this.opts.controllerManaged) return 1;
     return attemptsForChain(task.maxAttempts, this.effectiveChain(task));
   }
 
@@ -2234,6 +2243,10 @@ export class DagRunner {
     );
 
     try {
+      if (this.opts.contractGuard) {
+        if (!worktreePath) throw new Error('Contract enforcement requires isolated worktrees');
+        await this.opts.contractGuard(task, worktreePath, this.worktreeBases.get(task.id) ?? 'HEAD');
+      }
       // Environment first: nothing else can run without it.
       const prepared = await this.prepareWorktree(task, execute, worktreePath ?? undefined, planFile, depsContext);
       if (prepared === 'fail') {
@@ -2254,7 +2267,7 @@ export class DagRunner {
       }
 
       // Planning phase first: the work command follows {plan} / {planFile}.
-      if (chained.planCmd) {
+      if (chained.planCmd && !this.opts.controllerManaged) {
         const planned = await this.plan(
           task,
           execute,
@@ -2278,10 +2291,11 @@ export class DagRunner {
         }
       }
 
+      if (this.opts.contractGuard && worktreePath) await this.opts.contractGuard(task, worktreePath, this.worktreeBases.get(task.id) ?? 'HEAD');
       const outcome = await this.runPhase(
         task,
         execute,
-        chained.cmd,
+        this.opts.workCommand?.(task) ?? chained.cmd,
         'run',
         worktreePath ?? undefined,
         planFile,
@@ -2294,7 +2308,10 @@ export class DagRunner {
 
       this.enforceExitPolicy(task, outcome);
 
-      const verdict = await this.reviewPass(task, execute, scope, worktreePath ?? undefined, planFile, depsContext, outcome.exitCode);
+      if (this.opts.contractGuard && worktreePath) await this.opts.contractGuard(task, worktreePath, this.worktreeBases.get(task.id) ?? 'HEAD');
+      if (this.opts.postcondition && worktreePath) await this.opts.postcondition(task, worktreePath, this.worktreeBases.get(task.id) ?? 'HEAD');
+
+      const verdict = this.opts.controllerManaged ? 'pass' : await this.reviewPass(task, execute, scope, worktreePath ?? undefined, planFile, depsContext, outcome.exitCode);
       if (this.tokens.get(task.id) !== token) return;
       if (verdict !== 'pass') {
         this.dropWorktree(task.id);
@@ -2303,6 +2320,7 @@ export class DagRunner {
       }
 
       // Worktree mode: land the work before declaring success.
+      if (this.opts.contractGuard && worktreePath) await this.opts.contractGuard(task, worktreePath, this.worktreeBases.get(task.id) ?? 'HEAD');
       if (worktreePath) {
         const landed = await this.landWorktree(task);
         if (!landed.ok) {
@@ -2394,7 +2412,7 @@ export class DagRunner {
     depsContext: TokenContext;
     specOverride?: string;
   } {
-    const chained = this.applyHarnessChain(task, attempt);
+    const chained = this.opts.controllerManaged ? {cmd:task.cmd,planCmd:null} : this.applyHarnessChain(task, attempt);
     const planFile = chained.planCmd ? this.planFilePath(task, attempt) : undefined;
     // Upstream evidence for {deps} / {depsAll} / {depsFile}: deps are complete
     // by the time a task runs, so this is the real graph state, not a promise.

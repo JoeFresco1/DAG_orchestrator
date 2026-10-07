@@ -1,9 +1,9 @@
 // View-model builders: turn run/runtime state into the JSON shapes the viewer
 // consumes. Kept separate from the server so the payload contract is testable
 // and the request handler stays thin.
-import { existsSync } from 'node:fs';
-import { basename, resolve } from 'node:path';
-import { foreignLock, loadRun } from './store.js';
+import { existsSync, readFileSync } from 'node:fs';
+import { basename, resolve, join } from 'node:path';
+import { foreignLock, loadRun, runPaths } from './store.js';
 import { deriveStatus } from './graph.js';
 import { listRuns, projectOf } from './runs.js';
 import { loadRegistry, projectId, type ProjectEntry } from './registry.js';
@@ -23,7 +23,25 @@ export function jobView(rt: RunRuntime): Record<string, unknown> {
     startedAt: active ? rt.jobStartedAt : null,
     scope: active ? rt.activeScope : null,
     external: foreign ? { pid: foreign.pid, note: foreign.note, startedAt: foreign.startedAt } : null,
+    reliability: reliabilityView(rt.file),
   };
+}
+
+export function reliabilityView(file: string): Record<string, unknown> | null {
+  const directory = join(runPaths(file).dir, 'reliability');
+  if (!existsSync(join(directory, 'controller.json'))) return null;
+  try {
+    const state = JSON.parse(readFileSync(join(directory, 'controller.json'), 'utf8'));
+    let running = false;
+    if (existsSync(join(directory, 'controller.lock'))) {
+      const owner = JSON.parse(readFileSync(join(directory, 'controller.lock'), 'utf8')).owner;
+      try { process.kill(owner.pid, 0); running = true; } catch { /* Stale controller. */ }
+    }
+    return { running, stage: state.active?.stage ?? 'idle', taskId: state.active?.taskId ?? null,
+      remainingWallMs: Math.max(0, state.deadline - Date.now()), lastMeaningfulProgress: state.lastMeaningfulProgress ?? null,
+      suspended: state.suspended, attempts: state.attempts, incidents: state.incidents,
+      semanticCounts: state.semanticCounts, infrastructureCounts: state.infrastructureCounts };
+  } catch { return { running: false, stage: 'unreadable', error: 'Controller state unavailable' }; }
 }
 
 // Reads the freshest state: from the in-memory runner while it is live, from

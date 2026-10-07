@@ -45,9 +45,11 @@ import { launchCmd, serveCmd, serversCmd } from './viewer.js';
 import { factoryCmd } from './factory.js';
 import { neutralRunCmd } from './neutral.js';
 import { diagnoseCmd } from './diagnostics.js';
+import { reliableCmd } from './reliability.js';
 
 /** Maps `dag <name>` to its handler; aliases share one handler on purpose. */
 export const COMMANDS: Record<string, CommandHandler> = {
+  reliable: reliableCmd,
   // Viewer / server
   serve: serveCmd,
   launch: launchCmd,

@@ -1,6 +1,6 @@
 // Run-lifecycle commands: execute the graph, recover after a crash, retry or
 // skip work, apply run-wide settings, and the end-of-run review.
-import { DagRunner } from '../runner.js';
+import { DagRunner, type RunnerOptions } from '../runner.js';
 import {
   killOrphans,
   loadRun,
@@ -43,9 +43,11 @@ function buildRunner(
   file: string,
   argv: string[],
   pad = 12,
+  extras: Partial<RunnerOptions> = {},
 ): DagRunner {
   return new DagRunner(run, {
     file,
+    ...extras,
     persist: (state) => saveRun(state, file),
     onEvent: (ev) => {
       const where = ev.taskId ? `${ev.taskId} ` : '';
@@ -143,7 +145,14 @@ export async function runCmd(argv: string[]): Promise<void> {
     if (n > 0) console.log(`killed ${n} orphan process(es)`);
   }
 
-  const runner = buildRunner(run, file, argv);
+  let extras: Partial<RunnerOptions> = {};
+  const reliability = flag(argv, 'reliability-config');
+  if (reliability) {
+    // @ts-expect-error Packaged JavaScript adapter supplies the runner hooks.
+    const adapter = await import('../../scripts/reliability/engine-adapter.mjs');
+    extras = await adapter.runnerHooks(reliability, run, file);
+  }
+  const runner = buildRunner(run, file, argv, 12, extras);
   const onSignal = (): void => {
     console.log('\nstopping (signal received)…');
     void runner.stop();

@@ -32,14 +32,14 @@
   ],
   "devDependencies": {
     "@types/node": "^22.7.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.6.0"
+    "tsx": "^4.19.0"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
     "@dag-orchestrator/neutral-execution": "file:vendor/dag-orchestrator-neutral-execution-1.0.0.tgz",
-    "vis-network": "^10.1.2"
+    "vis-network": "^10.1.2",
+    "typescript": "^5.6.0"
   }
 }
