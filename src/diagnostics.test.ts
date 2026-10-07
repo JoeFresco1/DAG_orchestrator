@@ -41,3 +41,15 @@ test('dag diagnose dry-run uses real rejection history without changing task sta
   assert.equal(readFileSync(file, 'utf8'), definition);
   assert.equal(readFileSync(runPaths(file).state, 'utf8'), state);
 });
+
+
+test('dag diagnose first timeout is eligible without semantic rejections', () => {
+  const root=mkdtempSync(join(tmpdir(),'dag-diagnose-timeout-')),file=join(root,'dag.run.json');
+  const run=newRun('first infrastructure failure');
+  const task=addTask(run,{title:'hung verifier',spec:'Preserve acceptance.',cmd:'node test.js'});
+  task.status='failed';task.attempts=1;task.failureKind='timeout';task.result='reviewer timeout';saveRun(run,file);
+  const cli=fileURLToPath(new URL('./cli.js',import.meta.url));
+  const result=spawnSync(process.execPath,[cli,'diagnose','--file',file,'--id',task.id,'--dry-run','--json'],{encoding:'utf8',timeout:10000});
+  assert.equal(result.status,0,result.stderr);const packet=JSON.parse(result.stdout);
+  assert.equal(packet.eligible,true);assert.equal(packet.trigger,'infrastructure');assert.deepEqual(packet.rejectedAttempts,[]);
+});

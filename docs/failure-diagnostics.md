@@ -71,3 +71,41 @@ a real run sidecar and the reusable module with deterministic launch fixtures.
 Tests cover unique attempt counting, cache reuse, contract binding, failure
 holds, safe baseline restoration, routing consistency and unchanged run state.
 These tests do not spend model tokens or establish diagnostic-model accuracy.
+
+## Automatic controller recovery
+
+The reusable `scripts/diagnostics/recovery.mjs` closes the recovery loop for
+controllers that explicitly enable it. `recoveryTrigger` includes a first terminal
+timeout, stall, spawn or worktree failure, as well as repeated review rejections
+and `BUILD_DIAGNOSTIC_HOLD`. Quota/authentication failures and deliberate stops
+remain outside automatic model repair. `dag diagnose --dry-run` now reports
+terminal infrastructure eligibility even with zero semantic rejections.
+
+`recoverIncident` reserves a durable, contract-bound incident before consuming
+model budget. The controller supplies trusted hooks for stopped-run checks,
+diagnosis, scope authorization, repair, diff/contract validation, deterministic
+verification, independent review, publication and supported requeue. A diagnostic
+hold can reach the authorized coordinator through `allowHold: true`; it never
+grants scope or permission to an implementation worker. Unknown causes and
+resource-authority changes remain explicit blocked outcomes.
+
+Default limits are two incidents per task, six per run, ten bounded repair
+attempts and two hours per incident. The analytics adapter uses the configured
+Luna xhigh → Sol 6.1 medium → Sol 6.1 xhigh ladder. Astra is prohibited.
+`process.mjs` supplies streamed command evidence and process-tree termination
+for timeouts. Duplicate incidents cannot relaunch diagnosis/repair. A crash
+after recorded publication resumes only validated, idempotent requeue.
+
+The analytics build supervisor installs the project adapter in
+`scripts/build/controller-recovery.mjs`. It runs after the runner exits and before
+restarting. Repairs use isolated Git worktrees, retain interrupted artifacts,
+preserve frozen product requirements/guards, pass deterministic checks and a
+fresh reviewer, then advance the integration branch and call `dag retry`.
+Task success still requires the task's ordinary acceptance and reviewer. The
+ordinary generic runner remains opt-in through a controller; this module does
+not silently enable model launches in every project.
+
+Focused tests exercise the timeout entry point, controller-hold recovery chain,
+negative validation/review controls, bounded model routing, interrupted requeue,
+quota refusal and persistent incident budgets. Process tests terminate a real
+silent child. Deterministic launch fixtures verify wiring, not model accuracy.

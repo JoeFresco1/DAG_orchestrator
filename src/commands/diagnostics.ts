@@ -19,7 +19,7 @@ export async function diagnoseCmd(argv: string[]): Promise<void> {
     deps: task.deps, cmd: task.cmd, reviewers: task.reviewers, reviewCmd: task.reviewCmd })).digest('hex');
   const packet = { controllerRoot: dirname(file), cwd: resolve(flag(argv, 'cwd') ?? dirname(file)),
     recordRoot: join(runPaths(file).dir, 'diagnostics'), runId: run.id, taskId: id,
-    unit: scope, contractRevision, events: readEventLog(file, 0), dryRun: has(argv, 'dry-run'),
+    unit: scope, contractRevision, failure: {status:task.status, attempts:task.attempts, failureKind:task.failureKind, result:task.result}, events: readEventLog(file, 0), dryRun: has(argv, 'dry-run'),
     policy: { diagnostics: { enabled: true, afterRejections: countFlag(argv, 'after', 1) ?? 3,
       model: flag(argv, 'model') ?? 'gpt-6-luna', reasoning: flag(argv, 'reasoning') ?? 'xhigh', timeoutMs: timeoutSeconds * 1000 } } };
   const script = fileURLToPath(new URL('../../scripts/diagnostics/cli.mjs', import.meta.url));
