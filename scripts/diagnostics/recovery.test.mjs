@@ -55,6 +55,19 @@ test('live runner refusal and unknown cause never mutate or requeue',async()=>{
   const {f,calls}=fixture();f.hooks.assertStopped=async()=>{throw new Error('live runner');};await assert.rejects(recoverIncident(f),/live runner/);assert.ok(!calls.includes('repair'));
   const other=fixture();other.f.hooks.diagnose=async()=>({...diagnosis,category:'unknown'});assert.equal((await recoverIncident(other.f)).phase,'blocked');assert.ok(!other.calls.includes('repair'));
 });
+test('explicit missing-owner request expands only through a trusted hook before another attempt',async()=>{
+ const {f,calls}=fixture();let repairs=0;
+ f.hooks.repair=async({scope})=>{calls.push('repair');if(++repairs===1){const e=new Error('RECOVERY_SCOPE_REQUIRED viewer/analytics.html');e.code='RECOVERY_SCOPE_REQUIRED';e.scopeRequest={files:['viewer/analytics.html']};throw e;}assert.ok(scope.files.includes('viewer/analytics.html'));};
+ f.hooks.reauthorize=async({scope,request})=>({...scope,files:[...scope.files,...request.files]});
+ const result=await recoverIncident(f);assert.equal(result.phase,'completed');assert.equal(result.scopeRevisions.length,1);assert.equal(calls.filter(c=>c==='verify').length,1);
+});
+test('unresolved ownership stops without burning retries or changing acceptance',async()=>{
+ for(const alteration of ['missing-hook','no-expansion','changed-acceptance']){
+  const {f,calls}=fixture();f.hooks.repair=async()=>{calls.push('repair');const e=new Error('RECOVERY_SCOPE_REQUIRED');e.code='RECOVERY_SCOPE_REQUIRED';e.scopeRequest={files:['viewer/analytics.html']};throw e;};
+  if(alteration!=='missing-hook')f.hooks.reauthorize=async({scope})=>alteration==='no-expansion'?scope:{...scope,files:[...scope.files,'viewer/analytics.html'],acceptance:[{program:'node',args:['weaker.js']}]};
+  await assert.rejects(recoverIncident(f),/ownership remains unresolved|retaining acceptance/);assert.equal(calls.filter(c=>c==='repair').length,1);assert.ok(!calls.includes('verify'));assert.ok(!calls.includes('publish'));
+ }
+});
 test('changed failure identities are capped per task across controller restarts',async()=>{
   const {f,calls}=fixture();f.policy.maxPerTask=1;await recoverIncident(f);f.incident={...f.incident,contractRevision:'v2'};assert.equal((await recoverIncident(f)).phase,'blocked');assert.equal(calls.filter(c=>c==='repair').length,1);
 });

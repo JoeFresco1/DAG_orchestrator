@@ -74,7 +74,7 @@ export async function recoverIncident({ directory, incident, policy, hooks }) {
     if (record.diagnosis.category === 'unknown' || record.diagnosis.category === 'resource') {
       record.blocked = 'Unresolved cause or resource authority requires explicit intervention'; persist('blocked'); return record;
     }
-    const scope = await hooks.authorize(record.diagnosis);
+    let scope = await hooks.authorize(record.diagnosis);
     if (!scope || !Array.isArray(scope.files) || !scope.files.length || !Array.isArray(scope.acceptance) || !scope.acceptance.length) throw new Error('No trusted repair scope and executable acceptance');
     record.scope = scope; persist('authorized');
     if (!Array.isArray(limits.workers) || limits.workers.some(p => !Number.isSafeInteger(p.attempts) || p.attempts < 1 || p.attempts > 10)) throw new Error('Invalid recovery model attempt counts');
@@ -95,6 +95,20 @@ export async function recoverIncident({ directory, incident, policy, hooks }) {
       } catch (error) {
         attempt.status = 'rejected'; attempt.error = feedback = error.message; persist('repair_rejected');
         if (/usage limit|quota|rate limit|authentication|unavailable/i.test(feedback)) throw error;
+        if (error.code === 'RECOVERY_SCOPE_REQUIRED') {
+          if (!hooks.reauthorize || (record.scopeRevisions?.length || 0) >= 2) throw new Error('Repair ownership remains unresolved; unchanged retries forbidden');
+          const revised = await hooks.reauthorize({scope, request:error.scopeRequest, diagnosis:record.diagnosis});
+          if (!revised || !Array.isArray(revised.files) || !revised.files.length ||
+              !Array.isArray(revised.acceptance) || !revised.acceptance.length ||
+              scope.files.some(file => !revised.files.includes(file)) ||
+              !revised.files.some(file => !scope.files.includes(file)) ||
+              JSON.stringify(revised.acceptance) !== JSON.stringify(scope.acceptance)) {
+            throw new Error('Trusted owner resolution did not expand scope while retaining acceptance');
+          }
+          record.scopeRevisions ??= [];
+          record.scopeRevisions.push({attempt:attempt.number,request:error.scopeRequest,files:revised.files});
+          scope = record.scope = revised; persist('reauthorized');
+        }
       }
     }
     if (!accepted) { record.blocked = 'Bounded coordinator repair attempts exhausted'; persist('blocked'); return record; }

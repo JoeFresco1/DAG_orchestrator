@@ -1,5 +1,16 @@
 # Failure diagnostics
 
+## Resolving missing implementation owners
+
+An optional controller `reauthorize` hook handles an explicit repair error with
+`code: RECOVERY_SCOPE_REQUIRED` and a structured `scopeRequest`. The project
+resolves files against its trusted ownership/dependency registry; a worker's
+request does not authorize edits. The kernel requires a strict scope expansion
+retaining all prior files and the exact acceptance commands. At most two scope
+expansions share the existing attempt and wall budgets. Missing resolvers,
+unchanged scope, and changed checks stop before another identical repair.
+Scope revisions remain in the incident record and do not approve a task.
+
 Reusable, file-backed diagnosis extracted from the advanced analytics build.
 No database or daemon is required. It supplements implementation retries with
 a fresh read-only investigation. It never approves a task or rewrites its contract.
