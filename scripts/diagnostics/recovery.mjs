@@ -97,12 +97,13 @@ export async function recoverIncident({ directory, incident, policy, hooks }) {
         if (/usage limit|quota|rate limit|authentication|unavailable/i.test(feedback)) throw error;
         if (error.code === 'RECOVERY_SCOPE_REQUIRED') {
           if (!hooks.reauthorize || (record.scopeRevisions?.length || 0) >= 2) throw new Error('Repair ownership remains unresolved; unchanged retries forbidden');
+          const originalFiles=[...scope.files], originalAcceptance=JSON.stringify(scope.acceptance);
           const revised = await hooks.reauthorize({scope, request:error.scopeRequest, diagnosis:record.diagnosis});
           if (!revised || !Array.isArray(revised.files) || !revised.files.length ||
               !Array.isArray(revised.acceptance) || !revised.acceptance.length ||
-              scope.files.some(file => !revised.files.includes(file)) ||
-              !revised.files.some(file => !scope.files.includes(file)) ||
-              JSON.stringify(revised.acceptance) !== JSON.stringify(scope.acceptance)) {
+              originalFiles.some(file => !revised.files.includes(file)) ||
+              !revised.files.some(file => !originalFiles.includes(file)) ||
+              JSON.stringify(revised.acceptance) !== originalAcceptance) {
             throw new Error('Trusted owner resolution did not expand scope while retaining acceptance');
           }
           record.scopeRevisions ??= [];

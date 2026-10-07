@@ -62,9 +62,9 @@ test('explicit missing-owner request expands only through a trusted hook before 
  const result=await recoverIncident(f);assert.equal(result.phase,'completed');assert.equal(result.scopeRevisions.length,1);assert.equal(calls.filter(c=>c==='verify').length,1);
 });
 test('unresolved ownership stops without burning retries or changing acceptance',async()=>{
- for(const alteration of ['missing-hook','no-expansion','changed-acceptance']){
+ for(const alteration of ['missing-hook','no-expansion','changed-acceptance','mutated-acceptance']){
   const {f,calls}=fixture();f.hooks.repair=async()=>{calls.push('repair');const e=new Error('RECOVERY_SCOPE_REQUIRED');e.code='RECOVERY_SCOPE_REQUIRED';e.scopeRequest={files:['viewer/analytics.html']};throw e;};
-  if(alteration!=='missing-hook')f.hooks.reauthorize=async({scope})=>alteration==='no-expansion'?scope:{...scope,files:[...scope.files,'viewer/analytics.html'],acceptance:[{program:'node',args:['weaker.js']}]};
+  if(alteration!=='missing-hook')f.hooks.reauthorize=async({scope})=>{if(alteration==='mutated-acceptance')scope.acceptance=[{program:'node',args:['weaker.js']}];return alteration==='no-expansion'?scope:{...scope,files:[...scope.files,'viewer/analytics.html'],acceptance:[{program:'node',args:['weaker.js']}]};};
   await assert.rejects(recoverIncident(f),/ownership remains unresolved|retaining acceptance/);assert.equal(calls.filter(c=>c==='repair').length,1);assert.ok(!calls.includes('verify'));assert.ok(!calls.includes('publish'));
  }
 });
