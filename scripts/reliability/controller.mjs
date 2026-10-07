@@ -159,15 +159,18 @@ export async function reliable(action, configPath, options = {}) {
                     i.rejections++;
                     ledger.save('repair-rejected', { taskId: id });
                 }
+                else if(fault.code==='environment'&&(s.infrastructureCounts[id]||0)<cfg.policy.infraRetries){s.infrastructureCounts[id]=(s.infrastructureCounts[id]||0)+1;ledger.save('infrastructure-retry',{taskId:id});}
                 else
                     suspend(id, fault, disposition(fault));
                 return;
             }
-            if (git(i.worktree, ['diff', i.base]) === before && !git(i.worktree, ['ls-files', '--others', '--exclude-standard']) && !(i.interruptedRepair && before)) {
+            const environmentRepair=i.failure.code==='environment'&&!i.environmentVerified;
+            if (git(i.worktree, ['diff', i.base]) === before && !git(i.worktree, ['ls-files', '--others', '--exclude-standard']) && !(i.interruptedRepair && before)&&!environmentRepair) {
                 suspend(id, i.failure, 'Repair made no source progress');
                 return;
             }
             delete i.interruptedRepair;
+            if(environmentRepair)i.environmentVerified=true;
             i.phase = 'verify';
             ledger.save('repaired', { taskId: id });
         }

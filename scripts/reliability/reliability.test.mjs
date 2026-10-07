@@ -142,3 +142,7 @@ test('test protection includes helpers and imports, not just assertion bodies', 
     writeFileSync(join(f.root, path), "const expected=2; test('contract',()=>assert.equal(value,expected));");
     assert.throws(() => guardDiff(f.cfg, 'task_one', f.root, base, [path]), /acceptance changed/);
 });
+
+test('environment repair retries preserve the selected semantic tier',{timeout:180000},async()=>{
+ const f=fixture();writeFileSync(join(f.root,'repair.mjs'),"import fs from 'node:fs';const flag=process.argv[2]+'.infra';if(!fs.existsSync(flag)){fs.writeFileSync(flag,'retry');console.log('DAG_FAILURE: '+JSON.stringify({version:1,code:'environment',stage:'prepare',evidence:['Temporary runtime unavailable']}));process.exit(1)}fs.writeFileSync('value.txt','good');");git(f.root,['add','repair.mjs']);git(f.root,['commit','-m','environment fixture']);f.cfg.commands.repair.args.push('{scopeFile}');writeFileSync(f.path,JSON.stringify(f.cfg));const result=await reliable('run',f.path);assert.equal(result.completed,1,JSON.stringify(result));assert.equal(result.metrics.infrastructureRetries,1);assert.equal(result.metrics.semanticRejections,1);const state=JSON.parse(readFileSync(join(f.root,'dag.run.d','reliability','controller.json')));assert.ok(state.attempts.task_one.filter(a=>a.kind==='repair').every(a=>a.profile.model==='gpt-6-luna'));
+});
