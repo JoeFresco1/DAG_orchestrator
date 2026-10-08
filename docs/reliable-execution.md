@@ -63,7 +63,7 @@ The default ladder is Luna xhigh (3 attempts), Sol 6.1 medium (3 attempts), Sol 
 
 `replaceLegacyReview` explicitly authorizes the controller to replace legacy plan/review commands and end-of-run review with the registered checks and independent review. Registration rejects legacy reviewers unless this policy is explicit. Original task definitions remain available. Register the equivalent acceptance requirements before enabling this policy.
 
-Optional adapters: `prepare` installs worktree dependencies; `integration` runs the full integration gate before acceptance; `availability` checks a restored provider; `environment` supplies the environment digest needed for optional check reuse. All adapters use `program`, `args` and a deadline between 1 and 900000 milliseconds. No shell interpretation is added.
+Optional adapters: `prepare` installs worktree dependencies; `integration` runs the full integration gate before acceptance; `availability` checks a restored provider; `environment` supplies the environment digest needed for optional check reuse. All adapters use `program`, `args` and a deadline between 1 and 7200000 milliseconds. `policy.engineTimeoutMs` defaults to 900000 and may be raised, up to 7200000, to cover a registered work/check/review cycle. The durable wall budget remains the outer limit. No shell interpretation is added.
 
 Consumed input probes name `owner`, `contract` and `check`. The owner must be a registered ancestor. Failed probes invoke diagnosis before dispatching the consumer. A diagnostic request can expand repair scope only to registered upstream implementation files; affected owner checks also run. Unknown or future owners stop at registration.
 

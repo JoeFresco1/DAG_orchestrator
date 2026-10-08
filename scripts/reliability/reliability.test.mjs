@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRun, addTask, saveRun, loadRun } from '../../dist/store.js';
-import { git, hash, chooseBatch, preflight, guardDiff, DEFAULT_WORKERS } from './contracts.mjs';
+import { git, hash, chooseBatch, preflight, guardDiff, DEFAULT_WORKERS, command, loadConfig } from './contracts.mjs';
 import { marker, taskFailure, validateReview, profileFor, fingerprint } from './protocol.mjs';
 import { openLedger } from './ledger.mjs';
 import { reliable } from './controller.mjs';
@@ -145,4 +145,10 @@ test('test protection includes helpers and imports, not just assertion bodies', 
 
 test('environment repair retries preserve the selected semantic tier',{timeout:180000},async()=>{
  const f=fixture();writeFileSync(join(f.root,'repair.mjs'),"import fs from 'node:fs';const flag=process.argv[2]+'.infra';if(!fs.existsSync(flag)){fs.writeFileSync(flag,'retry');console.log('DAG_FAILURE: '+JSON.stringify({version:1,code:'environment',stage:'prepare',evidence:['Temporary runtime unavailable']}));process.exit(1)}fs.writeFileSync('value.txt','good');");git(f.root,['add','repair.mjs']);git(f.root,['commit','-m','environment fixture']);f.cfg.commands.repair.args.push('{scopeFile}');writeFileSync(f.path,JSON.stringify(f.cfg));const result=await reliable('run',f.path);assert.equal(result.completed,1,JSON.stringify(result));assert.equal(result.metrics.infrastructureRetries,1);assert.equal(result.metrics.semanticRejections,1);const state=JSON.parse(readFileSync(join(f.root,'dag.run.d','reliability','controller.json')));assert.ok(state.attempts.task_one.filter(a=>a.kind==='repair').every(a=>a.profile.model==='gpt-6-luna'));
+});
+test('registered long acceptance cycle has explicit bounded command and engine deadlines', () => {
+ const f=fixture();f.cfg.policy.engineTimeoutMs=7200000;f.cfg.commands.repair.timeoutMs=3600000;writeFileSync(f.path,JSON.stringify(f.cfg));assert.equal(loadConfig(f.path).cfg.policy.engineTimeoutMs,7200000);assert.equal(command(f.cfg.commands.repair).timeoutMs,3600000);assert.throws(()=>command({...f.cfg.commands.repair,timeoutMs:7200001}),/deadline/);f.cfg.policy.engineTimeoutMs=7200001;writeFileSync(f.path,JSON.stringify(f.cfg));assert.throws(()=>loadConfig(f.path),/deadline/);
+});
+test('repair does not demand a future unit merely because it shares the acceptance file',{timeout:180000},async()=>{
+ const f=fixture();writeFileSync(join(f.root,'shared.test.mjs'),"test('accepted baseline',()=>{});");git(f.root,['add','shared.test.mjs']);git(f.root,['commit','-m','shared acceptance baseline']);f.cfg.tasks.task_one.files.push({path:'shared.test.mjs',role:'test'});addTask(f.run,{id:'task_future',title:'future owner',spec:'R2 future',cmd:'node worker.mjs',deps:['task_one']});f.run.tasks.task_future.gate={question:'Later phase',approved:false};saveRun(f.run,join(f.root,'dag.run.json'));f.cfg.tasks.task_future={deterministic:true,entryPoint:'shared.test.mjs',reviewBoundary:'R2',requirements:['R2'],files:[{path:'shared.test.mjs',role:'test'}],checks:[{program:process.execPath,args:['-e','process.exit(9)'],timeoutMs:15000}]};writeFileSync(f.path,JSON.stringify(f.cfg));const result=await reliable('run',f.path);assert.equal(loadRun(join(f.root,'dag.run.json')).tasks.task_one.status,'completed',JSON.stringify(result));assert.equal(loadRun(join(f.root,'dag.run.json')).tasks.task_future.status,'pending');assert.equal(result.metrics.automaticallyResolved,1);
 });

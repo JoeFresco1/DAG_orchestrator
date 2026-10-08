@@ -70,7 +70,7 @@ export async function reliable(action, configPath, options = {}) {
             ledger.save('stage-end', { stage });
         }
     };
-    const dag = (args) => execute({ program: process.execPath, args: [cli, ...args, '--file', file, '--json'], timeoutMs: 900000 }, root, {}, 'engine');
+    const dag = (args) => execute({ program: process.execPath, args: [cli, ...args, '--file', file, '--json'], timeoutMs: cfg.policy.engineTimeoutMs }, root, {}, 'engine');
     const suspend = (id, f, reason) => { s.suspended[id] = { failure: f, reason, at: Date.now() }; ledger.save('suspend', { taskId: id, reason }); };
     async function recover(id, f) {
         if (['quota', 'authentication', 'model_unavailable', 'user_stop', 'contract', 'review_dispute', 'budget'].includes(f.code)) {
@@ -176,7 +176,11 @@ export async function reliable(action, configPath, options = {}) {
         }
         Object.assign(tokens, i.profile);
         if (i.phase === 'verify') {
-            const owners = Object.entries(cfg.tasks).filter(([owner, u]) => owner !== id && u.files.some(f => i.scope.includes(f.path))).map(([, u]) => u);
+            // Shared acceptance files are owned by many sequential units. Only an
+            // explicitly expanded upstream implementation boundary adds owner checks;
+            // otherwise a repair would demand unfinished future units' acceptance.
+            const expanded = i.scope.filter(path => !cfg.tasks[id].files.some(f => f.path === path));
+            const owners = Object.entries(cfg.tasks).filter(([owner, u]) => owner !== id && u.files.some(f => f.role === 'implementation' && expanded.includes(f.path))).map(([, u]) => u);
             i.checkReceipts = [];
             for (const check of [...cfg.tasks[id].checks, ...owners.flatMap(u => u.checks), ...(cfg.tasks[id].inputs || []).map(p => p.check), ...(cfg.commands.integration ? [cfg.commands.integration] : [])]) {
                 const r = await checked(check, { cfg, revision, cwd: i.worktree, directory, execute: c => execute(c, i.worktree, tokens, 'verify') });

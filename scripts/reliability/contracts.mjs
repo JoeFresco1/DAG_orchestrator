@@ -13,20 +13,21 @@ export function safePath(path) {
 export function command(value) {
     if (!value || typeof value.program !== 'string' || !value.program || !Array.isArray(value.args) || value.args.some(x => typeof x !== 'string' || /[\0\r\n]/.test(x)))
         throw new Error('Use a program and argument vector');
-    if (!Number.isSafeInteger(value.timeoutMs) || value.timeoutMs < 1 || value.timeoutMs > 900000)
-        throw new Error('Command deadline must be 1..900000ms');
+    if (!Number.isSafeInteger(value.timeoutMs) || value.timeoutMs < 1 || value.timeoutMs > 7200000)
+        throw new Error('Command deadline must be 1..7200000ms');
     return value;
 }
 export function loadConfig(path) {
     const bytes = readFileSync(path, 'utf8'), cfg = JSON.parse(bytes);
     if (cfg.version !== 1 || !cfg.runFile || !cfg.tasks || Array.isArray(cfg.tasks))
         throw new Error('Invalid reliability manifest');
-    cfg.policy = { wallMs: 86400000, incidentsPerTask: 2, incidentsPerRun: 12, infraRetries: 2, scopeRevisions: 2, concurrency: 1, workers: DEFAULT_WORKERS, ...cfg.policy };
+    cfg.policy = { wallMs: 86400000, engineTimeoutMs: 900000, incidentsPerTask: 2, incidentsPerRun: 12, infraRetries: 2, scopeRevisions: 2, concurrency: 1, workers: DEFAULT_WORKERS, ...cfg.policy };
     for (const key of ['wallMs', 'incidentsPerTask', 'incidentsPerRun', 'infraRetries', 'scopeRevisions', 'concurrency'])
         if (!Number.isSafeInteger(cfg.policy[key]) || cfg.policy[key] < 1)
             throw new Error(`Invalid policy ${key}`);
     if (cfg.policy.concurrency > 64)
         throw new Error('Concurrency exceeds engine limit');
+    command({ program: 'engine', args: [], timeoutMs: cfg.policy.engineTimeoutMs });
     if (!Array.isArray(cfg.policy.workers) || !cfg.policy.workers.length)
         throw new Error('Missing model policy');
     for (const p of cfg.policy.workers)
@@ -93,6 +94,12 @@ export function upstream(run, id) {
     return seen;
 }
 export function preflight(cfg, run) {
+    const roles = new Map();
+    for (const u of Object.values(cfg.tasks)) for (const f of u.files) {
+        const prior = roles.get(f.path);
+        if (prior && prior !== f.role) throw new Error(`Conflicting file roles: ${f.path}`);
+        roles.set(f.path, f.role);
+    }
     for (const id of Object.keys(run.tasks)) {
         if (run.tasks[id].status === 'skipped')
             continue;
@@ -107,10 +114,6 @@ export function preflight(cfg, run) {
         for (const p of u.inputs || [])
             if (!deps.has(p.owner) || !cfg.tasks[p.owner])
                 throw new Error(`Input ${p.contract} depends on a future/unregistered owner ${p.owner}`);
-        for (const f of u.files)
-            for (const [other, v] of Object.entries(cfg.tasks))
-                if (other !== id && v.files.some(x => x.path === f.path && x.role !== f.role))
-                    throw new Error(`Conflicting file roles: ${f.path}`);
     }
     return { tasks: Object.keys(run.tasks).length, contracts: Object.keys(cfg.tasks).length };
 }
