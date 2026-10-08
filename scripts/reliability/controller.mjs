@@ -99,10 +99,22 @@ export async function reliable(action, configPath, options = {}) {
         const i = incident, tokens = { taskId: id, incidentFile: join(directory, i.id + '.json') };
         atomic(tokens.incidentFile, { ...i, contract: cfg.tasks[id], task: run.tasks[id], runFile: file });
         if (i.phase === 'diagnose') {
+            // Each engine batch removes its integration checkout on completion.
+            // Diagnostics must inspect the accepted integration branch, so recreate
+            // that checkout at this boundary rather than relying on startup setup.
+            ensureIntegrationWorktree(root, run.id, undefined, snapshotExcludes(file, root));
             Object.assign(tokens, { model: 'gpt-6-luna', reasoning: 'xhigh' });
-            const r = await execute(cfg.commands.diagnose, root, tokens, 'diagnose'), d = marker(r.output, 'DAG_DIAGNOSIS');
+            const r = await execute(cfg.commands.diagnose, root, tokens, 'diagnose');
+            i.diagnosticReceipt = r;
+            ledger.save('diagnostic-receipt', { taskId: id });
+            const d = marker(r.output, 'DAG_DIAGNOSIS');
             if (r.code !== 0 || !d) {
-                suspend(id, f, 'Diagnostic produced no typed diagnosis');
+                const packet = marker(r.output, 'DAG_FAILURE');
+                const fault = packet ? failure(packet) : { version: 1, code: r.code !== 0 ? 'environment' : 'review_dispute', stage: 'diagnose', owner: id, evidence: [r.output || 'Diagnostic produced no typed diagnosis'] };
+                if (fault.code === 'environment' && (s.infrastructureCounts[id] || 0) < cfg.policy.infraRetries) {
+                    s.infrastructureCounts[id] = (s.infrastructureCounts[id] || 0) + 1;
+                    ledger.save('diagnostic-infrastructure-retry', { taskId: id });
+                } else suspend(id, fault, 'Diagnostic produced no typed diagnosis');
                 return;
             }
             i.failure = failure(d.failure);
@@ -364,6 +376,7 @@ export async function reliable(action, configPath, options = {}) {
             const failedProbes = new Set();
             for (const id of batch) {
                 for (const p of cfg.tasks[id].inputs || []) {
+                    ensureIntegrationWorktree(root, run.id, undefined, snapshotExcludes(file, root));
                     const branch = git(root, ['worktree', 'list', '--porcelain']).split(/\r?\n\r?\n/).find(e => e.includes(`branch refs/heads/dag/${run.id}`));
                     const cwd = branch ? branch.split(/\r?\n/)[0].slice(9) : root;
                     const r = await execute(p.check, cwd, { taskId: id }, 'preflight');
