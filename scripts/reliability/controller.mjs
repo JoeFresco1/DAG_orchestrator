@@ -78,6 +78,15 @@ export async function reliable(action, configPath, options = {}) {
             return;
         }
         let incident = Object.values(s.incidents).find(i => i.taskId === id && !['resolved', 'exhausted'].includes(i.phase));
+        if (incident?.phase === 'requeued' && f.stage === 'preflight') {
+            // A published repair is evidence, not a reason to ignore a failed
+            // probe forever. Preserve its receipts and open a bounded fresh
+            // incident rather than spinning on the already requeued phase.
+            incident.phase = 'exhausted';
+            incident.reason = 'Published repair failed a fresh consumed-input probe';
+            ledger.save('post-publication-probe-failed', { taskId: id, incidentId: incident.id });
+            incident = null;
+        }
         if (!incident) {
             if (Object.values(s.incidents).filter(i => i.taskId === id).length >= cfg.policy.incidentsPerTask || Object.keys(s.incidents).length >= cfg.policy.incidentsPerRun) {
                 suspend(id, f, 'Incident budget exhausted');
@@ -293,7 +302,8 @@ export async function reliable(action, configPath, options = {}) {
                 }
         ledger.save('controller-start');
         ensureIntegrationWorktree(root, run.id, undefined, snapshotExcludes(file, root));
-        for (let rounds = 0; rounds < 10000 && Date.now() < s.deadline; rounds++) {
+        let rounds = 0;
+        for (; rounds < 10000 && Date.now() < s.deadline; rounds++) {
             if (hash(readFileSync(context.path, 'utf8')) !== revision)
                 throw Error('Reliability configuration changed during execution');
             run = loadRun(file);
@@ -360,7 +370,8 @@ export async function reliable(action, configPath, options = {}) {
                     if (r.code !== 0) {
                         failedProbes.add(id);
                         try {
-                            await recover(id, { version: 1, code: 'ownership', stage: 'preflight', owner: p.owner, test: p.contract, evidence: [r.output || 'Consumed input probe failed'] });
+                            const packet = marker(r.output, 'DAG_FAILURE');
+                            await recover(id, packet ? { ...failure(packet), stage: 'preflight' } : { version: 1, code: 'ownership', stage: 'preflight', owner: p.owner, test: p.contract, evidence: [r.output || 'Consumed input probe failed'] });
                         }
                         catch (e) {
                             suspend(id, e.failure || { version: 1, code: 'contract', stage: 'preflight', evidence: [e.message] }, e.message);
@@ -405,7 +416,7 @@ export async function reliable(action, configPath, options = {}) {
             }
             ledger.save('batch-finished');
         }
-        s.stopReason = Date.now() >= s.deadline ? 'wall_budget_exhausted' : Object.keys(s.suspended).length ? 'suspended' : 'converged_or_waiting';
+        s.stopReason = Date.now() >= s.deadline ? 'wall_budget_exhausted' : rounds >= 10000 ? 'controller_round_budget_exhausted' : Object.keys(s.suspended).length ? 'suspended' : 'converged_or_waiting';
         ledger.save('controller-stop', { reason: s.stopReason });
         return report(ledger, loadRun(file));
     }
