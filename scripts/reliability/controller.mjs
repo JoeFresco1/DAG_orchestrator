@@ -15,8 +15,34 @@ export async function reliable(action, configPath, options = {}) {
     preflight(cfg, run);
     if (action === 'preflight')
         return preflight(cfg, run);
-    if (!['run', 'resume', 'status', 'audit', 'amend'].includes(action))
-        throw Error('Expected run, resume, status, audit, amend or preflight');
+    if (!['run', 'resume', 'status', 'audit', 'amend', 'continue'].includes(action))
+        throw Error('Expected run, resume, continue, status, audit, amend or preflight');
+    if (action === 'continue') {
+        if (!options.reason?.trim()) throw Error('Stopped continuation requires a recorded reason');
+        const releaseContinuation = lease(directory);
+        try {
+            assertNoForeignLock(file);
+            if (Object.values(run.tasks).some(t => t.status === 'running')) throw Error('Stop the engine before continuation');
+            const ledger = openLedger(directory, run.id, revision, cfg.policy), state = ledger.state;
+            if (state.graphRevision !== graphIdentity(run)) throw Error('Task contracts changed; stopped amendment required');
+            const ids = options.release || [];
+            for (const id of ids) {
+                if (!run.tasks[id] || state.suspended[id]?.failure.code !== 'review_dispute')
+                    throw Error('Continuation releases only registered review disputes for fresh review');
+                const incident = Object.values(state.incidents).find(i => i.taskId === id && i.phase === 'review');
+                if (!incident?.verifiedSource || sourceIdentity(incident.worktree, cfg) !== incident.verifiedSource)
+                    throw Error('Verified review source changed; recovery must be revalidated');
+            }
+            if (options.wallMs !== undefined && (!Number.isSafeInteger(options.wallMs) || options.wallMs <= 0 || options.wallMs > cfg.policy.wallMs))
+                throw Error('Continuation window must be positive and within the configured wall budget');
+            const previousDeadline = state.deadline;
+            if (options.wallMs !== undefined) state.deadline = Date.now() + options.wallMs;
+            for (const id of ids) delete state.suspended[id];
+            state.metrics.manualInterventions++;
+            ledger.save('operator-continuation', { reason: options.reason, released: ids, previousDeadline, deadline: state.deadline, countersPreserved: true });
+            return { deadline: state.deadline, released: ids, countersPreserved: true, incidentsPreserved: true };
+        } finally { releaseContinuation(); }
+    }
     if (action === 'amend') {
         if (!options.reason?.trim())
             throw Error('Stopped amendment requires a recorded reason');
@@ -221,6 +247,8 @@ export async function reliable(action, configPath, options = {}) {
         }
         if (i.phase === 'review') {
             const r = await execute(cfg.commands.review, i.worktree, tokens, 'review');
+            i.reviewReceipt = r;
+            ledger.save('review-receipt', { taskId: id });
             i.review = reviewOutcome(r.output, cfg.tasks[id].requirements);
             if (i.verifiedSource && sourceIdentity(i.worktree, cfg) !== i.verifiedSource) {
                 suspend(id, { version: 1, code: 'review_dispute', stage: 'review', evidence: ['Reviewer changed verified sources'] }, 'Reviewer changed verified sources');

@@ -11,6 +11,8 @@ usage: dag <cmd> [flags]
                                bounded recovery with ownership and structured review
   reliable amend --config F --reason R [--release task_a,task_b]
                                stopped contract amendment; preserves attempt budgets
+  reliable continue --config F --reason R [--release task_a] [--hours N]
+                               renew an authorized window; retain incidents and retries
 
   neutral-run --file request.json
                                execute a legacy-shaped task graph via neutral v1

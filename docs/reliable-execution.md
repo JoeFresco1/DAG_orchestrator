@@ -67,6 +67,22 @@ Optional adapters: `prepare` installs worktree dependencies; `integration` runs 
 
 Consumed input probes name `owner`, `contract` and `check`. The owner must be a registered ancestor. Failed probes invoke diagnosis before dispatching the consumer. A diagnostic request can expand repair scope only to registered upstream implementation files; affected owner checks also run. Unknown or future owners stop at registration.
 
+## Continuing after an operator pause
+
+`dag reliable continue --config F --reason "Authorized continuation" --hours 24`
+records an explicitly authorized new wall window without resetting attempt counts,
+incident phases, or accepted work. The window cannot exceed the configured wall
+budget. Ordinary `resume` never renews the deadline.
+
+Add `--release task_id` to release a stopped review dispute for fresh independent
+review of the same verified source. Source changes require revalidation; this
+command cannot approve a finding or release provider/contract suspensions.
+Contract changes still require `amend`, which supersedes active incidents.
+
+Review blockers may use an exact registered ID followed by ` — description`;
+the original display label is retained while the registered ID governs ownership.
+Unknown IDs, unsupported evidence, and inconclusive findings still fail closed.
+
 ## Adapter packets
 
 Use one complete JSON object on one line, with the exact prefix. Quota-related words elsewhere in logs do not classify a provider failure.

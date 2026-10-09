@@ -27,6 +27,15 @@ export function validateReview(value, requirements) {
     if (!value || !['pass', 'fail', 'inconclusive'].includes(value.verdict) || !Array.isArray(value.findings))
         throw new Error('Missing structured independent review');
     for (const f of value.findings) {
+        // Accept a display label only when its exact leading ID is registered.
+        // Never infer a requirement from prose or a partial identifier.
+        if (typeof f.requirement === 'string' && !requirements.includes(f.requirement)) {
+            const id = f.requirement.split(' — ')[0];
+            if (id !== f.requirement && requirements.includes(id)) {
+                f.requirementLabel = f.requirement;
+                f.requirement = id;
+            }
+        }
         if (!['blocker', 'uncertain', 'suggestion'].includes(f.severity) || typeof f.reason !== 'string' || !f.reason)
             throw new Error('Invalid review finding');
         if (f.severity === 'blocker' && (!requirements.includes(f.requirement) || !Array.isArray(f.evidence) || !f.evidence.length || !f.evidence.every(x => typeof x === 'string' && x.trim()) || !f.test && !f.codePath))
