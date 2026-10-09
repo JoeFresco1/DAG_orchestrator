@@ -213,6 +213,7 @@ export async function reliable(action, configPath, options = {}) {
             writeIncident();
             const r = await execute(cfg.commands.repair, i.worktree, tokens, 'repair');
             i.repairReceipt = r;
+            attempt.code = r.code;
             attempt.elapsedMs = r.elapsedMs;
             const repairFault = marker(r.output, 'DAG_FAILURE');
             attempt.semanticRejected = r.code !== 0 && repairFault?.code === 'implementation';
@@ -352,6 +353,20 @@ export async function reliable(action, configPath, options = {}) {
     }
     try {
         assertNoForeignLock(file);
+        // Correct an inferred legacy charge without erasing history or resetting
+        // the budget. A recorded zero exit is required for historical rejection.
+        for (const event of [...s.history]) {
+            if (event.event !== 'legacy-guard-reclassified' || event.charged !== undefined ||
+                s.history.some(e => e.event === 'legacy-guard-budget-corrected' && e.originalSequence === event.sequence)) continue;
+            const attempt = (s.attempts[event.taskId] || []).findLast(a => a.kind === 'repair' && a.at <= event.at);
+            if (!attempt?.semanticRejected || attempt.code === 0) continue;
+            attempt.semanticRejected = false;
+            attempt.classification = 'unknown_legacy_outcome';
+            s.semanticCounts[event.taskId] = Math.max(0, (s.semanticCounts[event.taskId] || 0) - 1);
+            const incident = Object.values(s.incidents).find(i => i.taskId === event.taskId && i.lastFailure?.validationRule === event.failure?.validationRule);
+            if (incident) incident.rejections = Math.max(0, incident.rejections - 1);
+            ledger.save('legacy-guard-budget-corrected', { taskId: event.taskId, originalSequence: event.sequence, reason: 'Historical repair exit unavailable; retain its unknown outcome uncharged' });
+        }
         if (s.active?.receipt?.owners) {
             if (s.active.stage === 'repair')
                 for (const i of Object.values(s.incidents))
@@ -396,7 +411,16 @@ export async function reliable(action, configPath, options = {}) {
                         ledger.save('legacy-task-guard-reclassified', { taskId: id, failure: error.failure });
                     }
                     const priorAttempt = (s.attempts[id] || []).findLast(a => a.kind === 'repair' && !a.semanticRejected);
-                    reject(incident, error.failure, 'legacy-guard-reclassified', priorAttempt);
+                    // Old code could mask a provider failure behind this guard.
+                    // Charge historical repair only with positive exit evidence.
+                    if (priorAttempt && (priorAttempt.code === 0 || incident.repairReceipt?.code === 0))
+                        reject(incident, error.failure, 'legacy-guard-reclassified', priorAttempt);
+                    else {
+                        incident.lastFailure = error.failure;
+                        incident.phase = 'repair';
+                        if (priorAttempt) priorAttempt.classification = 'unknown_legacy_outcome';
+                        ledger.save('legacy-guard-reclassified', { taskId: id, failure: error.failure, charged: false, reason: 'Historical repair exit outcome unavailable' });
+                    }
                     delete s.suspended[id];
                     ledger.save('legacy-guard-released', { taskId: id, previousFailure: entry.failure, countersPreserved: true });
                 }

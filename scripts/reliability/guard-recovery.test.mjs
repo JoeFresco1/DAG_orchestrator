@@ -81,15 +81,15 @@ function lines(path) {
     return readFileSync(path, 'utf8').trim().split(/\r?\n/).map(line => JSON.parse(line));
 }
 
-function assertPublished(f, state, repairAttempts, semanticRejections) {
+function assertPublished(f, state, repairAttempts, semanticRejections, incidentRejections = 1) {
     assert.equal(loadRun(join(f.root, 'dag.run.json')).tasks.task_one.status, 'completed');
     assert.deepEqual(state.suspended, {});
-    assert.equal(state.semanticCounts.task_one, semanticRejections);
+    assert.equal(state.semanticCounts.task_one || 0, semanticRejections);
     assert.equal(state.attempts.task_one.filter(a => a.kind === 'repair').length, repairAttempts);
     assert.equal(Object.values(state.incidents).length, 1);
     const incident = Object.values(state.incidents)[0];
     assert.equal(incident.phase, 'resolved');
-    assert.equal(incident.rejections, 1);
+    assert.equal(incident.rejections, incidentRejections);
     assert.equal(incident.review.verdict, 'pass');
     assert.equal(incident.reviewReceipt.code, 0);
     assert.ok(incident.checkReceipts.length > 0);
@@ -121,7 +121,7 @@ test('real CLI corrects rejected new test support, reviews, publishes and comple
     assert.equal(lines(f.repairAudit).length, 2);
 });
 
-test('resume reclassifies retained legacy test-support suspension without operator release', { timeout: 180000 }, () => {
+for (const knownExit of [true, false]) test(`resume reclassifies retained legacy test-support suspension with ${knownExit ? 'recorded' : 'unknown'} exit outcome`, { timeout: 180000 }, () => {
     const f = fixture();
     const base = git(f.root, ['rev-parse', 'HEAD']);
     git(f.root, ['branch', `dag/${f.run.id}`, base]);
@@ -139,18 +139,33 @@ test('resume reclassifies retained legacy test-support suspension without operat
     ledger.state.graphRevision = graphIdentity(f.run);
     ledger.state.semanticCounts = {};
     ledger.state.infrastructureCounts = {};
-    ledger.state.attempts.task_one = [];
+    ledger.state.attempts.task_one = [{ kind: 'repair', at: Date.now() - 1000, ...(knownExit ? { code: 0 } : {}), semanticRejected: false }];
     ledger.state.incidents.incident_legacy = { id: 'incident_legacy', taskId: 'task_one', phase: 'repair', base, worktree, scope: ['value.txt', 'acceptance.test.mjs'], failure, rejections: 0, infraRetries: 0 };
     ledger.state.suspended.task_one = { failure: { version: 1, code: 'contract', stage: 'recovery', owner: 'task_one', evidence: ['New test support code requires a separate registered file: acceptance.test.mjs'] }, reason: 'suspend_decision', at: Date.now() };
+    if (!knownExit) {
+        // Replay the first migration's inferred historical charge. Resume must
+        // correct only that charge, retain the event, and keep outcome unknown.
+        let guardFailure;
+        try { guardDiff(f.cfg, 'task_one', worktree, base, ['value.txt', 'acceptance.test.mjs']); }
+        catch (error) { guardFailure = error.failure; }
+        assert.ok(guardFailure);
+        ledger.state.attempts.task_one[0].semanticRejected = true;
+        ledger.state.semanticCounts.task_one = 1;
+        ledger.state.incidents.incident_legacy.rejections = 1;
+        ledger.state.incidents.incident_legacy.lastFailure = guardFailure;
+        ledger.save('legacy-guard-reclassified', { taskId: 'task_one', failure: guardFailure });
+    }
     ledger.save('injected-legacy-suspension');
     const deadline = ledger.state.deadline;
     const state = invoke(f, 'resume');
-    assertPublished(f, state, 1, 1);
+    assertPublished(f, state, 2, knownExit ? 1 : 0, knownExit ? 1 : 0);
     assert.equal(state.deadline, deadline);
     const repairs = lines(f.repairAudit);
     assert.equal(repairs.length, 1);
     assert.equal(repairs[0].lastFailure.validationRule, 'test_support');
     assert.equal(repairs[0].before, invalid);
+    if (!knownExit) assert.equal(state.attempts.task_one[0].classification, 'unknown_legacy_outcome');
+    if (!knownExit) assert.equal(state.history.filter(e => e.event === 'legacy-guard-budget-corrected').length, 1);
 });
 
 for (const [rule, source] of [['test_support', invalid], ['acceptance_modified', baseline.replace('2 + 2, 4', '2 + 2, 5')]]) {
