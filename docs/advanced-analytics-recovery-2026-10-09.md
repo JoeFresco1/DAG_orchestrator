@@ -28,6 +28,10 @@ that every remaining task is too complex for Luna.
 ## Corrections
 
 Engine commit: `8ba910e` (`Recover protected-test violations with fresh bounded feedback`).
+Historical-outcome follow-up: `a9e10d6`. The follow-up preserves unknown old exit
+outcomes without charging them and corrects inferred charges on a subsequent
+resume. The live process was started on `8ba910e`; a planned boundary reload was
+refused because the stage had already advanced, preserving the active engine.
 
 - Protected-test violations have structured implementation failures with exact
   validation rule, file and evidence. They return to bounded repair instead of
@@ -75,8 +79,11 @@ remaining suspension. The existing deadline remains October 10 at 9:31 AM Easter
 The live worker moved the helpers inside a prefixed parent test, awaited all eight
 child cases, and passed `pnpm build` and unchanged scope acceptance (nine tests
 including the parent). A separate coordinator read-only guard invocation passed
-against that actual source. Completion remained 67/164 pending controller checks
-and independent review; this does not claim all remaining units have completed.
+against that actual source. The controller checks and independent review then
+passed, and the repair was published and requeued through the supported CLI.
+The latest snapshot still counted 67/164 completed with T004 running its fresh
+completion gate and no suspension. This does not claim all remaining units have
+completed.
 
 The next 11 units share the same test file; the shared guidance and recovery
 correction therefore apply to a demonstrated recurring boundary. No ownership,
