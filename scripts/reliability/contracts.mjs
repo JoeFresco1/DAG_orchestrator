@@ -168,6 +168,9 @@ function testCalls(path, text) {
     visit(source);
     return out;
 }
+function testViolation(path, validationRule, message, owner) {
+    return Object.assign(new Error(message), { failure: { version: 1, code: 'implementation', stage: 'validation', validationRule, file: path, ...(owner ? { owner } : {}), evidence: [message] } });
+}
 function preserveTestModule(path, old, text) {
     const parse = value => ts.createSourceFile(path, value, ts.ScriptTarget.Latest, true), printer = ts.createPrinter();
     const before = parse(old), after = parse(text), remaining = [...after.statements];
@@ -176,13 +179,13 @@ function preserveTestModule(path, old, text) {
         const printed = printer.printNode(ts.EmitHint.Unspecified, node, before);
         const at = remaining.findIndex((candidate, index) => index >= cursor && printer.printNode(ts.EmitHint.Unspecified, candidate, after) === printed);
         if (at < 0)
-            throw Error(`Existing acceptance changed: ${path}`);
+            throw testViolation(path, 'acceptance_modified', `Existing acceptance changed: ${path}`);
         remaining[at] = null;
         cursor = at + 1;
     }
     for (const node of remaining.filter(Boolean))
         if (!ts.isExpressionStatement(node) || !ts.isCallExpression(node.expression) || !/^(?:test|it|describe|suite)$/.test(node.expression.expression.getText(after)))
-            throw Error(`New test support code requires a separate registered file: ${path}`);
+            throw testViolation(path, 'test_support', `New test support code requires a separate registered file: ${path}`);
 }
 export function guardDiff(cfg, id, cwd, base, scope = repairScope(cfg, { tasks: { [id]: { deps: [] } } }, id)) {
     if (git(cwd, ['rev-parse', 'HEAD']) !== base)
@@ -207,22 +210,23 @@ export function guardDiff(cfg, id, cwd, base, scope = repairScope(cfg, { tasks: 
             continue;
         const text = readFileSync(resolve(cwd, f.path), 'utf8');
         if (/\.(?:ts|js|mjs|cjs)$/.test(f.path)) {
-            preserveTestModule(f.path, old, text);
+            try { preserveTestModule(f.path, old, text); }
+            catch (error) { if (error.failure) error.failure.owner = id; throw error; }
             const available = testCalls(f.path, text);
             for (const call of testCalls(f.path, old)) {
                 const at = available.indexOf(call);
                 if (at < 0)
-                    throw new Error(`Existing acceptance changed: ${f.path}`);
+                    throw testViolation(f.path, 'acceptance_modified', `Existing acceptance changed: ${f.path}`, id);
                 available.splice(at, 1);
             }
         }
         else if (f.path.endsWith('.py')) {
             const script = 'import ast,json,sys; a,b=json.load(sys.stdin); nodes=lambda s:[ast.dump(n,include_attributes=False) for n in ast.parse(s).body]; x,y=nodes(a),nodes(b); cursor=0\nfor node in x:\n try: cursor=y.index(node,cursor)+1\n except ValueError: sys.exit(1)';
             if (spawnSync('python', ['-c', script], { input: JSON.stringify([old, text]), cwd, windowsHide: true, timeout: 10000 }).status !== 0)
-                throw new Error(`Existing Python acceptance changed: ${f.path}`);
+                throw testViolation(f.path, 'acceptance_modified', `Existing Python acceptance changed: ${f.path}`, id);
         }
         else if (!text.includes(old))
-            throw new Error(`Existing acceptance changed: ${f.path}`);
+            throw testViolation(f.path, 'acceptance_modified', `Existing acceptance changed: ${f.path}`, id);
     }
     return changed;
 }
@@ -234,7 +238,7 @@ export function makeTaskGuard(context) {
             guardDiff(context.cfg, task.id, cwd, base, context.cfg.tasks[task.id].files.filter(f => f.role !== 'frozen').map(f => f.path));
         }
         catch (e) {
-            throw Object.assign(new Error('DAG_FAILURE: ' + JSON.stringify({ version: 1, code: 'ownership', stage: 'validation', owner: task.id, evidence: [e.message] })), { kind: 'review' });
+            throw Object.assign(new Error('DAG_FAILURE: ' + JSON.stringify(e.failure || { version: 1, code: 'ownership', stage: 'validation', owner: task.id, evidence: [e.message] })), { kind: 'review' });
         }
     };
 }

@@ -98,6 +98,14 @@ export async function reliable(action, configPath, options = {}) {
     };
     const dag = (args) => execute({ program: process.execPath, args: [cli, ...args, '--file', file, '--json'], timeoutMs: cfg.policy.engineTimeoutMs }, root, {}, 'engine');
     const suspend = (id, f, reason) => { s.suspended[id] = { failure: f, reason, at: Date.now() }; ledger.save('suspend', { taskId: id, reason }); };
+    const reject = (i, fault, event, attempt) => {
+        i.lastFailure = fault;
+        i.rejections++;
+        s.semanticCounts[i.taskId] = (s.semanticCounts[i.taskId] || 0) + 1;
+        if (attempt) attempt.semanticRejected = true;
+        i.phase = 'repair';
+        ledger.save(event, { taskId: i.taskId, failure: fault });
+    };
     async function recover(id, f) {
         if (['quota', 'authentication', 'model_unavailable', 'user_stop', 'contract', 'review_dispute', 'budget'].includes(f.code)) {
             suspend(id, f, disposition(f));
@@ -123,7 +131,26 @@ export async function reliable(action, configPath, options = {}) {
             ledger.save('incident', { taskId: id });
         }
         const i = incident, tokens = { taskId: id, incidentFile: join(directory, i.id + '.json') };
-        atomic(tokens.incidentFile, { ...i, contract: cfg.tasks[id], task: run.tasks[id], runFile: file });
+        // Receipts stay in the ledger. Sending whole transcripts back to an LLM
+        // on every retry caused enormous prompts and hid the current rejection.
+        const writeIncident = () => atomic(tokens.incidentFile, {
+            id: i.id, taskId: id, phase: i.phase, failure: i.failure,
+            lastFailure: i.lastFailure || null, review: i.review || null,
+            checkResults: (i.checkReceipts || []).map(r => ({ command: r.command, code: r.code, output: r.code ? String(r.output || '').slice(-6000) : undefined })),
+            scope: i.scope, base: i.base, worktree: i.worktree, profile: i.profile,
+            ledgerFile: ledger.path, runFile: file,
+            contract: cfg.tasks[id], task: { id, title: run.tasks[id].title, spec: run.tasks[id].spec, result: String(run.tasks[id].result || '').slice(-12000) },
+        });
+        writeIncident();
+        if (i.phase === 'diagnose') {
+            if (i.failure.code === 'implementation' && ['test_support', 'acceptance_modified'].includes(i.failure.validationRule)) {
+                i.scope = repairScope(cfg, run, id);
+                i.lastFailure = i.failure;
+                i.nextAction = 'repair';
+                i.phase = 'prepare';
+                ledger.save('mechanical-diagnosis', { taskId: id, failure: i.failure });
+            }
+        }
         if (i.phase === 'diagnose') {
             // Each engine batch removes its integration checkout on completion.
             // Diagnostics must inspect the accepted integration branch, so recreate
@@ -181,11 +208,25 @@ export async function reliable(action, configPath, options = {}) {
             const attempt = { kind: 'repair', at: Date.now(), profile: i.profile, accepted: false };
             s.attempts[id].push(attempt);
             ledger.save();
+            // Diagnosis and preparation may have changed this incident in the
+            // same call. Refresh the worker's snapshot at the command boundary.
+            writeIncident();
             const r = await execute(cfg.commands.repair, i.worktree, tokens, 'repair');
+            i.repairReceipt = r;
             attempt.elapsedMs = r.elapsedMs;
-            attempt.semanticRejected = r.code !== 0 && marker(r.output, 'DAG_FAILURE')?.code === 'implementation';
+            const repairFault = marker(r.output, 'DAG_FAILURE');
+            attempt.semanticRejected = r.code !== 0 && repairFault?.code === 'implementation';
             ledger.save('repair-command-finished', { taskId: id });
-            guardDiff(cfg, id, i.worktree, i.base, i.scope);
+            try { guardDiff(cfg, id, i.worktree, i.base, i.scope); }
+            catch (error) {
+                if (error.failure?.code !== 'implementation') throw error;
+                // A provider/runtime failure must not be charged as a new bad
+                // implementation merely because the retained source is still bad.
+                if (!(r.code !== 0 && repairFault && repairFault.code !== 'implementation')) {
+                    reject(i, error.failure, 'guard-rejected', attempt);
+                    return;
+                }
+            }
             if (r.code !== 0) {
                 const request = marker(r.output, 'DAG_SCOPE_REQUEST');
                 if (request) {
@@ -202,9 +243,7 @@ export async function reliable(action, configPath, options = {}) {
                 const packet = marker(r.output, 'DAG_FAILURE');
                 const fault = packet ? failure(packet) : { version: 1, code: 'unknown', stage: 'repair', evidence: [r.output || 'Repair exited nonzero'] };
                 if (fault.code === 'implementation') {
-                    s.semanticCounts[id] = (s.semanticCounts[id] || 0) + 1;
-                    i.rejections++;
-                    ledger.save('repair-rejected', { taskId: id });
+                    reject(i, fault, 'repair-rejected', attempt);
                 }
                 else if(fault.code==='environment'&&(s.infrastructureCounts[id]||0)<cfg.policy.infraRetries){s.infrastructureCounts[id]=(s.infrastructureCounts[id]||0)+1;ledger.save('infrastructure-retry',{taskId:id});}
                 else
@@ -234,10 +273,10 @@ export async function reliable(action, configPath, options = {}) {
                 i.checkReceipts.push({ command: check, ...r });
                 ledger.save('check', { taskId: id });
                 if (r.code !== 0) {
-                    s.semanticCounts[id] = (s.semanticCounts[id] || 0) + 1;
-                    i.rejections++;
-                    i.phase = 'repair';
-                    ledger.save('check-rejected', { taskId: id });
+                    const packet = marker(r.output, 'DAG_FAILURE');
+                    const fault = packet ? failure(packet) : { version: 1, code: 'implementation', stage: 'verify', owner: id, evidence: [String(r.output || 'Check exited nonzero').slice(-6000)] };
+                    if (fault.code !== 'implementation') throw Object.assign(Error('Check prerequisite failed'), { failure: fault });
+                    reject(i, fault, 'check-rejected');
                     return;
                 }
             }
@@ -259,10 +298,7 @@ export async function reliable(action, configPath, options = {}) {
                 return;
             }
             if (i.review.verdict === 'fail') {
-                s.semanticCounts[id] = (s.semanticCounts[id] || 0) + 1;
-                i.rejections++;
-                i.phase = 'repair';
-                ledger.save('review-rejected', { taskId: id });
+                reject(i, { version: 1, code: 'implementation', stage: 'review', owner: id, evidence: i.review.findings.filter(f => f.severity === 'blocker').map(f => `${f.requirement}: ${f.reason}`) }, 'review-rejected');
                 return;
             }
             guardDiff(cfg, id, i.worktree, i.base, i.scope);
@@ -340,6 +376,31 @@ export async function reliable(action, configPath, options = {}) {
                         ledger.save('provider-restored', { taskId: id });
                     }
                 }
+        // Older controllers mislabeled repairable test violations as contract
+        // disputes. Reclassify only if the same registered guard reproduces the
+        // exact recorded error on the retained source; genuine authority faults
+        // and source/history changes remain suspended.
+        if (action === 'resume')
+            for (const [id, entry] of Object.entries(s.suspended)) {
+                if (entry.failure.code !== 'contract' || entry.failure.stage !== 'recovery') continue;
+                const incident = Object.values(s.incidents).find(i => i.taskId === id && i.phase === 'repair');
+                if (!incident?.worktree || !incident.base || !incident.scope) continue;
+                try { guardDiff(cfg, id, incident.worktree, incident.base, incident.scope); }
+                catch (error) {
+                    if (error.failure?.code !== 'implementation' || !entry.failure.evidence.includes(error.message)) continue;
+                    const original = taskFailure(run.tasks[id]);
+                    const normalAttempt = (s.attempts[id] || []).findLast(a => a.kind !== 'repair' && !a.accepted && !a.semanticRejected);
+                    if (normalAttempt && original.code === 'ownership' && original.stage === 'validation' && original.evidence.includes(error.message)) {
+                        normalAttempt.semanticRejected = true;
+                        s.semanticCounts[id] = (s.semanticCounts[id] || 0) + 1;
+                        ledger.save('legacy-task-guard-reclassified', { taskId: id, failure: error.failure });
+                    }
+                    const priorAttempt = (s.attempts[id] || []).findLast(a => a.kind === 'repair' && !a.semanticRejected);
+                    reject(incident, error.failure, 'legacy-guard-reclassified', priorAttempt);
+                    delete s.suspended[id];
+                    ledger.save('legacy-guard-released', { taskId: id, previousFailure: entry.failure, countersPreserved: true });
+                }
+            }
         ledger.save('controller-start');
         ensureIntegrationWorktree(root, run.id, undefined, snapshotExcludes(file, root));
         let rounds = 0;

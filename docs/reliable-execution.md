@@ -104,6 +104,25 @@ The run's existing sidecar contains `reliability/controller.json`, event history
 
 Recovery persists preparation, repair, verification, review, commit, publication and requeue boundaries. Commit receipts precede publication; branch updates use the expected base, or fast-forward a clean registered integration checkout. Resume reconciles already published commits and uses the supported retry command. Only a subsequent independently checked task completion resolves an incident.
 
+Protected-test violations are implementation failures, not changes to the accepted
+contract. New top-level helper/import/type statements (`test_support`) and changed
+existing acceptance (`acceptance_modified`) fail the guard, consume a bounded
+semantic attempt, and return the exact rule/file/evidence to repair. Existing
+tests remain protected; frozen-contract mutation, unowned changes and Git-history
+changes still stop. Known mechanical violations use deterministic diagnosis rather
+than spending a model call to rediscover the validator's finding.
+
+Workers receive an incident snapshot refreshed after diagnosis and preparation,
+including `lastFailure`, structured review findings and bounded failed-check
+output. Full diagnostic, repair, check and review receipts remain in the ledger,
+linked by `ledgerFile`; full old transcripts are not duplicated in each prompt.
+
+On resume, an old `contract/recovery` suspension can be reclassified only if the
+same registered test guard reproduces its exact recorded error on the retained
+repair. This retains scope, worktree, deadline and history. Previously uncounted
+matching worker/repair attempts are recorded as rejected; unrelated suspensions
+remain in force. The usual checks and independent review still precede publication.
+
 `policy.reuseChecks: true` enables successful deterministic-check reuse. It requires the environment adapter to fingerprint the installed runtime/dependencies. Cache identities include exact HEAD, tracked changes, registered file contents, dependency manifests, command, contract revision, environment digest, process environment and platform. Uncertain identities rerun the check; failures are not cached. Reviews are never cached.
 
 The viewer displays the current controller stage, task, selected profile, remaining wall budget and suspension reasons. Metrics cover observed controller attempts only; unknown spend is null. Audit emits lesson candidates with evidence, not installed skills. Applicability review and regression controls are required before promoting a lesson.
