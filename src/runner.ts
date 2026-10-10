@@ -2314,6 +2314,7 @@ export class DagRunner {
       const verdict = this.opts.controllerManaged ? 'pass' : await this.reviewPass(task, execute, scope, worktreePath ?? undefined, planFile, depsContext, outcome.exitCode);
       if (this.tokens.get(task.id) !== token) return;
       if (verdict !== 'pass') {
+        this.salvageWorktree(task.id, 'review rejected');
         this.dropWorktree(task.id);
         this.persist();
         return;
