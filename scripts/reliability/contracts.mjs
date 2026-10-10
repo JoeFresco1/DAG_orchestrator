@@ -124,6 +124,9 @@ export function repairScope(cfg, run, id, requested = []) {
     const files = new Set(own);
     for (const path of requested) {
         safePath(path);
+        // Diagnostics may list the files needed for a repair, including ones
+        // already authorized by this task's implementation/test/report scope.
+        if (files.has(path)) continue;
         if (![...allowed].some(owner => cfg.tasks[owner]?.files.some(f => f.path === path && f.role === 'implementation')))
             throw new Error(`No upstream implementation authority: ${path}`);
         files.add(path);

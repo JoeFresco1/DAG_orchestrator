@@ -4,11 +4,24 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRun, addTask, saveRun, loadRun } from '../../dist/store.js';
-import { git, hash, chooseBatch, preflight, guardDiff, DEFAULT_WORKERS, command, loadConfig, graphIdentity, sourceIdentity, repairCheckOwners } from './contracts.mjs';
+import { git, hash, chooseBatch, preflight, guardDiff, DEFAULT_WORKERS, command, loadConfig, graphIdentity, sourceIdentity, repairCheckOwners, repairScope } from './contracts.mjs';
 import { marker, taskFailure, validateReview, profileFor, fingerprint } from './protocol.mjs';
 import { openLedger } from './ledger.mjs';
 import { reliable } from './controller.mjs';
 const cmd = (script) => ({ program: process.execPath, args: [script], timeoutMs: 15000, kind: 'deterministic' });
+test('repair scope accepts repeated owned paths and restricts additional authority', () => {
+    const cfg = { tasks: {
+        consumer: { files: [{ path: 'consumer.ts', role: 'implementation' }, { path: 'consumer.test.ts', role: 'test' }, { path: 'report.md', role: 'generated' }, { path: 'contract.json', role: 'frozen' }] },
+        producer: { files: [{ path: 'producer.ts', role: 'implementation' }, { path: 'producer.test.ts', role: 'test' }] },
+        future: { files: [{ path: 'future.ts', role: 'implementation' }] },
+    } };
+    const run = { tasks: { consumer: { deps: ['producer'] }, producer: { deps: [] }, future: { deps: ['consumer'] } } };
+    const own = repairScope(cfg, run, 'consumer');
+    assert.deepEqual(repairScope(cfg, run, 'consumer', [...own, ...own]), own);
+    assert.deepEqual(repairScope(cfg, run, 'consumer', ['consumer.test.ts', 'producer.ts', 'producer.ts']), [...own, 'producer.ts']);
+    for (const path of ['contract.json', 'producer.test.ts', 'future.ts', 'unknown.ts', '../escape.ts'])
+        assert.throws(() => repairScope(cfg, run, 'consumer', [path]));
+});
 test('expanded repair checks preserve accepted shared-file behavior without demanding future work', () => {
     const unit = path => ({ files: [{ path, role: 'implementation' }], checks: [cmd('check.mjs')] });
     const cfg = { tasks: { consumer: unit('cli.ts'), producer: unit('controller.ts'), sibling: unit('controller.ts'), future: unit('controller.ts'), failed: unit('controller.ts') } };
@@ -83,6 +96,22 @@ test('ledger deadline and budget survive reopening', () => { const root = mkdtem
 test('scheduling prevents conflicting writes and resource overcommit', () => { const cfg = { policy: { concurrency: 3 }, capacities: { cpu: 1 }, tasks: { a: { files: [{ path: 'a', role: 'implementation' }], resources: { cpu: 1 } }, b: { files: [{ path: 'b', role: 'implementation' }], resources: { cpu: 1 } } } }; const run = { tasks: { a: { id: 'a', status: 'pending', deps: [], cmd: 'x' }, b: { id: 'b', status: 'pending', deps: [], cmd: 'x' } } }; assert.deepEqual(chooseBatch(cfg, run), ['a']); run.tasks.a.gate = { approved: false }; assert.deepEqual(chooseBatch(cfg, run), ['b']); });
 test('unregistered producer and unowned edits fail closed', () => { const f = fixture(); f.cfg.tasks.task_one.inputs = [{ owner: 'future', contract: 'input' }]; assert.throws(() => preflight(f.cfg, f.run)); writeFileSync(join(f.root, 'outside.txt'), 'oops'); const base = git(f.root, ['rev-parse', 'HEAD']); assert.throws(() => guardDiff(f.cfg, 'task_one', f.root, base, ['value.txt'])); });
 test('real CLI failure repairs in isolation, verifies, publishes and requeues', { timeout: 180000 }, async () => { const f = fixture(); const result = await reliable('run', f.path); assert.equal(loadRun(join(f.root, 'dag.run.json')).tasks.task_one.status, 'completed', JSON.stringify(result)); assert.equal(result.metrics.automaticallyResolved, 1); assert.equal(readFileSync(join(f.root, 'value.txt'), 'utf8'), 'bad'); assert.equal(git(f.root, ['show', `dag/${f.run.id}:value.txt`]), 'good'); const again = await reliable('resume', f.path); assert.equal(again.metrics.automaticallyResolved, 1); });
+test('real recovery proceeds when diagnosis requests an already owned test file', { timeout: 180000 }, async () => {
+    const f = fixture();
+    writeFileSync(join(f.root, 'owned.test.mjs'), "import test from 'node:test';test('existing control',()=>{});");
+    writeFileSync(join(f.root, 'diagnose.mjs'), "console.log('DAG_DIAGNOSIS: '+JSON.stringify({failure:{version:1,code:'implementation',stage:'work',owner:'task_one',evidence:['repair value and retain regression']},requestedFiles:['value.txt','owned.test.mjs']}))");
+    f.cfg.tasks.task_one.files.push({ path: 'owned.test.mjs', role: 'test' });
+    git(f.root, ['add', '.']); git(f.root, ['commit', '-m', 'owned test diagnosis']);
+    writeFileSync(f.path, JSON.stringify(f.cfg));
+    const result = await reliable('run', f.path);
+    assert.equal(loadRun(join(f.root, 'dag.run.json')).tasks.task_one.status, 'completed', JSON.stringify(result));
+    const state = JSON.parse(readFileSync(join(f.root, 'dag.run.d/reliability/controller.json'), 'utf8'));
+    const incident = Object.values(state.incidents).find(i => i.taskId === 'task_one');
+    assert.equal(incident.phase, 'resolved');
+    assert.ok(incident.scope.includes('owned.test.mjs'));
+    assert.equal(state.suspended.task_one, undefined);
+    assert.equal(git(f.root, ['show', `dag/${f.run.id}:value.txt`]), 'good');
+});
 test('real recovery of a shared producer excludes unfinished descendant acceptance', { timeout: 180000 }, async () => {
     const f = fixture();
     writeFileSync(join(f.root, 'cli.txt'), 'consumer');
