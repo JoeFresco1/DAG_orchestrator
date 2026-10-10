@@ -3,7 +3,7 @@ import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadRun, assertNoForeignLock, runPaths } from '../../dist/store.js';
 import { ensureIntegrationWorktree, snapshotExcludes } from '../../dist/git-worktree.js';
-import { loadConfig, preflight, chooseBatch, repairScope, guardDiff, git, hash, sourceIdentity, graphIdentity } from './contracts.mjs';
+import { loadConfig, preflight, chooseBatch, repairScope, repairCheckOwners, guardDiff, git, hash, sourceIdentity, graphIdentity } from './contracts.mjs';
 import { failure, taskFailure, marker, fingerprint, disposition, profileFor, reviewOutcome, lessonCandidate } from './protocol.mjs';
 import { openLedger, lease, report, atomic } from './ledger.mjs';
 import { runCommand, terminateOwned } from './process.mjs';
@@ -266,8 +266,7 @@ export async function reliable(action, configPath, options = {}) {
             // Shared acceptance files are owned by many sequential units. Only an
             // explicitly expanded upstream implementation boundary adds owner checks;
             // otherwise a repair would demand unfinished future units' acceptance.
-            const expanded = i.scope.filter(path => !cfg.tasks[id].files.some(f => f.path === path));
-            const owners = Object.entries(cfg.tasks).filter(([owner, u]) => owner !== id && u.files.some(f => f.role === 'implementation' && expanded.includes(f.path))).map(([, u]) => u);
+            const owners = repairCheckOwners(cfg, run, id, i.scope).map(({ unit }) => unit);
             i.checkReceipts = [];
             for (const check of [...cfg.tasks[id].checks, ...owners.flatMap(u => u.checks), ...(cfg.tasks[id].inputs || []).map(p => p.check), ...(cfg.commands.integration ? [cfg.commands.integration] : [])]) {
                 const r = await checked(check, { cfg, revision, cwd: i.worktree, directory, execute: c => execute(c, i.worktree, tokens, 'verify') });

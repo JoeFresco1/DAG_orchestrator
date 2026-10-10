@@ -4,11 +4,18 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRun, addTask, saveRun, loadRun } from '../../dist/store.js';
-import { git, hash, chooseBatch, preflight, guardDiff, DEFAULT_WORKERS, command, loadConfig, graphIdentity, sourceIdentity } from './contracts.mjs';
+import { git, hash, chooseBatch, preflight, guardDiff, DEFAULT_WORKERS, command, loadConfig, graphIdentity, sourceIdentity, repairCheckOwners } from './contracts.mjs';
 import { marker, taskFailure, validateReview, profileFor, fingerprint } from './protocol.mjs';
 import { openLedger } from './ledger.mjs';
 import { reliable } from './controller.mjs';
 const cmd = (script) => ({ program: process.execPath, args: [script], timeoutMs: 15000, kind: 'deterministic' });
+test('expanded repair checks preserve accepted shared-file behavior without demanding future work', () => {
+    const unit = path => ({ files: [{ path, role: 'implementation' }], checks: [cmd('check.mjs')] });
+    const cfg = { tasks: { consumer: unit('cli.ts'), producer: unit('controller.ts'), sibling: unit('controller.ts'), future: unit('controller.ts'), failed: unit('controller.ts') } };
+    const run = { tasks: { consumer: { status: 'failed', deps: ['producer'] }, producer: { status: 'completed' }, sibling: { status: 'completed' }, future: { status: 'pending' }, failed: { status: 'failed' } } };
+    assert.deepEqual(repairCheckOwners(cfg, run, 'consumer', ['cli.ts', 'controller.ts']).map(x => x.owner), ['producer', 'sibling']);
+    assert.deepEqual(repairCheckOwners(cfg, run, 'consumer', ['cli.ts']), []);
+});
 function fixture() {
     const root = mkdtempSync(join(tmpdir(), 'dag-reliable-'));
     git(root, ['init']);
@@ -76,6 +83,32 @@ test('ledger deadline and budget survive reopening', () => { const root = mkdtem
 test('scheduling prevents conflicting writes and resource overcommit', () => { const cfg = { policy: { concurrency: 3 }, capacities: { cpu: 1 }, tasks: { a: { files: [{ path: 'a', role: 'implementation' }], resources: { cpu: 1 } }, b: { files: [{ path: 'b', role: 'implementation' }], resources: { cpu: 1 } } } }; const run = { tasks: { a: { id: 'a', status: 'pending', deps: [], cmd: 'x' }, b: { id: 'b', status: 'pending', deps: [], cmd: 'x' } } }; assert.deepEqual(chooseBatch(cfg, run), ['a']); run.tasks.a.gate = { approved: false }; assert.deepEqual(chooseBatch(cfg, run), ['b']); });
 test('unregistered producer and unowned edits fail closed', () => { const f = fixture(); f.cfg.tasks.task_one.inputs = [{ owner: 'future', contract: 'input' }]; assert.throws(() => preflight(f.cfg, f.run)); writeFileSync(join(f.root, 'outside.txt'), 'oops'); const base = git(f.root, ['rev-parse', 'HEAD']); assert.throws(() => guardDiff(f.cfg, 'task_one', f.root, base, ['value.txt'])); });
 test('real CLI failure repairs in isolation, verifies, publishes and requeues', { timeout: 180000 }, async () => { const f = fixture(); const result = await reliable('run', f.path); assert.equal(loadRun(join(f.root, 'dag.run.json')).tasks.task_one.status, 'completed', JSON.stringify(result)); assert.equal(result.metrics.automaticallyResolved, 1); assert.equal(readFileSync(join(f.root, 'value.txt'), 'utf8'), 'bad'); assert.equal(git(f.root, ['show', `dag/${f.run.id}:value.txt`]), 'good'); const again = await reliable('resume', f.path); assert.equal(again.metrics.automaticallyResolved, 1); });
+test('real recovery of a shared producer excludes unfinished descendant acceptance', { timeout: 180000 }, async () => {
+    const f = fixture();
+    writeFileSync(join(f.root, 'cli.txt'), 'consumer');
+    writeFileSync(join(f.root, 'accepted-check.mjs'), "console.log('accepted producer invariant retained')");
+    writeFileSync(join(f.root, 'future-check.mjs'), "throw Error('unfinished descendant must not be required')");
+    writeFileSync(join(f.root, 'diagnose.mjs'), "console.log('DAG_DIAGNOSIS: '+JSON.stringify({failure:{version:1,code:'ownership',stage:'work',owner:'producer',evidence:['consumer requires producer correction']},requestedFiles:['value.txt']}))");
+    git(f.root, ['add', '.']); git(f.root, ['commit', '-m', 'shared producer fixture']);
+    addTask(f.run, { id: 'task_producer', title: 'accepted producer', spec: 'Prior producer invariant.', cmd: 'node accepted-check.mjs' });
+    f.run.tasks.task_producer.status = 'completed';
+    f.run.tasks.task_one.deps = ['task_producer'];
+    addTask(f.run, { id: 'task_future', title: 'future shared-file owner', spec: 'Future behavior.', deps: ['task_one'], cmd: null });
+    saveRun(f.run, join(f.root, 'dag.run.json'));
+    f.cfg.tasks.task_one.entryPoint = 'cli.txt';
+    f.cfg.tasks.task_one.files[0] = { path: 'cli.txt', role: 'implementation' };
+    for (const [id, check] of [['task_producer','accepted-check.mjs'], ['task_future','future-check.mjs']])
+        f.cfg.tasks[id] = { deterministic: true, entryPoint: 'value.txt', reviewBoundary: 'R1', requirements: ['R1'], files: [{path:'value.txt',role:'implementation'}], checks:[cmd(check)] };
+    writeFileSync(f.path, JSON.stringify(f.cfg));
+    await reliable('run', f.path);
+    const run = loadRun(join(f.root, 'dag.run.json'));
+    assert.equal(run.tasks.task_one.status, 'completed');
+    assert.equal(run.tasks.task_future.status, 'pending');
+    const state = JSON.parse(readFileSync(join(f.root, 'dag.run.d/reliability/controller.json'),'utf8'));
+    const incident = Object.values(state.incidents).find(i=>i.taskId==='task_one');
+    assert.deepEqual(incident.checkReceipts.map(r=>r.command.args[0]), ['check.mjs','accepted-check.mjs']);
+    assert.equal(incident.phase, 'resolved');
+});
 for (const phase of ['verify', 'commit', 'publish', 'published'])
     test(`installed recovery resumes durable ${phase} boundary without duplicate publication`, { timeout: 180000 }, async () => {
         const f = fixture();

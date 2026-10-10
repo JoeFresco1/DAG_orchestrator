@@ -132,6 +132,15 @@ export function repairScope(cfg, run, id, requested = []) {
         throw new Error('Repair scope exceeds 64 files');
     return [...files];
 }
+// File ownership is shared across sequential units. Regression obligations
+// follow accepted behavior, never the mere presence of a future file owner.
+export function repairCheckOwners(cfg, run, id, scope) {
+    const expanded = scope.filter(path => !cfg.tasks[id].files.some(f => f.path === path));
+    return Object.entries(cfg.tasks)
+        .filter(([owner, unit]) => owner !== id && run.tasks[owner]?.status === 'completed' &&
+            unit.files.some(f => f.role === 'implementation' && expanded.includes(f.path)))
+        .map(([owner, unit]) => ({ owner, unit }));
+}
 export function chooseBatch(cfg, run, suspended = new Set()) {
     const chosen = [], used = {}, writes = new Set();
     for (const t of Object.values(run.tasks).sort((a, b) => (a.seq || 0) - (b.seq || 0))) {
