@@ -37,3 +37,9 @@ The amendment tool refuses an active controller, saves prior graph/configuration
 The stopped old incident is retained as superseded history. New task work starts from the amended accepted integration baseline. The current CLI task retains its ID and attempt history but waits behind the newly explicit runtime producers.
 
 The existing shared acceptance resource serializes admissions. This repair does not increase concurrency to mask dependency errors. Model cost is unavailable; existing time and attempt caps remain in force.
+
+## Restart verification
+
+The amendment applied successfully at 2026-10-10 02:36:59 UTC: 185 registered tasks, 68 accepted records unchanged, 117 pending; deadline and counters matched the saved baseline.
+
+The first restart exposed a coordinator-introduced adapter error: `--approve-for-me` conflicts with `--sandbox workspace-write`. Codex exited during argument parsing, before model work. Removed the redundant sandbox option (`--approve-for-me` already selects workspace-write), retained explicit `--cd`, verified argument parsing locally, and released the environment suspension through `reliable amend` and `dag retry`. The failed startup receipts and infrastructure counts remain recorded; semantic/model counters were not reset.

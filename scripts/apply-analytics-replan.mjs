@@ -86,7 +86,8 @@ cfg.tasks=tasks;put(control,'docs/build/reliability.json',cfg);
 // Prompt handoff fixes: explicit workspace, concise interfaces, exact skill path,
 // typed environment refusal, and no generic whole-feature setup loop per unit.
 let source=fs.readFileSync(adapter,'utf8');
-source=source.replace("'--ignore-user-config', '--approve-for-me', '-m'","'--ignore-user-config', '--approve-for-me', '--sandbox', 'workspace-write', '--cd', cwd, '-m'");
+// approve-for-me already selects workspace-write and conflicts with --sandbox.
+source=source.replace("'--ignore-user-config', '--approve-for-me', '-m'","'--ignore-user-config', '--approve-for-me', '--cd', cwd, '-m'");
 source=source.replace('Read the relevant Spec Kit implement skill and apply within this boundary.', 'Spec Kit planning is already complete and this registered unit is authorized. The repository skill is .agents/skills/speckit-implement/SKILL.md; its whole-feature planning, setup-file edits and interactive checklist gate are handled by the coordinator. Execute only this unit with its frozen requirements and passing scope tests. Before implementation, prove write access through your actual shell by creating and removing an ignored .dag-build scratch file; if that operation is denied, return a typed DAG_FAILURE environment packet with the actual error. Do not infer read-only access from an assumption.');
 source=source.replace('const cwd = process.cwd();',"const handoffPath = join(control, 'docs/build/task-handoffs.json');\nconst handoff = existsSync(handoffPath) ? JSON.parse(readFileSync(handoffPath, 'utf8'))[key] : null;\nconst cwd = process.cwd();");
 source=source.replace('Accepted review boundary: ${config.tasks[taskId].reviewBoundary}.', 'Producer/consumer handoff: ${JSON.stringify(handoff ? { consumes: handoff.consumes, produces: handoff.produces, laterOwners: handoff.laterOwners } : null)}. Accepted review boundary: ${config.tasks[taskId].reviewBoundary}.');
