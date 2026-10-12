@@ -31,6 +31,12 @@ afterEach(() => { for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive:
 const id = (key: string): `code:v1:${string}` => `code:v1:${key}`;
 
 describe('deterministic TypeScript code graph', () => {
+  it('test imports can target interface contracts and inferred schemas during planning review', () => {
+    const root = fixture();
+    writeFileSync(path.join(root, 'test/contracts.test.ts'), "import type { CaseSchema } from '../src/case-schema.js';\nconst value: CaseSchema = { id: '1' };\n");
+    const graph = buildCodeGraph({ rootDir: root });
+    assert.ok(graph.graph.edges.some(e => e.type === 'tests' && e.from === id('file/test/contracts.test.ts') && e.to === id('symbol/src/case-schema.ts#CaseSchema')));
+  });
   it('indexes file and symbol identities, imports, calls, tests, schemas, and requirement tags', () => {
     const root = fixture();
     const graph = buildCodeGraph({ rootDir: root });

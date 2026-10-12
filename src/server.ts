@@ -211,10 +211,13 @@ async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult
     // Split the selection into runnable tasks and manual ones (no cmd and no
     // chain). Manuals are reported as skipped; only runnables form the scope.
     const candidates = opts.ids ?? Object.keys(run.tasks);
-    const manual = candidates.filter(
-      (id) => !run.tasks[id].cmd && (run.tasks[id].status === 'pending' || run.tasks[id].status === 'ready'),
+    const runnable = (id: string): boolean => Boolean(
+      run.tasks[id].cmd || (run.tasks[id].harnessChain ?? run.settings.harnessChain ?? []).length,
     );
-    const scope = candidates.filter((id) => run.tasks[id].cmd);
+    const manual = candidates.filter(
+      (id) => !runnable(id) && (run.tasks[id].status === 'pending' || run.tasks[id].status === 'ready'),
+    );
+    const scope = candidates.filter(runnable);
     if (scope.length === 0) {
       lock();
       return {

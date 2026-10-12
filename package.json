@@ -17,7 +17,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/vendor-viewer.mjs",
-    "test": "npm run build && node --test dist/**/*.test.js",
+    "test": "npm run build && node scripts/run-tests.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dag": "tsx src/cli.ts",
     "smoke:viewer": "node scripts/smoke-viewer.mjs"

@@ -123,7 +123,7 @@ const INTERNAL_EDGE_RULES: Record<FactoryEntityKind, Record<string, [string[], s
     subscribes: [['symbol', 'function'], ['event', 'queue']],
     serializes: [['symbol', 'function'], ['data', 'schema', 'api']],
     deserializes: [['symbol', 'function'], ['data', 'schema', 'api']],
-    tests: [['file', 'symbol', 'function', 'class', 'contract', 'execution_path'], ['file', 'symbol', 'function', 'class']],
+    tests: [['file', 'symbol', 'function', 'class', 'contract', 'execution_path'], ['file', 'symbol', 'function', 'class', 'api', 'contract', 'data', 'schema', 'database_model', 'queue', 'event']],
   },
   execution: {
     depends_on: [['implementation_task', 'review_task', 'verification_task', 'remediation_task'], ['implementation_task', 'review_task', 'verification_task', 'remediation_task']],

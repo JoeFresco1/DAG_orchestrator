@@ -272,7 +272,7 @@ export function validateCodeGraphIndex(value: unknown): asserts value is CodeGra
     subscribes: [['symbol', 'function'], ['event', 'queue']],
     serializes: [['symbol', 'function'], ['data', 'schema', 'api']],
     deserializes: [['symbol', 'function'], ['data', 'schema', 'api']],
-    tests: [['file', 'symbol', 'function', 'class', 'contract', 'execution_path'], ['file', 'symbol', 'function', 'class']],
+    tests: [['file', 'symbol', 'function', 'class', 'contract', 'execution_path'], ['file', 'symbol', 'function', 'class', 'api', 'contract', 'data', 'schema', 'database_model', 'queue', 'event']],
   };
   for (const edge of value.graph.edges as unknown[]) {
     if (!isRecord(edge) || typeof edge.type !== 'string' || !edgeKinds[edge.type] || typeof edge.from !== 'string' || typeof edge.to !== 'string') throw new Error('invalid or dangling code graph edge');
