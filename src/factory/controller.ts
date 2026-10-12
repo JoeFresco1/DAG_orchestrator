@@ -43,6 +43,10 @@ import { accountReviewUsage, createReviewBudget } from './review-budget.js';
 import { calculateRiskCoverage } from './risk-coverage.js';
 import { rankReviewableUnits } from './risk.js';
 import { summarizeFactoryTelemetry } from './telemetry.js';
+import type { PlanningManifest } from '../planning/contracts.js';
+import { validatePlan } from '../planning/validation.js';
+import { compilePlan, attachPlanning, checkCommand, planningDefinition } from '../planning/compile.js';
+import { missingPlanningAcceptance } from '../planning/runtime.js';
 
 export interface FactoryRequirementInput {
   id: string;
@@ -73,6 +77,9 @@ export interface FactoryCheckInput {
 
 export interface StructuredFactoryGoal {
   schemaVersion: 1;
+  /** Internal normalized view of explicitly upgraded schemaVersion 2 input. */
+  planning?: PlanningManifest;
+  planningReview?: import('../planning/contracts.js').PlanningReview;
   mode?: 'build' | 'review';
   goal: { id: string; title: string; description: string };
   requirements: FactoryRequirementInput[];
@@ -90,6 +97,52 @@ export interface StructuredFactoryGoal {
   coverage: { criticalFlow: number; weightedRisk: number };
   certificationPolicy?: BaselinePolicy;
   convergencePolicy?: ConvergencePolicy;
+}
+
+export interface StructuredFactoryGoalV2 extends Omit<StructuredFactoryGoal, 'schemaVersion' | 'implementation' | 'requirements' | 'checks' | 'planning'> {
+  schemaVersion: 2;
+  planning: PlanningManifest;
+  /** Existing project certification checks, distinct from task-local acceptance. */
+  checks?: FactoryCheckInput[];
+}
+
+/** Factory orchestration consumes a generated view of the canonical contract. */
+export function normalizeFactoryGoal(input: StructuredFactoryGoal | StructuredFactoryGoalV2): StructuredFactoryGoal {
+  if (input.schemaVersion === 1) return input;
+  if (input.schemaVersion !== 2) throw Error('Unsupported structured factory goal version');
+  if ('implementation' in input || 'requirements' in input) throw Error('Version 2 factory goals must not define competing implementation or requirement records');
+  const plan = input.planning, report = validatePlan(plan);
+  if (!report.valid) throw Error(`Invalid factory planning contract: ${report.findings.map(f => `${f.rule}: ${f.message}`).join('; ')}`);
+  if (input.mode === 'review') throw Error('Use legacy review-only goals for existing-repository review; version 2 plans describe executable task ownership');
+  const compiled = compilePlan(plan);
+  return { ...input, schemaVersion: 1, planning: plan,
+    requirements: plan.requirements.map(r => ({ id: r.id, title: r.title, description: r.description,
+      acceptanceCriteria: r.acceptance.map(id => plan.criteria.find(c => c.id === id)!.text) })),
+    implementation: plan.tasks.map(t => ({ id: t.id, title: t.title, spec: compiled.tasks[t.id]!.spec, cmd: compiled.tasks[t.id]!.cmd!,
+      deps: compiled.tasks[t.id]!.deps, requirementIds: t.requirements,
+      codeUnits: (t.files ?? []).filter(f => f.role !== 'frozen').map(f => f.path), reviewCmd: t.reviewCmd, maxAttempts: t.maxAttempts })),
+    checks: [...(input.checks ?? []), ...plan.tasks.flatMap(t => t.checks.map(c => ({ id: `${t.id}/${c.id}`, title: `${t.title}: ${c.id}`, cmd: checkCommand(c), requirementIds: t.requirements })))],
+  };
+}
+
+/** Explicit fresh-goal upgrade: require authored ownership, never guess it from prose. */
+export function upgradeFactoryGoal(legacy: StructuredFactoryGoal, planning: PlanningManifest): StructuredFactoryGoalV2 {
+  if (legacy.schemaVersion !== 1 || legacy.mode === 'review') throw Error('Upgrade requires a version 1 implementation goal');
+  const upgraded: StructuredFactoryGoalV2 = { ...legacy, schemaVersion: 2, planning };
+  delete (upgraded as unknown as Record<string, unknown>).implementation;
+  delete (upgraded as unknown as Record<string, unknown>).requirements;
+  const generated = normalizeFactoryGoal(upgraded);
+  for (const original of legacy.requirements) {
+    const replacement = generated.requirements.find(r => r.id === original.id);
+    if (!replacement || replacement.description !== original.description) throw Error(`Upgrade loses original requirement acceptance: ${original.id}`);
+    const remaining = [...replacement.acceptanceCriteria];
+    for (const text of original.acceptanceCriteria) {
+      const index = remaining.indexOf(text);
+      if (index < 0) throw Error(`Upgrade loses original requirement acceptance: ${original.id}`);
+      remaining.splice(index, 1);
+    }
+  }
+  return upgraded;
 }
 
 export type FactoryStage = 'implementation' | 'quality' | 'verification' | 'root_cause' | 'report' | 'reported' | 'remediation' | 'remediation_verification' | 'recertification' | 'convergence' | 'complete';
@@ -157,10 +210,11 @@ const NOOP_CMD = 'node -e "process.exit(0)"';
 
 /** Create and execute a factory run. Repeating start with the same goal resumes it. */
 export async function startFactory(
-  goal: StructuredFactoryGoal,
+  inputGoal: StructuredFactoryGoal | StructuredFactoryGoalV2,
   runFile: string,
   options: FactoryControllerOptions = {},
 ): Promise<FactoryControllerResult> {
+  const goal = normalizeFactoryGoal(inputGoal);
   validateFactoryGoal(goal);
   const file = resolve(runFile);
   const paths = runPaths(file);
@@ -1128,6 +1182,26 @@ function compileImplementationTasks(
   graph: FactoryGraphModel,
   goalHash: string,
 ): void {
+  if (goal.planning) {
+    const compiled = compilePlan(goal.planning);
+    for (const input of Object.values(compiled.tasks)) {
+      const task = ensureTask(run, input.id, { title: input.title, spec: input.spec, deps: input.deps, cmd: input.cmd,
+        reviewCmd: input.reviewCmd, reviewRounds: input.reviewRounds,
+        maxAttempts: input.maxAttempts });
+      state.tasks.implementation[task.id] = task.id;
+      ensureExecutionEntity(graph, task, 'implementation_task');
+    }
+    for (const requirement of goal.planning.requirements) requirement.acceptance.forEach((id, index) => {
+      const criterion = goal.planning!.criteria.find(c => c.id === id)!;
+      const from = requirementId(`acceptance/${goal.goal.id}/${requirement.id}/${index + 1}`), to = executionEntityId(criterion.owner);
+      if (!graph.links.some(l => l.type === 'verified_by' && l.from === from && l.to === to)) graph.links.push({ type: 'verified_by', from, to });
+    });
+    if (!run.planning) {
+      attachPlanning(run, goal.planning);
+      run.planning!.review = goal.planningReview;
+    }
+    return;
+  }
   for (const input of orderedImplementation(goal.implementation)) {
     const deps = (input.deps ?? []).map((id) => {
       const dependency = state.tasks.implementation[id];
@@ -1270,7 +1344,7 @@ function attachCodeGraph(model: FactoryGraphModel, index: CodeGraphIndex, goal: 
     if (link.type === 'implemented_by') addCrossLink(model, { type: 'implemented_by', from: link.from as `requirement:v1:${string}`, to: link.to as `code:v1:${string}` });
   }
   for (const task of goal.implementation) {
-    const executionId = executionEntityId(taskId(goalHash, 'implementation', task.id));
+    const executionId = executionEntityId(goal.planning ? task.id : taskId(goalHash, 'implementation', task.id));
     for (const path of task.codeUnits) {
       const symbolId = syntheticSymbolId(goal, task.id, normalizeRepoPath(path));
       addCrossLink(model, { type: 'modified_by', from: symbolId, to: executionId });
@@ -1324,6 +1398,8 @@ function qualityEvidence(file: string, state: FactoryControllerState, run: Run, 
   deterministicChecks: CertificationInput['deterministicChecks'];
   reviewEvidence: CertificationInput['reviewEvidence'][number];
 } {
+  const missing = missingPlanningAcceptance(run);
+  if (missing.length) throw Error(`Missing original planning acceptance evidence: ${missing.join(', ')}`);
   const deterministicChecks = goal.checks.map((check) => {
     const task = requiredTask(run, state.tasks.checks[check.id], `quality check ${check.id}`);
     const evidence = evidenceForTask(file, run, task, 'command');
@@ -1363,6 +1439,7 @@ function renderReviewSpec(goal: StructuredFactoryGoal, file: string, index: Code
       ? `Review the existing application for goal ${goal.goal.id}: ${goal.goal.title}. Do not schedule new implementation work.`
       : `Review the completed implementation for goal ${goal.goal.id}: ${goal.goal.title}.`,
     `Requirements: ${JSON.stringify(goal.requirements)}.`,
+    ...(goal.planning ? [`Criterion verification ownership: ${JSON.stringify(goal.planning.criteria)}. Verify every original criterion; downstream obligations remain required at their named verification stage.`] : []),
     `Code scope: ${(goal.mode === 'review' ? reviewCodePaths(goal, index) :
       [...new Set(goal.implementation.flatMap((task) => task.codeUnits.map(normalizeRepoPath)))].sort()).join(', ')}.`,
     ...(sourceRunContext ? [sourceRunContext] : []),
@@ -1433,12 +1510,22 @@ function ensureTask(run: Run, id: string, input: Parameters<typeof addTask>[1]):
     const matches = prior.title === input.title && prior.spec === input.spec &&
       JSON.stringify(prior.deps) === JSON.stringify([...new Set(input.deps ?? [])]) &&
       prior.cmd === (input.cmd ?? null) && prior.reviewCmd === (input.reviewCmd ?? null) &&
-      prior.reviewRounds === (input.reviewRounds ?? 0) && prior.maxAttempts === (input.maxAttempts ?? run.settings.maxAttempts) &&
+      prior.reviewRounds === (input.reviewRounds ?? 0) &&
+      prior.maxAttempts === (input.maxAttempts ?? run.settings.maxAttempts) &&
       JSON.stringify(prior.reviewers) === JSON.stringify(input.reviewers ?? []);
     if (!matches) throw new Error(`persisted factory task does not match its compiler input: ${id}`);
+    registerFactoryGeneratedTask(run, prior);
     return prior;
   }
-  return addTask(run, { ...input, id });
+  const task = addTask(run, { ...input, id });
+  registerFactoryGeneratedTask(run, task);
+  return task;
+}
+
+function registerFactoryGeneratedTask(run: Run, task: Task): void {
+  if (run.planning && !run.planning.manifest.tasks.some(t => t.id === task.id)) {
+    (run.planning.generated ??= {})[task.id] = planningDefinition(task);
+  }
 }
 
 function stageTaskIds(state: FactoryControllerState): string[] {
@@ -1600,6 +1687,10 @@ function validateFactoryGoal(value: unknown): asserts value is StructuredFactory
     requirementIds.add(requirement.id);
   }
   const implementation = value.implementation as FactoryImplementationInput[];
+  if (value.planning !== undefined) {
+    const planning = validatePlan(value.planning);
+    if (!planning.valid) throw Error(`Invalid factory plan: ${planning.findings.map(f => f.message).join('; ')}`);
+  }
   if (value.mode !== undefined && value.mode !== 'build' && value.mode !== 'review') throw new Error('factory mode must be build or review');
   if (value.mode === 'review') {
     if (implementation.length !== 0) throw new Error('review-only factory must not schedule implementation tasks');
@@ -1614,7 +1705,7 @@ function validateFactoryGoal(value: unknown): asserts value is StructuredFactory
   const implementationIds = new Set<string>();
   for (const task of implementation) {
     if (!isRecord(task) || !nonempty(task.id) || !nonempty(task.title) || !nonempty(task.spec) || !nonempty(task.cmd) ||
-      !Array.isArray(task.requirementIds) || task.requirementIds.length === 0 || !Array.isArray(task.codeUnits) || task.codeUnits.length === 0) {
+      !Array.isArray(task.requirementIds) || !value.planning && task.requirementIds.length === 0 || !Array.isArray(task.codeUnits) || !value.planning && task.codeUnits.length === 0) {
       throw new Error('each implementation task needs id, title, spec, cmd, requirementIds, and codeUnits');
     }
     if (implementationIds.has(task.id)) throw new Error(`duplicate implementation task id: ${task.id}`);

@@ -47,9 +47,11 @@ import { factoryCmd } from './factory.js';
 import { neutralRunCmd } from './neutral.js';
 import { diagnoseCmd } from './diagnostics.js';
 import { reliableCmd } from './reliability.js';
+import { planningCmd } from './planning.js';
 
 /** Maps `dag <name>` to its handler; aliases share one handler on purpose. */
 export const COMMANDS: Record<string, CommandHandler> = {
+  plan: planningCmd,
   reliable: reliableCmd,
   // Viewer / server
   serve: serveCmd,

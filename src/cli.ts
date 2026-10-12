@@ -7,6 +7,10 @@ import { COMMANDS } from './commands/index.js';
 const HELP = `DAG Orchestrator
 usage: dag <cmd> [flags]
 
+  plan validate|review|compile --plan plan.json [--file F] [--json]
+  plan amend --plan plan.json --file F --reason R
+  plan proposal --file F
+
   reliable preflight|run|resume|status|audit --config F
                                bounded recovery with ownership and structured review
   reliable amend --config F --reason R [--release task_a,task_b]

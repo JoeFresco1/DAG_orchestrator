@@ -499,6 +499,7 @@ function definitionOf(run: Run): Record<string, unknown> {
     objective: run.objective,
     createdAt: run.createdAt,
     settings: run.settings,
+    planning: run.planning,
     tasks,
   };
 }
@@ -515,6 +516,7 @@ function stateOf(run: Run): Record<string, unknown> {
     updatedAt: run.updatedAt,
     rev: run.rev,
     eventSeq: run.eventSeq,
+    planningState: run.planningState,
     tasks,
   };
 }
@@ -548,6 +550,7 @@ export function newRun(objective: string): Run {
 }
 
 interface StoredDefinition {
+  planning?: Run['planning'];
   storageVersion?: number;
   id: string;
   objective: string;
@@ -562,6 +565,7 @@ interface StoredDefinition {
 }
 
 interface StoredState {
+  planningState?: Run['planningState'];
   updatedAt?: string;
   rev?: number;
   eventSeq?: number;
@@ -634,11 +638,16 @@ export function loadRun(file: string): Run {
   run.settings = { ...DEFAULT_SETTINGS, ...(def.settings ?? {}) };
 
   const state = readJsonWithBackup<StoredState>(paths.state);
+  if (def.planning && (!state || Object.keys(def.tasks ?? {}).some(id => !state.tasks?.[id]))) {
+    throw Error('Invalid persisted planning task checkpoint; preserve artifacts and resume stopped amendment');
+  }
   const legacy = !state && (def.storageVersion ?? 1) < STORAGE_VERSION;
   const dynamic = state?.tasks ?? {};
   run.updatedAt = state?.updatedAt ?? def.updatedAt ?? run.createdAt;
   run.rev = state?.rev ?? def.rev ?? 0;
   run.eventSeq = state?.eventSeq ?? def.eventSeq ?? 0;
+  run.planning = def.planning;
+  run.planningState = state?.planningState;
 
   let index = 0;
   for (const [id, raw] of Object.entries(def.tasks ?? {})) {
@@ -883,6 +892,7 @@ export interface EditTaskInput {
 export function editTask(run: Run, id: string, patch: EditTaskInput): Task {
   const task = run.tasks[id];
   if (!task) throw new Error(`unknown task ${id}`);
+  assertPlanningPatch(run, patch);
   const prev = { ...task, deps: [...task.deps] };
   if (patch.title !== undefined) task.title = patch.title;
   if (patch.spec !== undefined) task.spec = patch.spec;
@@ -923,6 +933,7 @@ export function editTask(run: Run, id: string, patch: EditTaskInput): Task {
 // keeps a dependent blocked forever.
 export function removeTask(run: Run, id: string): void {
   if (!run.tasks[id]) throw new Error(`unknown task ${id}`);
+  if (run.planning) throw new Error('Contract-managed tasks must be removed through stopped dag plan amend');
   delete run.tasks[id];
   for (const t of Object.values(run.tasks)) {
     t.deps = t.deps.filter((d) => d !== id);
@@ -1172,6 +1183,7 @@ export interface TaskSelector {
 // Bulk edit: point many tasks at the same harness, policy, or budgets at
 // once. Skips running tasks; `reviewCmd: null` clears the reviewer.
 export function setTasks(run: Run, patch: TaskPatch, selector: TaskSelector): string[] {
+  assertPlanningPatch(run, patch);
   const only = selector.only && selector.only.length > 0 ? new Set(selector.only) : null;
   const re = selector.match ? new RegExp(selector.match, 'i') : null;
   if (!selector.all && !only && !re) {
@@ -1239,6 +1251,13 @@ export function setTasks(run: Run, patch: TaskPatch, selector: TaskSelector): st
   }
   if (changed.length > 0) touch(run);
   return changed;
+}
+
+function assertPlanningPatch(run: Run, patch: object): void {
+  if (run.planning && ['title', 'spec', 'deps', 'cmd', 'reviewCmd', 'reviewers', 'planCmd', 'prepareCmd', 'harnessChain', 'covers']
+    .some(key => Object.prototype.hasOwnProperty.call(patch, key))) {
+    throw new Error('Compiled planning definitions are authoritative; use stopped dag plan amend');
+  }
 }
 
 // Point many tasks at the same harness at once: `--all`, `--only a,b`, or a

@@ -1,8 +1,13 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { createWriteStream, existsSync, mkdirSync, rmSync, statSync, writeFileSync, type WriteStream } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, type WriteStream } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { resolveCommand } from './command-resolution.js';
+import { planningRefusal, planningAdmitted, planningProbes, recordPlanningAcceptance, recordPlanningFailure, missingPlanningAcceptance } from './planning/runtime.js';
+import { checkCommand } from './planning/compile.js';
+import { forwardReferenceFailure } from './planning/acceptance-lint.js';
+import { digest, type PlanningFinding } from './planning/contracts.js';
+import { validatePlan } from './planning/validation.js';
 import {
   commitAll,
   createTaskWorktree,
@@ -423,6 +428,7 @@ export interface RunnerOptions {
 
 /** Final buckets for a settled run, plus recovery and end-of-run review facts. */
 export interface RunSummary {
+  planningError?: string;
   scope: string[];
   completed: string[];
   failed: string[];
@@ -536,6 +542,13 @@ export class DagRunner {
   // Resolves when the run settles or stops. Never rejects.
   async start(scope: Set<string> | null = null): Promise<void> {
     if (this.active) return this.loopPromise ?? Promise.resolve();
+    const planningError = planningRefusal(this.state, this.opts.cwd ?? (this.opts.file ? dirname(resolve(this.opts.file)) : process.cwd()), this.opts.file ? runPaths(this.opts.file).dir : undefined);
+    if (planningError) {
+      const ids = [...(scope ?? Object.keys(this.state.tasks))];
+      this.log('note', null, planningError);
+      this.summary = { planningError, scope: ids, completed: [], failed: ids, skipped: [], unfinished: ids, stopped: true, budgetReached: false, interrupted: { requeued: [], orphanPids: [] }, finalReview: null };
+      return;
+    }
 
     // A run file can be hand-edited or written by an older version: an
     // invalid policy must refuse execution instead of silently changing the
@@ -926,6 +939,7 @@ export class DagRunner {
           if (task.status !== 'pending' && task.status !== 'ready') continue;
           if (this.inFlight.has(task.id)) continue;
           if (gateBlocks(task) || !depsMet(task, run.tasks)) continue;
+          if (!planningAdmitted(run, task.id, this.inFlight.keys())) continue;
           if (
             task.deps.some((d) => {
               const dep = run.tasks[d];
@@ -956,6 +970,10 @@ export class DagRunner {
         : [...scope].filter((id) => run.tasks[id]);
     const completed = scoped.filter((id) => run.tasks[id].status === 'completed');
     const failed = scoped.filter((id) => run.tasks[id].status === 'failed');
+    for (const criterion of missingPlanningAcceptance(run)) {
+      const owner = run.planning!.manifest.criteria.find(c => c.id === criterion)!.owner;
+      if (scoped.includes(owner) && !failed.includes(owner)) failed.push(owner);
+    }
     const skipped = scoped.filter((id) => run.tasks[id].status === 'skipped');
     const unfinished = scoped.filter((id) => !isTerminal(run.tasks[id].status));
     this.summary = {
@@ -1338,6 +1356,10 @@ export class DagRunner {
       this.reasons.set(task.id, 'plan');
       throw err;
     }
+    if (outcome.exitCode !== 0) {
+      const findings = forwardReferenceFailure(this.state, task.id, outcome.output, worktreePath ?? this.opts.cwd ?? process.cwd());
+      if (findings.length) throw Object.assign(new Error(outcome.output), { kind: 'plan', planningFindings: findings });
+    }
     task.plan = truncate(stripAnsi(outcome.output).trim(), PLAN_LIMIT) || '(empty plan)';
     this.log('task-plan', task.id, `plan ready (${task.plan.length} chars)`);
     return 'ok';
@@ -1647,7 +1669,18 @@ export class DagRunner {
         reviewerExit = outcome.exitCode;
         task.reviewExitCode = outcome.exitCode;
         cleaned = stripAnsi(outcome.output).trim();
+        if (outcome.exitCode !== 0) {
+          const findings = forwardReferenceFailure(this.state, task.id, cleaned, worktreePath ?? this.opts.cwd ?? process.cwd());
+          if (findings.length) throw Object.assign(new Error(cleaned), { kind: 'review', planningFindings: findings });
+        }
+        const planningPacket = cleaned.split(/\r?\n/).find(line => line.startsWith('DAG_PLANNING_FINDINGS: '));
+        if (planningPacket && this.state.planning) {
+          const findings: PlanningFinding[] = JSON.parse(planningPacket.slice('DAG_PLANNING_FINDINGS: '.length));
+          throw Object.assign(new Error(`Reviewer identified planning defect: ${JSON.stringify(findings)}`), { kind: 'review', planningFindings: findings });
+        }
+
       } catch (err) {
+        if ((err as { planningFindings?: PlanningFinding[] }).planningFindings) throw err;
         const reason: FailureKind =
           this.reasons.get(task.id) ?? (err as { kind?: FailureKind }).kind ?? 'exit';
         const message = err instanceof Error ? err.message : String(err);
@@ -2277,6 +2310,17 @@ export class DagRunner {
         return;
       }
 
+      const declaredInputs = this.state.planning?.manifest.tasks.find(t => t.id === task.id)?.inputs ?? [];
+      for (const [index, probe] of planningProbes(this.state, task).entries()) {
+        const checked = await this.runPhase({ ...task, timeoutMs: probe.timeoutMs }, execute, checkCommand(probe), 'run', worktreePath ?? undefined);
+        if (checked.exitCode !== 0) {
+          const input = declaredInputs[index]!, producer = input.baseline ? undefined : this.state.planning!.manifest.tasks.find(t => (t.provides ?? []).some(p => p.id === input.capability) && (!input.owner || input.owner === t.id));
+          const finding: PlanningFinding = { id: `input:${task.id}:${input.capability}`, rule: 'capability.missing', tasks: [task.id], references: [input.capability], evidence: [input.contract, `Readiness check ${probe.id} exited ${checked.exitCode}`, checked.output || 'No checker output'], severity: 'error', blocking: true, message: `Declared prerequisite unavailable: ${input.capability}`, correction: 'Verify the producer or baseline readiness evidence; correct the prerequisite before retrying this consumer' };
+          const planningFindings = [finding];
+          throw Object.assign(new Error('DAG_FAILURE: ' + JSON.stringify({ version: 1, code: producer ? 'ownership' : 'implementation', category: 'missing_prerequisite', stage: 'input-check', owner: producer?.id ?? task.id, capability: input.capability, evidence: finding.evidence, planningFindings })), { kind: 'review', planningFindings });
+        }
+      }
+
       // Planning phase first: the work command follows {plan} / {planFile}.
       if (chained.planCmd && !this.opts.controllerManaged) {
         const planned = await this.plan(
@@ -2326,12 +2370,28 @@ export class DagRunner {
       );
       if (this.tokens.get(task.id) !== token) return;
 
+      if (outcome.exitCode !== 0) {
+        const findings = forwardReferenceFailure(this.state, task.id, outcome.output, worktreePath ?? this.opts.cwd ?? process.cwd());
+        if (findings.length) throw Object.assign(new Error(outcome.output), { kind: 'review', planningFindings: findings });
+      }
       this.applyChainReviewVerdict(task, outcome, task.attempts);
+
+      const planningPacket = outcome.output.split(/\r?\n/).find(line => line.startsWith('DAG_PLANNING_FINDINGS: '));
+      if (planningPacket) {
+        let findings: PlanningFinding[];
+        try { findings = JSON.parse(planningPacket.slice('DAG_PLANNING_FINDINGS: '.length)); } catch { throw Error('Malformed planning failure findings'); }
+        throw Object.assign(new Error('DAG_FAILURE: ' + JSON.stringify({ version: 1, code: 'implementation', category: 'planning', stage: 'planning', owner: task.id,
+          evidence: findings.map(f => f.message), planningFindings: findings })), { kind: 'review', planningFindings: findings });
+      }
 
       this.enforceExitPolicy(task, outcome);
 
       if (this.opts.contractGuard && worktreePath) await this.opts.contractGuard(task, worktreePath, this.worktreeBases.get(task.id) ?? 'HEAD');
       if (this.opts.postcondition && worktreePath) await this.opts.postcondition(task, worktreePath, this.worktreeBases.get(task.id) ?? 'HEAD');
+
+      const planningContract = this.state.planning?.manifest.tasks.find(t => t.id === task.id);
+      const planningChecks = [...new Map([...(planningContract?.checks ?? []), ...(planningContract?.provides ?? []).map(p => p.check)].map(c => [c.id, c])).values()];
+      const planningOutputs: string[] = [];
 
       const verdict = this.opts.controllerManaged ? 'pass' : await this.reviewPass(task, execute, scope, worktreePath ?? undefined, planFile, depsContext, outcome.exitCode);
       if (this.tokens.get(task.id) !== token) return;
@@ -2342,7 +2402,31 @@ export class DagRunner {
         return;
       }
 
+      // Review/postcondition commands can change files. Acceptance must describe
+      // the artifact that will actually land, rather than its pre-review state.
+      for (const check of planningChecks) {
+        const checked = await this.runPhase({ ...task, timeoutMs: check.timeoutMs }, execute, checkCommand(check), 'run', worktreePath ?? undefined);
+        if (checked.exitCode !== 0) throw Object.assign(new Error(`Task-local acceptance check failed: ${check.id}: ${checked.output}`), { kind: 'review' });
+        planningOutputs.push(`${check.id}:${checked.output}`);
+      }
+
       // Worktree mode: land the work before declaring success.
+      const evidenceRoot = worktreePath ?? this.opts.cwd ?? process.cwd();
+      const files = (planningContract?.files ?? []).map(f => [f.path, existsSync(join(evidenceRoot, f.path)) ? digest(readFileSync(join(evidenceRoot, f.path))) : null]);
+      if (planningContract) {
+        const checked = validatePlan(this.state.planning!.manifest, worktreePath ?? this.opts.cwd ?? process.cwd());
+        if (!checked.valid) throw Object.assign(new Error(`Authoritative planning inputs changed: ${checked.findings.filter(f => f.blocking).map(f => f.message).join('; ')}`), { kind: 'review' });
+        const base = this.worktreeBases.get(task.id);
+        if (worktreePath && base && planningContract.files?.length) {
+          const changed = git(worktreePath, ['diff', '--name-only', '-z', base]);
+          const untracked = git(worktreePath, ['ls-files', '--others', '--exclude-standard', '-z']);
+          if (changed.code || untracked.code) throw new Error('Cannot validate planned write ownership');
+          const allowed = new Set(planningContract.files.filter(f => f.role !== 'frozen').map(f => f.path));
+          const unexpected = [...changed.stdout.split('\0'), ...untracked.stdout.split('\0')].filter(p => p && !allowed.has(p));
+          if (unexpected.length) throw Object.assign(new Error(`Task wrote outside planned ownership: ${unexpected.join(', ')}`), { kind: 'review' });
+        }
+      }
+
       if (this.opts.contractGuard && worktreePath) await this.opts.contractGuard(task, worktreePath, this.worktreeBases.get(task.id) ?? 'HEAD');
       if (worktreePath) {
         const landed = await this.landWorktree(task);
@@ -2352,6 +2436,7 @@ export class DagRunner {
         }
       }
 
+      recordPlanningAcceptance(this.state, task, digest({ revision: this.state.planning?.revision, commit: task.commit, files, outputs: planningOutputs }));
       this.completeAttempt(task, outcome);
     } catch (err) {
       await this.failAttempt(task, err, scope, token);
@@ -2578,6 +2663,14 @@ export class DagRunner {
     const reason: FailureKind =
       this.reasons.get(task.id) ?? (err as { kind?: FailureKind }).kind ?? 'exit';
     const message = err instanceof Error ? err.message : String(err);
+    const observed = forwardReferenceFailure(this.state, task.id, message, this.worktrees.get(task.id) ?? this.opts.cwd ?? process.cwd());
+    const planningFindings = observed.length ? observed : (err as { planningFindings?: PlanningFinding[] }).planningFindings;
+    if (planningFindings && recordPlanningFailure(this.state, task.id, planningFindings)) {
+      task.status = 'pending'; task.failureKind = 'review'; task.result = 'Planning correction required; remaining retry budget preserved';
+      task.finishedAt = nowIso();
+      this.log('note', task.id, `Planning hold: ${JSON.stringify(planningFindings)}`);
+      this.dropWorktree(task.id); this.persist(); return;
+    }
     const exitCode = (err as { exitCode?: number | null }).exitCode ?? null;
     task.finishedAt = nowIso();
     task.result = truncate(message, RESULT_LIMIT);

@@ -371,6 +371,8 @@ export const DEFAULT_SETTINGS: RunSettings = {
 };
 
 export interface Run {
+  planning?: import('./planning/contracts.js').CompiledPlanning;
+  planningState?: import('./planning/contracts.js').PlanningState;
   storageVersion: number;
   id: string;
   objective: string;

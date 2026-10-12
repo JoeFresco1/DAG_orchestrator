@@ -1,16 +1,24 @@
 // Closed-loop software factory commands. Every runnable phase is submitted to
 // the existing DagRunner by the controller; this file only handles CLI I/O.
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { emit, flag, flagRequired, guard, parseList, wantsJson } from '../cli-args.js';
-import { closeFactoryReview, factoryReviewReport, factoryStatus, fixFactoryReview, resumeFactory, startFactory, type StructuredFactoryGoal, type FactoryControllerOptions } from '../factory/controller.js';
+import { closeFactoryReview, factoryReviewReport, factoryStatus, fixFactoryReview, resumeFactory, startFactory, normalizeFactoryGoal, upgradeFactoryGoal, type StructuredFactoryGoal, type StructuredFactoryGoalV2, type FactoryControllerOptions } from '../factory/controller.js';
 import { createRepoReviewGoal } from '../factory/repo-goal.js';
 import { findHarness } from '../harnesses.js';
-import { runPaths } from '../store.js';
+import { atomicWriteJson, runPaths } from '../store.js';
 import type { DagEvent } from '../types.js';
+import { validatePlanningReview } from '../planning/review.js';
 
 export async function factoryCmd(argv: string[]): Promise<void> {
   const subcommand = argv[0] ?? 'status';
+  if (subcommand === 'upgrade') {
+    const output = resolve(flagRequired(argv, 'output'));
+    if (existsSync(output)) throw Error('Factory upgrade requires a fresh output goal');
+    const goal = upgradeFactoryGoal(readGoal(flagRequired(argv, 'goal')), JSON.parse(readFileSync(resolve(flagRequired(argv, 'plan')), 'utf8')));
+    atomicWriteJson(output, goal);
+    emit(argv, { output, schemaVersion: 2 }, () => `Upgraded factory goal saved: ${output}`); return;
+  }
   const file = flag(argv, 'file') ?? (subcommand === 'review' ? 'dag.review.json' : 'dag.run.json');
   if (subcommand === 'status') {
     const result = factoryStatus(file);
@@ -58,7 +66,7 @@ export async function factoryCmd(argv: string[]): Promise<void> {
     : subcommand === 'fix'
       ? await fixFactoryReview(file, options)
       : await startFactory(
-        subcommand === 'review' ? reviewGoalInput(argv) : readGoal(flagRequired(argv, 'goal')),
+        subcommand === 'review' ? reviewGoalInput(argv) : readGoal(flagRequired(argv, 'goal'), flag(argv, 'planning-review')),
         file, options,
       );
   emit(argv, result, () => result.summary);
@@ -90,11 +98,16 @@ function reviewGoal(goal: StructuredFactoryGoal, sourceRunFile: string | undefin
   };
 }
 
-function readGoal(file: string): StructuredFactoryGoal {
+function readGoal(file: string, receiptFile?: string): StructuredFactoryGoal {
   let value: unknown;
   try { value = JSON.parse(readFileSync(file, 'utf8')); }
   catch (error) { throw new Error(`cannot read structured factory goal ${file}: ${error instanceof Error ? error.message : String(error)}`); }
-  return value as StructuredFactoryGoal;
+  const goal = normalizeFactoryGoal(value as StructuredFactoryGoal | StructuredFactoryGoalV2);
+  if (receiptFile) {
+    if (!goal.planning) throw Error('Planning review receipt requires a canonical version 2 goal');
+    goal.planningReview = validatePlanningReview(JSON.parse(readFileSync(resolve(receiptFile), 'utf8')), goal.planning);
+  }
+  return goal;
 }
 
 function readAssessment(file: string): NonNullable<FactoryControllerOptions['convergenceAssessment']> {

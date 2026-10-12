@@ -81,6 +81,7 @@ export interface GraphEdgeTypeByKind {
 }
 
 export type FactoryCrossGraphEdge =
+  | FactoryEdge<'verified_by', FactoryGraphEntityId<'requirement'>, FactoryGraphEntityId<'execution'>>
   | FactoryEdge<'implemented_by', FactoryGraphEntityId<'requirement'>, FactoryGraphEntityId<'code'>> // requirement -> symbol
   | FactoryEdge<'modified_by', FactoryGraphEntityId<'code'>, FactoryGraphEntityId<'execution'>> // code entity -> execution task
   | FactoryEdge<'produced', FactoryGraphEntityId<'execution'>, FactoryGraphEntityId<'defect'>> // execution task -> observation
@@ -140,6 +141,7 @@ const INTERNAL_EDGE_RULES: Record<FactoryEntityKind, Record<string, [string[], s
 };
 
 const CROSS_EDGE_RULES: Record<FactoryCrossGraphEdge['type'], [FactoryEntityKind, string[], FactoryEntityKind, string[]]> = {
+  verified_by: ['requirement', ['acceptance_criterion'], 'execution', ['implementation_task', 'verification_task']],
   implemented_by: ['requirement', ['requirement'], 'code', ['symbol']],
   modified_by: ['code', CODE_ENTITY_KINDS, 'execution', ['implementation_task', 'remediation_task']],
   produced: ['execution', ['implementation_task', 'review_task', 'verification_task', 'remediation_task'], 'defect', ['observation']],

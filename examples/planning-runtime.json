@@ -1,0 +1,28 @@
+{
+  "version": 2,
+  "id": "runtime-example",
+  "title": "Executable acceptance ownership example",
+  "sources": [],
+  "semanticReview": { "mode": "off" },
+  "requirements": [{ "id": "example", "title": "Composed artifact", "description": "Compose the exact ready feature artifact", "acceptance": ["runtime-ready", "feature-ready"] }],
+  "criteria": [
+    { "id": "runtime-ready", "text": "The runtime artifact contains ready", "requirement": "example", "stage": "local", "owner": "task_runtime", "contributors": ["task_runtime"], "checks": ["runtime"] },
+    { "id": "feature-ready", "text": "The composed artifact contains ready feature", "requirement": "example", "stage": "final", "owner": "task_feature", "contributors": ["task_runtime", "task_feature"], "checks": ["feature"], "requires": ["runtime"] }
+  ],
+  "tasks": [
+    {
+      "id": "task_runtime", "title": "Produce runtime artifact", "objective": "Create demo-plan/runtime.txt containing ready", "reviewBoundary": "Runtime artifact only",
+      "requirements": ["example"], "acceptance": ["runtime-ready"], "files": [{ "path": "demo-plan/runtime.txt", "role": "generated" }],
+      "cmd": "node -e \"const fs=require('fs');fs.mkdirSync('demo-plan',{recursive:true});fs.writeFileSync('demo-plan/runtime.txt','ready')\"",
+      "checks": [{ "id": "runtime", "program": "node", "args": ["-e", "if(require('fs').readFileSync('demo-plan/runtime.txt','utf8')!=='ready')process.exit(1)"], "timeoutMs": 10000 }],
+      "provides": [{ "id": "runtime", "contract": "UTF-8 ready artifact", "interface": { "id": "ready-artifact", "version": "1" }, "check": { "id": "runtime", "program": "node", "args": ["-e", "if(require('fs').readFileSync('demo-plan/runtime.txt','utf8')!=='ready')process.exit(1)"], "timeoutMs": 10000 } }]
+    },
+    {
+      "id": "task_feature", "title": "Compose and verify feature artifact", "objective": "Compose runtime contents with the literal feature suffix", "reviewBoundary": "Complete composed artifact",
+      "requirements": ["example"], "acceptance": ["feature-ready"], "files": [{ "path": "demo-plan/feature.txt", "role": "generated" }],
+      "cmd": "node -e \"const fs=require('fs');fs.writeFileSync('demo-plan/feature.txt',fs.readFileSync('demo-plan/runtime.txt','utf8')+' feature')\"",
+      "inputs": [{ "capability": "runtime", "contract": "UTF-8 ready artifact", "interface": { "id": "ready-artifact", "version": "1" } }],
+      "checks": [{ "id": "feature", "program": "node", "args": ["-e", "if(require('fs').readFileSync('demo-plan/feature.txt','utf8')!=='ready feature')process.exit(1)"], "timeoutMs": 10000 }]
+    }
+  ]
+}

@@ -65,6 +65,7 @@ export function addCmd(argv: string[]): void {
   const file = flag(argv, 'file') ?? 'dag.run.json';
   guard(file, argv);
   const run = loadRun(file);
+  if (run.planning) throw Error('Add contract-managed tasks through stopped dag plan amend');
   const title = flag(argv, 'title');
   const spec = flag(argv, 'spec') ?? '';
   if (!title) throw new Error('--title is required');
