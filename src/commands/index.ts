@@ -24,6 +24,7 @@ import {
   chainReviewCmd,
   harnessCmd,
   layersCmd,
+  lintCmd,
   modelsCmd,
   reviewCmd,
   reviewerCmd,
@@ -99,6 +100,7 @@ export const COMMANDS: Record<string, CommandHandler> = {
   dot: dotCmd,
   // Reviews and harnesses
   layers: layersCmd,
+  lint: lintCmd,
   'chain-review': chainReviewCmd,
   review: reviewCmd,
   reviewer: reviewerCmd,

@@ -56,6 +56,23 @@ skips it and the viewer marks it done by hand.
 - Edit anything, any time: `dag edit --id X --spec ... --deps a,b`,
   `dag rm --id X`.
 
+## Depend minimally — keep the graph wide
+
+- Each task depends ONLY on tasks whose outputs it directly consumes
+  (files it reads, APIs it calls, evidence it grades). Never depend on the
+  full chain above a task.
+- A mid-tier task that needs only the root contracts depends only on the
+  root — not on every sibling in between. Chaining everything behind one
+  predecessor means one stalled task blocks the whole run.
+- After wiring, run `dag lint` (and `dag layers` for the wave view):
+  - `redundant-dep`: drop the transitive edge, keep the true prerequisite.
+  - `long-chain` (6+ tasks deep) / `narrow` (never more than 1 wide):
+    fan independent tasks out from their real prerequisite.
+  - `blast-radius`: one task blocking half the run means its downstream
+    deps are over-claimed — re-check each one.
+- `dag add` / `dag edit` warn on redundant deps immediately.
+  `dag lint --strict` exits 1 while warnings remain — use it pre-run or in CI.
+
 ## Run
 
 ```bash

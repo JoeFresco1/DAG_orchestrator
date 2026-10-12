@@ -87,6 +87,7 @@ usage: dag <cmd> [flags]
   final-review [--mode per-task|run] [--rounds N] [--cmd "agent ..."]
   settings --final-review off|per-task|run   end-of-run code review
   layers                       dependency waves in this run
+  lint [--strict]              flag linear chains, redundant deps, narrow graphs
   chain-review --of a,b | --wave N | --from ID | --all [--batch N] [--cmd C]
                                review tasks that review the work of other tasks
   settings [--concurrency N] [--retries N] [--timeout SEC] [--silence SEC]

@@ -9,7 +9,7 @@ import {
   loadRun,
   saveRun,
 } from '../store.js';
-import { computeDepths, topoSort, transitiveDepIds } from '../graph.js';
+import { computeDepths, topoSort, transitiveDepIds, analyzeShape } from '../graph.js';
 import { HARNESSES, findHarness } from '../harnesses.js';
 import { listAgentModels } from '../agent-models.js';
 import { resolveCommand } from '../command-resolution.js';
@@ -52,6 +52,29 @@ export function layersCmd(argv: string[]): void {
       .map((r) => `wave ${r.wave}: ${r.tasks} task(s) — ${r.titles.slice(0, 4).join(' | ')}${r.titles.length > 4 ? ' | …' : ''}`)
       .join('\n'),
   );
+}
+
+// `lint` is the parallelism guardrail: it flags near-linear DAGs before they
+// run. A chain 6+ tasks deep, a redundant dep (reachable via another direct
+// dep), a graph that never runs more than 1 wide, or one task whose stall
+// blocks half the run each produce a warning with a concrete fix. Read-only;
+// `--strict` exits 1 when any warning fires, for CI or pre-run checks.
+export function lintCmd(argv: string[]): void {
+  const file = flag(argv, 'file') ?? 'dag.run.json';
+  const run = loadRun(file);
+  const shape = analyzeShape(run);
+  emit(argv, shape, () => {
+    const lines = [
+      `run ${run.id}: ${shape.tasks} tasks, depth ${shape.depth}, max width ${shape.maxWidth}`,
+      ...(shape.chain.length > 0 ? [`  longest chain: ${shape.chain.join(' -> ')}`] : []),
+      ...(shape.warnings.length === 0
+        ? ['  no shape warnings: independent work fans out, deps are minimal']
+        : ['  warnings:', ...shape.warnings.map((w) => `    [${w.kind}] ${w.message}`)]),
+      ...(has(argv, 'strict') && shape.warnings.length > 0 ? ['  strict: failing (warnings present)'] : []),
+    ];
+    return lines.join('\n');
+  });
+  if (has(argv, 'strict') && shape.warnings.length > 0) process.exitCode = 1;
 }
 
 // `chain-review` creates one review task per chunk of finished tasks. The

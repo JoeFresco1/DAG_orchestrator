@@ -21,6 +21,7 @@ import {
 import {
   deriveStatus,
   describeStuck,
+  findRedundantDeps,
   getBlocked,
   getReady,
   summarize,
@@ -46,6 +47,17 @@ import {
 } from '../cli-args.js';
 import { TASK_STATUSES, type TaskStatus } from '../types.js';
 
+// A redundant dep (reachable via another direct dep) adds blocking without
+// adding order. Warn on stderr so --json stdout stays parseable; the edge is
+// kept, since only the author knows which dep is the true prerequisite.
+function warnRedundant(run: Parameters<typeof findRedundantDeps>[0], id: string): void {
+  for (const r of findRedundantDeps(run, id)) {
+    console.error(
+      `warning: ${r.id} depends on ${r.dep} and ${r.via}, but ${r.dep} is already reachable via ${r.via} — keep only the dep whose output this task directly consumes (dag lint)`,
+    );
+  }
+}
+
 // `add` appends a task to the graph. The spec is required to be self-contained
 // (Inputs/Outputs/Acceptance) but the CLI only enforces title + optional spec,
 // and accepts the same timing/review flags as `edit`.
@@ -68,6 +80,7 @@ export function addCmd(argv: string[]): void {
     cmd: cmdFlag(argv) ?? null,
     ...timing,
   });
+  warnRedundant(run, task.id);
   saveRun(run, file);
   emit(argv, task, () => task.id);
 }
@@ -115,6 +128,7 @@ export function editCmd(argv: string[]): void {
     );
   }
   const task = editTask(run, id, patch);
+  if (patch.deps !== undefined) warnRedundant(run, id);
   saveRun(run, file);
   console.log(`${task.id} ${task.status} deps=[${task.deps.join(',')}] attempts=${task.attempts} total, cycle=${task.attemptsInCycle}/${task.maxAttempts}`);
 }
