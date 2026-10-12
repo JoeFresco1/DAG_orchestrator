@@ -100,6 +100,42 @@ export function findHarness(name: string): Harness | undefined {
   return HARNESSES.find((h) => h.name === name);
 }
 
+// Infer which agent harness a raw command belongs to from its binary prefix,
+// so a task like `opencode run ... {spec}` gets that tool's plan phase even
+// when no harness chain is configured. Plain shell (`pnpm test`, `npm run …`)
+// returns undefined and is never auto-planned.
+export function inferHarnessForCmd(cmd: string | null | undefined): Harness | undefined {
+  if (!cmd || !cmd.trim()) return undefined;
+  const first = cmd.trim().split(/\s+/)[0].toLowerCase();
+  const base = first.split('/').pop()!.split('\\').pop()!.replace(/\.(exe|cmd|bat)$/, '');
+  return HARNESSES.find((h) => h.binary && base === h.binary);
+}
+
+// Effective planning command for a task under the plan-by-default policy:
+//
+// - non-empty task.planCmd wins (explicit authoring, including chain presets
+//   applied via `dag set --harness`);
+// - empty-string planCmd is the explicit opt-out (`--no-plan`);
+// - null planCmd inherits: off when settings.autoPlan is false, otherwise the
+//   chain preset's planCmd when a chain is set, else the planCmd inferred from
+//   the command's own binary prefix. Shell commands resolve to no plan.
+export function effectivePlanCmd(
+  task: { planCmd?: string | null; cmd?: string | null; harnessChain?: { harness: string }[] | null },
+  settings: { autoPlan?: boolean; harnessChain?: { harness: string }[] },
+): string | null {
+  const explicit = task.planCmd;
+  if (explicit !== undefined && explicit !== null && explicit !== '') return explicit;
+  if (explicit === '') return null;
+  if (settings.autoPlan === false) return null;
+  const chain = task.harnessChain ?? settings.harnessChain ?? [];
+  if (chain.length > 0) {
+    const preset = findHarness(chain[0].harness);
+    if (preset?.planCmd) return preset.planCmd;
+    return null;
+  }
+  return inferHarnessForCmd(task.cmd ?? null)?.planCmd ?? null;
+}
+
 export interface HarnessApply {
   cmd?: string;
   planCmd?: string;

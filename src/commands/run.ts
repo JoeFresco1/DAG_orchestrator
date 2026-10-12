@@ -346,6 +346,16 @@ export function settingsCmd(argv: string[]): void {
   if (model !== undefined) patch.model = model;
   const variant = flag(argv, 'variant');
   if (variant !== undefined) patch.variant = variant;
+  // Plan-by-default policy: --plan auto|off (aliases --auto-plan/--no-auto-plan).
+  const planMode = flag(argv, 'plan');
+  if (planMode !== undefined) {
+    if (planMode !== 'auto' && planMode !== 'off') {
+      throw new Error(`--plan must be auto|off (got ${planMode})`);
+    }
+    patch.autoPlan = planMode === 'auto';
+  }
+  if (has(argv, 'auto-plan')) patch.autoPlan = true;
+  if (has(argv, 'no-auto-plan')) patch.autoPlan = false;
   Object.assign(patch, policyFlags(argv));
   if (Object.keys(patch).length === 0) {
     throw new Error(

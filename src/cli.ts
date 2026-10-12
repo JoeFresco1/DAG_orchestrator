@@ -41,11 +41,12 @@ usage: dag <cmd> [flags]
   factory resume|status [--file F]
                                continue or inspect the persisted factory cycle
   add --title T --spec S [--deps a,b] [--cmd "..."] [--retries N]
-      [--timeout SEC] [--silence SEC] [--plan-cmd "..."] [--review-cmd "..."]
+      [--timeout SEC] [--silence SEC] [--plan-cmd "..." | --no-plan] [--review-cmd "..."]
+                                plan runs by default for agent commands; --no-plan opts out
       [--review-rounds N] [--repair-rounds N]
   edit --id ID [--title T] [--spec S] [--deps a,b | --clear-deps] [--cmd C]
       [--status S] [--retries N] [--timeout SEC] [--silence SEC]
-      [--plan-cmd C] [--review-cmd C] [--review-rounds N] [--repair-rounds N]
+      [--plan-cmd C | --no-plan] [--review-cmd C] [--review-rounds N] [--repair-rounds N]
   rm --id ID                   delete node, strip it from others' deps
   list [--status S] [--limit N] | status | ready | blocked
   retry --id ID [--cascade]    requeue failed task (cascade: its failed subtree)
@@ -72,7 +73,7 @@ usage: dag <cmd> [flags]
   new-run --objective "..."     archive the active run, start a fresh one
   runs [list] | runs show --id ID | runs archive
   set [--all | --only a,b | --match REGEX]
-      [--cmd "..." | --clear-review] [--plan-cmd "..."] [--review-cmd "..."]
+      [--cmd "..." | --clear-review] [--plan-cmd "..." | --no-plan] [--review-cmd "..."]
       [--review-rounds N] [--repair-rounds N] [--retries N] [--timeout SEC]
       [--silence SEC]
                                bulk edit harness / planner / reviewer / repair
@@ -90,7 +91,7 @@ usage: dag <cmd> [flags]
                                review tasks that review the work of other tasks
   settings [--concurrency N] [--retries N] [--timeout SEC] [--silence SEC]
       [--max-hours H] [--on-dep-failure block|skip] [--gates wait|skip]
-      [--notify "command"] [--worktree none|task]
+      [--notify "command"] [--worktree none|task] [--plan auto|off]
   gate --id ID --question Q | approve --id ID | reject --id ID
   dot                          graphviz chart
   run --file F [--concurrency N] [--only a,b] [--retries N] [--timeout SEC]

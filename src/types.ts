@@ -271,6 +271,9 @@ export function validateSettingsPatch(patch: Record<string, unknown>): SettingsP
       typeof patch.failOnNonZeroExit !== 'boolean') {
     problems.push(PROBLEM('failOnNonZeroExit', 'must be true, false or null'));
   }
+  if (patch.autoPlan !== undefined && typeof patch.autoPlan !== 'boolean') {
+    problems.push(PROBLEM('autoPlan', 'must be true or false'));
+  }
   text('model', 300);
   text('variant', 100);
   text('notifyCmd', 4000);
@@ -334,6 +337,11 @@ export interface RunSettings {
   // How many times a task may be redone after a merge conflict with the
   // integration branch (worktree mode only).
   mergeRounds: number;
+  // Plan-then-execute by default: when true, a task with no explicit planCmd
+  // still runs a planning phase resolved from its harness chain (or inferred
+  // from its command prefix), and the work command receives the plan even if
+  // it never mentions {plan}/{planFile}. Empty-string planCmd opts a task out.
+  autoPlan: boolean;
 }
 
 // Baseline settings every run starts from; user settings layer on top.
@@ -342,6 +350,7 @@ export const DEFAULT_SETTINGS: RunSettings = {
   timeoutMs: 60 * 60 * 1000,
   silenceMs: 10 * 60 * 1000,
   silenceAction: 'warn',
+  autoPlan: true,
   reviewVerdict: 'marker',
   maxAttempts: 1,
   onDepFailure: 'block',

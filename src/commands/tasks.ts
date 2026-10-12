@@ -56,12 +56,17 @@ export function addCmd(argv: string[]): void {
   const title = flag(argv, 'title');
   const spec = flag(argv, 'spec') ?? '';
   if (!title) throw new Error('--title is required');
+  if (has(argv, 'no-plan') && argv.includes('--plan-cmd')) {
+    throw new Error('--no-plan cannot be combined with --plan-cmd');
+  }
+  const timing = taskTimingFlags(argv);
+  if (has(argv, 'no-plan')) timing.planCmd = '';
   const task = addTask(run, {
     title,
     spec,
     deps: parseList(flag(argv, 'deps')),
     cmd: cmdFlag(argv) ?? null,
-    ...taskTimingFlags(argv),
+    ...timing,
   });
   saveRun(run, file);
   emit(argv, task, () => task.id);
@@ -92,6 +97,10 @@ export function editCmd(argv: string[]): void {
   if (has(argv, 'clear-deps')) patch.deps = [];
   else if (argv.includes('--deps')) patch.deps = parseList(flagRequired(argv, 'deps'));
   const timing = taskTimingFlags(argv);
+  if (has(argv, 'no-plan')) {
+    if (argv.includes('--plan-cmd')) throw new Error('--no-plan cannot be combined with --plan-cmd');
+    timing.planCmd = '';
+  }
   if (timing.maxAttempts !== undefined) patch.maxAttempts = timing.maxAttempts;
   if (timing.timeoutMs !== undefined) patch.timeoutMs = timing.timeoutMs;
   if (timing.silenceMs !== undefined) patch.silenceMs = timing.silenceMs;
@@ -284,6 +293,14 @@ export function setCmd(argv: string[]): void {
     throw new Error(
       'nothing to set; use --cmd, --review-cmd, --review-rounds, --repair-rounds, --retries, --timeout, --silence',
     );
+  }
+  // Explicit opt-out stores "" so the runner distinguishes it from auto inheritance.
+  if (has(argv, 'no-plan')) {
+    if (argv.includes('--plan-cmd')) throw new Error('--no-plan cannot be combined with --plan-cmd');
+    patch.planCmd = '';
+  }
+  if (harnessName !== undefined && has(argv, 'no-plan') && patch.planCmd === undefined) {
+    patch.planCmd = '';
   }
   const changed = setTasks(run, patch, {
     all: has(argv, 'all'),

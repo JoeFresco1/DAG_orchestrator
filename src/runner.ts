@@ -27,7 +27,7 @@ import {
 import { attemptsForChain, planAttempt, type HarnessCandidate } from './harness-chain.js';
 import { routeModel, type ModelRouteCandidate, type ModelTier } from './factory/model-router.js';
 import type { ReviewerCalibrationReport } from './factory/reviewer-calibration.js';
-import { findHarness } from './harnesses.js';
+import { findHarness, effectivePlanCmd } from './harnesses.js';
 import { createReviewPlan, type ReviewRouterEvidence } from './factory/review-router.js';
 import {
   decideReviewers,
@@ -2160,6 +2160,13 @@ export class DagRunner {
   // preset owns the command, the candidate owns the model.
   private applyHarnessChain(task: Task, attempt: number): { cmd: string | null; planCmd: string | null } {
     const chain = this.effectiveChain(task);
+    // Explicit opt-out ("") never plans, even under a chain.
+    if (task.planCmd === '') {
+      if (!chain || chain.length === 0) return { cmd: task.cmd, planCmd: null };
+    } else if (task.planCmd) {
+      // Explicit plan command wins; the chain still owns the work command.
+      if (!chain || chain.length === 0) return { cmd: task.cmd, planCmd: task.planCmd };
+    }
     let routeReason: string | null = null;
     let routeOffset = 0;
     if (attempt === 1 && chain && chain.length > 1 && task.model?.trim()) {
@@ -2191,7 +2198,9 @@ export class DagRunner {
       }
     }
     const plan = planAttempt(chain, Math.max(1, attempt + routeOffset));
-    if (!plan) return { cmd: task.cmd, planCmd: task.planCmd };
+    if (!plan) {
+      return { cmd: task.cmd, planCmd: effectivePlanCmd(task, this.state.settings) };
+    }
     task.harness = plan.candidate.harness;
     if (plan.candidate.model !== undefined && (!task.model?.trim() || this.chainSelectedModels.has(task.id)) && !this.state.settings.model.trim()) {
       task.model = plan.candidate.model;
@@ -2209,7 +2218,9 @@ export class DagRunner {
     );
     return {
       cmd: plan.harness.cmd,
-      planCmd: plan.harness.planCmd ?? task.planCmd,
+      // Explicit task plan wins; "" opts out; otherwise the chain candidate's
+      // plan (which is also what effectivePlanCmd resolves to for chains).
+      planCmd: task.planCmd === '' ? null : (task.planCmd || plan.harness.planCmd || effectivePlanCmd(task, this.state.settings)),
     };
   }
 
@@ -2292,15 +2303,26 @@ export class DagRunner {
       }
 
       if (this.opts.contractGuard && worktreePath) await this.opts.contractGuard(task, worktreePath, this.worktreeBases.get(task.id) ?? 'HEAD');
+      // Plan-then-execute loop: when a plan exists but the work command never
+      // mentions {plan}/{planFile}, the plan would otherwise be generated and
+      // ignored. Inject it into the spec so the worker follows it by default.
+      let workSpec = specOverride;
+      const workCmd = this.opts.workCommand?.(task) ?? chained.cmd;
+      if (task.plan && workCmd && !workCmd.includes('{plan')) {
+        const base = specOverride ?? task.spec ?? '';
+        if (!base.includes(task.plan.slice(0, 80))) {
+          workSpec = `${base}\n\nApproved implementation plan (follow it; deviate only if it is wrong):\n${task.plan}`;
+        }
+      }
       const outcome = await this.runPhase(
         task,
         execute,
-        this.opts.workCommand?.(task) ?? chained.cmd,
+        workCmd,
         'run',
         worktreePath ?? undefined,
         planFile,
         depsContext,
-        specOverride,
+        workSpec,
       );
       if (this.tokens.get(task.id) !== token) return;
 
