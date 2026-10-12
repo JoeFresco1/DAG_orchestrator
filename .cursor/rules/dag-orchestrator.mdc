@@ -21,6 +21,11 @@ active run so history stays in the project folder.
 - While a run is active the run file is locked. Do not edit tasks then —
   wait, or stop the run first. `dag add` will refuse with the lock holder.
 - Prefer many small, independently verifiable tasks over one big task.
+- Keep every task inside the decomposition budget: a spec of at most 800
+  characters of authored brief, at most 2 acceptance criteria, and one
+  independently verifiable output concern. `dag plan validate` enforces these as `scope.oversized`,
+  `scope.acceptance` and `scope.concerns`. Fifty small tasks beat ten that
+  fail — split instead of writing one long brief.
 
 ## Inspect first
 
@@ -30,6 +35,32 @@ dag list --json --limit 200
 dag ready --json           # what would launch right now
 dag log --n 20             # event history
 ```
+
+## Decompose specifications
+
+For new spec-to-task plans, author a canonical version 2 planning manifest
+(see `docs/planning-contract.md`) before creating executable tasks.
+
+1. Preserve every original requirement and criterion in the registry. Split
+   implementation by one observable output behavior; give each task only its
+   own one or two achievable acceptance criteria and executable checks.
+2. Keep title, objective, review boundary, owned criterion text, constraints,
+   input/output contracts and named concerns within 800 characters combined.
+   Related output files may share a `concern` describing that same behavior;
+   tests stay with their implementation. Do not hide unrelated work in a label,
+   truncate acceptance, or move required work into uncounted context.
+3. Wire only actual producer/consumer prerequisites. Put composed acceptance
+   in small downstream verification tasks after all contributors.
+4. Run `dag plan validate --plan plan.json --json`. Split every task with
+   `scope.oversized`, `scope.acceptance` or `scope.concerns`, preserve coverage
+   and revalidate until it passes. Do not raise `sizing` to avoid splitting
+   unless the user explicitly requests a different budget.
+5. Run independent `dag plan review` when required, then `dag plan compile`
+   into a fresh run file. There is no task-count cap: fifty bounded tasks are
+   preferable to ten oversized tasks. Existing runs use stopped amendments.
+
+The limits apply to canonical plans. Legacy `dag add` remains a manual task
+entry point; it does not perform decomposition or enforce these budgets.
 
 ## Create tasks
 
@@ -46,6 +77,8 @@ Spec rules — self-contained so a worker never asks questions or enters plan mo
 - **Outputs**: exact files or commands produced.
 - **Acceptance**: a runnable check (test command, expected output/exit code).
 - Imperative sentences. No "investigate", "as appropriate", "consider".
+- Budget: at most 800 characters of authored brief, at most 2 acceptance
+  criteria, one output concern. Split into as many bounded tasks as needed.
 
 `--cmd` is required for auto-runs. A task without `cmd` is manual: the runner
 skips it and the viewer marks it done by hand.

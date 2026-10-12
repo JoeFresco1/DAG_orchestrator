@@ -9,6 +9,7 @@ import { compileContext } from '../factory/context-compiler.js';
 import { digest, assertPlanningRequirementsPreserved, type PlanningManifest, type PlanningFinding, type PlanningReview } from './contracts.js';
 import { validatePlan } from './validation.js';
 import { checkCommand } from './compile.js';
+import { sizingBudget } from './sizing.js';
 
 export function validatePlanningReview(value: unknown, plan: PlanningManifest): PlanningReview {
   if (!value || typeof value !== 'object') throw Error('Missing structured planning review');
@@ -53,10 +54,12 @@ export async function reviewPlan(plan: PlanningManifest, root: string, executor?
       .map(path => ({ path, sha256: digest(readFileSync(join(root, path))), content: readFileSync(join(root, path), 'utf8') }));
     const protectedPaths = [...new Set([...index.files.map(f => f.path), ...plan.sources.map(s => s.path), ...guidance.map(g => g.path), ...plan.tasks.flatMap(t => (t.files ?? []).map(f => f.path))])];
     const before = digest(protectedPaths.map(p => [p, existsSync(join(root, p)) ? digest(readFileSync(join(root, p))) : null]));
+    const budget = sizingBudget(plan);
     const context = { version: 1, revision: report.revision, plan, deterministic: report, packet, guidance,
       instructions: [
         'Independently review the proposed work against pinned specifications, AGENTS.md, applicable repository instructions, skills and interfaces.',
         'Check complete coverage, coherent bounded responsibilities, achievable intermediate acceptance, sufficient prerequisites and consistent interfaces.',
+        `Check decomposition size against the plan budget: at most ${budget.maxSpecChars} characters of authored brief per task, at most ${budget.maxAcceptancePerTask} owned acceptance criteria, and at most ${budget.maxOutputConcerns} output concern per task. Report oversized tasks as scope.oversized, scope.acceptance or scope.concerns with the exact split you would make. Prefer many small independently verifiable tasks over few large ones.`,
         'A shared file concern must describe one observable behavior. Reject unrelated responsibilities grouped under a broad label even when numeric limits pass. Split scope without dropping original criteria, executable checks or producer/consumer prerequisites.',
         'Do not edit product code, plans, or run artifacts. Request missing authoritative evidence as an inconclusive finding, never infer approval.',
         'Return DAG_PLAN_REVIEW: followed by one JSON object. Use version 1, the exact revision/contextDigest below, reviewer identity, verdict pass/fail/inconclusive and findings.',

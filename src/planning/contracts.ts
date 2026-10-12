@@ -31,10 +31,13 @@ export interface PlanningCriterion {
   checks: string[]; requires?: string[];
 }
 export interface PlanningRequirement { id: string; title: string; description: string; acceptance: string[] }
+/** Decomposition budget. Small bounded tasks execute; large ones strand the run. */
+export interface PlanningSizing { maxSpecChars?: number; maxAcceptancePerTask?: number; maxOutputConcerns?: number }
 export interface PlanningManifest {
   version: 2; id: string; title: string; sources: PlanningSource[];
   requirements: PlanningRequirement[]; criteria: PlanningCriterion[]; tasks: PlanningTask[];
   capacities?: Record<string, number>;
+  sizing?: PlanningSizing;
   semanticReview?: { mode: 'off' | 'auto' | 'required'; command?: Omit<PlanningCheck, 'id'> };
 }
 export interface PlanningFinding {
@@ -141,6 +144,13 @@ export function validatePlanningManifest(v: unknown): asserts v is PlanningManif
     if (t.resources !== undefined && !record(t.resources)) throw Error('Invalid resource demands');
   }
   if (v.capacities !== undefined && !record(v.capacities)) throw Error('Invalid resource capacities');
+  if (v.sizing !== undefined) {
+    if (!record(v.sizing)) throw Error('Invalid sizing budget');
+    for (const key of ['maxSpecChars', 'maxAcceptancePerTask', 'maxOutputConcerns'] as const) {
+      const value = (v.sizing as Record<string, unknown>)[key];
+      if (value !== undefined && (!Number.isSafeInteger(value) || Number(value) < 1)) throw Error('Invalid sizing budget');
+    }
+  }
   if (v.semanticReview !== undefined) {
     if (!record(v.semanticReview) || !['off', 'auto', 'required'].includes(String(v.semanticReview.mode))) throw Error('Invalid semantic review policy');
     if (v.semanticReview.command) validatePlanningCheck({ ...v.semanticReview.command as object, id: 'planning-review' });

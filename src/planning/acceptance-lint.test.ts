@@ -38,6 +38,7 @@ test('literal acceptance files catch missing future dependencies even when stale
 
 test('recursive static imports resolve emitted js to planned ts without inventing dependencies', t => {
   const dir = fixture(t), p = plan(); mkdirSync(join(dir, 'tests'));
+  p.sizing = { maxOutputConcerns: 2 }; // Isolate import tracing from the sizing rule.
   // This fixture deliberately owns one implementation plus a bridging module;
   // the decomposition budget is relaxed here so the lint rule under test stays isolated.
   writeFileSync(join(dir, 'tests/early.test.ts'), "import { bridge } from '../bridge.js'; void bridge;");

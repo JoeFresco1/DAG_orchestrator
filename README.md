@@ -20,6 +20,16 @@ DAG Orchestrator is a local-first runner for coding agents. Give it small,
 verifiable tasks; it handles dependency order, parallelism, retries, isolated
 git worktrees, reviewer verdicts, and a live browser view.
 
+For prerequisite and acceptance validation before workers start, use the
+[versioned planning contract](docs/planning-contract.md) with `dag plan validate`,
+`review`, and `compile`. Existing DAGs keep their behavior until explicitly upgraded.
+
+New spec decomposition uses a default budget of 800 characters of authored
+task prose, at most two acceptance criteria, and one independently verifiable
+output concern. Validation blocks oversized units before compilation; the
+planner must split them while preserving requirements and dependencies.
+Related files can share one concern. There is no maximum task count.
+
 There is no database, hosted control plane, or always-on daemon. A run is a
 plain JSON file in your repository, with logs and state beside it.
 

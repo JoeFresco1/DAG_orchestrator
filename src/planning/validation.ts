@@ -2,6 +2,7 @@ import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { resolve, relative, isAbsolute } from 'node:path';
 import { digest, validatePlanningManifest, type PlanningManifest, type PlanningFinding, type PlanningReport, type PlanningInterface } from './contracts.js';
 import { lintAcceptance } from './acceptance-lint.js';
+import { lintSizing } from './sizing.js';
 
 export function planningFile(root: string, file: string): string {
   const target = resolve(root, file), rel = relative(root, target);
@@ -42,6 +43,7 @@ export function validatePlan(value: unknown, root?: string): PlanningReport {
   plan.sources.forEach(s => checkSource(s.path, s.sha256, []));
   // Decomposition size is a structural rule: it is checked before relationships
   // so an oversized brief is split before anyone reasons about its ownership.
+  lintSizing(plan, add);
   for (const [name, capacity] of Object.entries(plan.capacities ?? {})) if (!Number.isSafeInteger(capacity) || capacity < 1) add('resource.capacity', [], [name], 'Invalid resource capacity', 'Set a positive integer capacity');
   for (const task of plan.tasks) {
     unique(task.acceptance, 'acceptance.duplicate', [task.id]);
