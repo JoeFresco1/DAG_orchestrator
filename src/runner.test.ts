@@ -162,7 +162,7 @@ describe('watchdog and failures', () => {
   it('falls back when a tool dies with a non-zero exit and nothing judges it', async () => {
     const { run, a } = make(['a']) as { run: Run; a: Task };
     run.tasks[a.id].harnessChain = parseHarnessChain('opencode,codex');
-    run.tasks[a.id].planCmd = null;
+    run.tasks[a.id].planCmd = ''; // This fixture exercises work exits, not planner failures.
     const runner = new DagRunner(run, {
       executor: async () => ({ output: 'rate limited', exitCode: 1 }),
     });
@@ -176,7 +176,7 @@ describe('watchdog and failures', () => {
   it('leaves a non-zero exit alone when a reviewer is judging', async () => {
     const { run, a } = make(['a']) as { run: Run; a: Task };
     run.tasks[a.id].harnessChain = parseHarnessChain('opencode,codex');
-    run.tasks[a.id].planCmd = null;
+    run.tasks[a.id].planCmd = ''; // A failed planner must never be waived by the work reviewer.
     run.tasks[a.id].reviewCmd = 'judge';
     const runner = new DagRunner(run, {
       executor: async (_t, _c, command) =>

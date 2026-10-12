@@ -458,6 +458,7 @@ describe('settings validation', () => {
     await runner.start();
     assert.equal(run.tasks[a.id].status, 'pending', 'nothing ran');
     assert.ok(run.events.some((e) => /invalid settings.*worktree/.test(e.message ?? '')));
-    assert.equal(runner.result?.scope.length, 0);
+    assert.deepEqual(runner.result?.scope, [a.id]);
+    assert.deepEqual(runner.result?.unfinished, [a.id]);
   });
 });

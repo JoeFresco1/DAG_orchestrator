@@ -560,11 +560,11 @@ export class DagRunner {
       if (problems.length > 0) {
         this.log('note', null, `not starting: invalid settings — ${describeSettingsProblems(problems)}`);
         this.summary = {
-          scope: [],
+          scope: [...(scope ?? Object.keys(this.state.tasks))],
           completed: [],
           failed: [],
           skipped: [],
-          unfinished: [],
+          unfinished: [...(scope ?? Object.keys(this.state.tasks))],
           stopped: true,
           budgetReached: false,
           interrupted: { requeued: [], orphanPids: [] },
@@ -594,11 +594,11 @@ export class DagRunner {
       if (refusal) {
         this.log('note', null, `not starting: ${refusal}`);
         this.summary = {
-          scope: [],
+          scope: [...(scope ?? Object.keys(this.state.tasks))],
           completed: [],
           failed: [],
           skipped: [],
-          unfinished: [],
+          unfinished: [...(scope ?? Object.keys(this.state.tasks))],
           stopped: true,
           budgetReached: false,
           interrupted: { requeued: [], orphanPids: [] },
@@ -648,11 +648,11 @@ export class DagRunner {
       const message = err instanceof Error ? err.message : String(err);
       this.log('note', null, `not starting: ${message}`);
       this.summary = {
-        scope: [],
+        scope: [...(scope ?? Object.keys(this.state.tasks))],
         completed: [],
         failed: [],
         skipped: [],
-        unfinished: [],
+        unfinished: [...(scope ?? Object.keys(this.state.tasks))],
         stopped: true,
         budgetReached: false,
         interrupted: { requeued: [], orphanPids: [] },
@@ -1060,7 +1060,8 @@ export class DagRunner {
 
     // Fail-closed: only an explicit PASS passes. A missing VERDICT line is a
     // rejection, never silent approval.
-    const verdictOf = (output: string): { verdict: 'pass' | 'fail'; reason: string } => {
+    const verdictOf = (output: string, exitCode: number | null): { verdict: 'pass' | 'fail'; reason: string } => {
+      if (exitCode !== 0) return { verdict: 'fail', reason: `final reviewer exited ${exitCode ?? 'without an exit code'}` };
       const parsed = parseVerdict(stripAnsi(output));
       if (parsed.kind === 'pass') return { verdict: 'pass', reason: parsed.reason };
       return {
@@ -1079,7 +1080,7 @@ export class DagRunner {
       this.log('run-review', null, `end-of-run review: whole run (round ${round})`);
       try {
         const outcome = await this.runPhase(promptTask, execute, cmdTemplate, 'review', undefined, undefined, diff.ctx);
-        const verdict = verdictOf(outcome.output);
+        const verdict = verdictOf(outcome.output, outcome.exitCode);
         if (verdict.verdict === 'pass') {
           this.log('run-review', null, 'run review passed');
           return { mode: effective, verdict: 'pass', reason: verdict.reason, reviewed: candidates, failed: [], requeued: [] };
@@ -1103,7 +1104,7 @@ export class DagRunner {
       );
       try {
         const outcome = await this.runPhase(promptTask, execute, cmdTemplate, 'review', undefined, undefined, diff.ctx);
-        const verdict = verdictOf(outcome.output);
+        const verdict = verdictOf(outcome.output, outcome.exitCode);
         reviewed.push(task.id);
         if (verdict.verdict === 'pass') {
           task.finalReview = { verdict: 'pass', reason: verdict.reason, at: nowIso(), round };
@@ -1315,6 +1316,10 @@ export class DagRunner {
     this.appendLog(task.id, '\n--- prepare ---\n');
     try {
       const outcome = await this.runPhase(task, execute, cmd, 'plan', worktreePath, planFile, depsContext);
+      if (outcome.exitCode !== 0) throw Object.assign(
+        new Error(`prepare exit ${outcome.exitCode}${tailOf(stripAnsi(outcome.output))}`),
+        { kind: 'setup' as FailureKind, exitCode: outcome.exitCode },
+      );
       const out = stripAnsi(outcome.output).trim();
       if (out) this.appendLog(task.id, `\n${truncateTail(out, 2000)}\n`);
       this.log('note', task.id, 'worktree ready');
@@ -1359,6 +1364,8 @@ export class DagRunner {
     if (outcome.exitCode !== 0) {
       const findings = forwardReferenceFailure(this.state, task.id, outcome.output, worktreePath ?? this.opts.cwd ?? process.cwd());
       if (findings.length) throw Object.assign(new Error(outcome.output), { kind: 'plan', planningFindings: findings });
+      throw Object.assign(new Error(`planner exit ${outcome.exitCode}${tailOf(stripAnsi(outcome.output))}`),
+        { kind: 'plan' as FailureKind, exitCode: outcome.exitCode });
     }
     task.plan = truncate(stripAnsi(outcome.output).trim(), PLAN_LIMIT) || '(empty plan)';
     this.log('task-plan', task.id, `plan ready (${task.plan.length} chars)`);
@@ -2178,9 +2185,7 @@ export class DagRunner {
 
   // The harness chain that governs this task: its own, else the run's, else none.
   private effectiveChain(task: Task): HarnessCandidate[] | null {
-    if (task.harnessChain && task.harnessChain.length > 0) return task.harnessChain;
-    if (this.state.settings.harnessChain?.length) return this.state.settings.harnessChain;
-    return null;
+    return task.harnessChain ?? this.state.settings.harnessChain ?? null;
   }
 
   // A chain of N tools means N attempts at least, so a fallback can happen.
@@ -2253,7 +2258,8 @@ export class DagRunner {
       cmd: plan.harness.cmd,
       // Explicit task plan wins; "" opts out; otherwise the chain candidate's
       // plan (which is also what effectivePlanCmd resolves to for chains).
-      planCmd: task.planCmd === '' ? null : (task.planCmd || plan.harness.planCmd || effectivePlanCmd(task, this.state.settings)),
+      planCmd: task.planCmd === '' ? null : (task.planCmd ||
+        (this.state.settings.autoPlan === false ? null : plan.harness.planCmd || effectivePlanCmd(task, this.state.settings))),
     };
   }
 

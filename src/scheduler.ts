@@ -212,6 +212,7 @@ export async function runScheduler(opts: SchedulerOptions = {}): Promise<number>
       if (job.status !== 'running') continue;
       if (job.pid && pidAlive(job.pid)) continue;
       job.status = 'failed';
+      lastCode = 1;
       job.finishedAt = new Date().toISOString();
       job.exitCode = null;
       job.note = job.pid
@@ -261,7 +262,7 @@ export async function runScheduler(opts: SchedulerOptions = {}): Promise<number>
         else child?.once('exit', () => resolve());
       });
       const code = child.exitCode ?? 1;
-      lastCode = code;
+      if (code !== 0) lastCode = 1;
       const schedule = loadSchedule();
       const job = schedule.jobs.find((j) => j.id === runningId);
       if (job) {
@@ -287,6 +288,7 @@ export async function runScheduler(opts: SchedulerOptions = {}): Promise<number>
           const decision = decideDue(job, schedule);
           if (decision.blocked) {
             job.status = 'blocked';
+            lastCode = 1;
             job.note = decision.blocked;
             job.finishedAt = new Date().toISOString();
             changed = true;
@@ -317,13 +319,13 @@ export async function runScheduler(opts: SchedulerOptions = {}): Promise<number>
           await sleep(pollMs);
           continue;
         }
-        return 0;
+        return lastCode;
       }
       const anyDue = pending.some((j) => decideDue(j, schedule).due);
       if (opts.once || opts.drain) {
         if (!anyDue) {
           log(`${pending.length} job(s) not due yet`);
-          return 0;
+          return lastCode;
         }
         continue;
       }

@@ -168,6 +168,7 @@ export async function runCmd(argv: string[]): Promise<void> {
       runId: run.id,
       completed: summary?.completed ?? [],
       failed: summary?.failed ?? [],
+      stopped: summary?.stopped ?? true,
       skipped: summary?.skipped ?? [],
       unfinished: summary?.unfinished ?? [],
       budgetReached: summary?.budgetReached ?? false,
@@ -192,7 +193,7 @@ export async function runCmd(argv: string[]): Promise<void> {
   if (review && review.verdict !== 'pass' && review.verdict !== 'skipped') {
     process.exitCode = 1;
   }
-  if (summary.failed.length > 0 || summary.unfinished.length > 0) {
+  if (summary.stopped || summary.budgetReached || summary.failed.length > 0 || summary.unfinished.length > 0) {
     process.exitCode = 1;
   }
 }

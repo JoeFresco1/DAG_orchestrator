@@ -116,7 +116,8 @@ export function recordPlanningFailure(run: Run, taskId: string, findings: Planni
 
 export function validFailureFindings(run: Run, taskId: string, findings: PlanningFinding[]): boolean {
   if (!run.planning || !run.tasks[taskId] || !Array.isArray(findings) || !findings.length) return false;
-  const allowed = ['acceptance.future', 'acceptance.owner', 'capability.missing', 'capability.ambiguous', 'interface.incompatible', 'scope.ambiguous'];
+  const allowed = ['acceptance.future', 'acceptance.owner', 'capability.missing', 'capability.ambiguous', 'interface.incompatible',
+    'scope.ambiguous', 'scope.oversized', 'scope.acceptance', 'scope.concerns'];
   try { validatePlanningReview({ version: 1, revision: run.planning.revision, contextDigest: run.planning.revision, reviewer: 'execution-diagnosis', verdict: 'fail', findings }, run.planning.manifest); } catch { return false; }
   if (findings.some(f => !f || !allowed.includes(f.rule) || !f.blocking || !Array.isArray(f.tasks) || !f.tasks.includes(taskId) ||
     !Array.isArray(f.evidence) || !f.evidence.length || f.evidence.some(v => typeof v !== 'string' || !v.trim()) ||

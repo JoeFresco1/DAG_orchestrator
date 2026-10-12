@@ -638,6 +638,13 @@ export function loadRun(file: string): Run {
   run.settings = { ...DEFAULT_SETTINGS, ...(def.settings ?? {}) };
 
   const state = readJsonWithBackup<StoredState>(paths.state);
+  const checkpointTasks = state?.tasks;
+  if ((def.storageVersion ?? 1) >= STORAGE_VERSION && (!checkpointTasks ||
+    typeof checkpointTasks !== 'object' || Array.isArray(checkpointTasks) ||
+    Object.keys(def.tasks ?? {}).some(id => !checkpointTasks[id] ||
+      !['pending', 'ready', 'running', 'completed', 'failed', 'skipped'].includes(checkpointTasks[id].status ?? '')))) {
+    throw Error('Missing or invalid modern execution state; preserve the definition and sidecar and restore a matching checkpoint');
+  }
   if (def.planning && (!state || Object.keys(def.tasks ?? {}).some(id => !state.tasks?.[id]))) {
     throw Error('Invalid persisted planning task checkpoint; preserve artifacts and resume stopped amendment');
   }
