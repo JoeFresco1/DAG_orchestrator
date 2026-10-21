@@ -8,6 +8,10 @@ export const REVIEW_STAGES = [
 export type ReviewStage = typeof REVIEW_STAGES[number];
 
 export interface ReviewRouterEvidence {
+  policy?: 'lean';
+  checksPassed?: boolean;
+  artifactSignals?: { publicContract?: boolean; dependencyChange?: boolean; durableConcurrency?: boolean;
+    coverageUncertain?: boolean; protectedClasses?: string[]; verifiedDefects?: boolean };
   unit: string;
   title: string;
   spec?: string;
@@ -79,6 +83,20 @@ export function createReviewPlan(evidence: ReviewRouterEvidence, configured: Rev
   const text = `${evidence.title}\n${evidence.spec ?? ''}\n${paths.join('\n')}\n${(evidence.changedSymbols ?? []).join('\n')}\n${evidence.subsystem ?? ''}`;
   const reasons: string[] = [];
   let score = 20; // Unknown coverage/history starts with moderate uncertainty.
+  const lean = evidence.policy === 'lean';
+  const protectedChange = lean && (!!evidence.artifactSignals?.protectedClasses?.length || evidence.graphSignals?.securitySensitive === true);
+  if (lean) {
+    const signals = evidence.artifactSignals ?? {};
+    if (signals.publicContract || evidence.graphSignals?.publicApi) { score += 20; reasons.push('changed public contract'); }
+    if (signals.dependencyChange || (evidence.graphSignals?.dependents ?? 0) >= 12 || (evidence.graphSignals?.fanOut ?? 0) >= 10) { score += 20; reasons.push('changed dependency, lockfile or broad shared-library impact'); }
+    if (signals.durableConcurrency) { score += 25; reasons.push('changed concurrency or durable state'); }
+    if (signals.coverageUncertain !== false) { score += 20; reasons.push('behavioral coverage uncertain'); }
+    if (evidence.diffLines === null) { score = Math.max(score, 60); reasons.push('required diff evidence unavailable'); }
+    else if (evidence.diffLines > 500) { score += 20; reasons.push('more than 500 changed lines'); }
+    else if (evidence.diffLines > 150) { score += 10; reasons.push('more than 150 changed lines'); }
+    if (signals.verifiedDefects) { score += 10; reasons.push('verified defect history'); }
+    if (protectedChange) { score = Math.max(score, 60); reasons.push(`protected change: ${signals.protectedClasses?.join(', ') || 'trusted repository security classification'}`); }
+  } else {
   if (SECURITY.test(text)) { score += 35; reasons.push('authentication or security-sensitive path'); }
   if (INTEGRATION.test(text)) { score += 18; reasons.push('contract or integration boundary'); }
   if (evidence.diffLines !== null && evidence.diffLines > 500) { score += 15; reasons.push(`large change (${evidence.diffLines} diff lines)`); }
@@ -100,29 +118,30 @@ export function createReviewPlan(evidence: ReviewRouterEvidence, configured: Rev
     reasons.length = 0;
     reasons.push(...(evidence.riskReasons ?? ['risk score supplied by the repository risk engine']));
   }
+  }
   score = clamp(score);
   const intensity = assignReviewIntensity({
     riskScore: score,
     triggers: {
-      'deterministic-finding': evidence.deterministicFindings?.length ?? 0,
-      contradiction: evidence.contradictions?.length ?? 0,
-      'changed-contract': evidence.changedContracts?.length ?? 0,
-      'verified-defect': evidence.verifiedDefects?.length ?? 0,
+      'deterministic-finding': lean ? 0 : evidence.deterministicFindings?.length ?? 0,
+      contradiction: lean ? 0 : evidence.contradictions?.length ?? 0,
+      'changed-contract': lean ? 0 : evidence.changedContracts?.length ?? 0,
+      'verified-defect': lean ? 0 : evidence.verifiedDefects?.length ?? 0,
     },
   });
-  score = intensity.score;
+  score = lean ? clamp(protectedChange ? Math.max(score, 60) : score) : intensity.score;
 
   const risk: ReviewPlan['risk'] = score >= 90 ? 'critical' : score >= 60 ? 'high' : score >= 35 ? 'medium' : 'low';
   reasons.push(...intensity.reasons);
   if (!reasons.length) reasons.push('no elevated risk signals; history and coverage are not available');
   const deterministic = configured.filter((reviewer) => reviewer.verdict === 'exit-code');
   const agents = configured.filter((reviewer) => reviewer.verdict !== 'exit-code');
-  const deterministicSufficient = evidence.workExitCode === 0 &&
+  const deterministicSufficient = lean ? evidence.checksPassed === true && evidence.diffLines !== null && risk === 'low' : evidence.workExitCode === 0 &&
     (evidence.deterministicFindings?.length ?? 0) === 0 &&
     deterministic.length > 0 &&
     risk === 'low' &&
     !agents.some((reviewer) => (reviewer.when ?? '').split(';').some((clause) => clause.trim().toLowerCase() === 'on-reject'));
-  const budget = Math.max(0, Math.floor(evidence.maxAgentReviewers ?? (risk === 'critical' ? 3 : 2)));
+  const budget = lean ? 1 : Math.max(0, Math.floor(evidence.maxAgentReviewers ?? (risk === 'critical' ? 3 : 2)));
 
   const stageFor = (reviewer: Reviewer): ReviewStage => {
     if (reviewer.verdict === 'exit-code') return 'deterministic';
@@ -168,6 +187,13 @@ export function createReviewPlan(evidence: ReviewRouterEvidence, configured: Rev
   if (agents.length === 1 && !deterministicSufficient && selectedNames.size === 0) {
     selectedNames.add(agents[0]!.name);
     stageReasons.set(stageFor(agents[0]!), 'the only authored agent reviewer remains the acceptance check');
+  }
+  if (lean) {
+    selectedNames.clear();
+    if (risk !== 'low') {
+      const preferred = classified.find(item => protectedChange ? item.stage === 'security' : item.stage === 'local') ?? classified[0];
+      if (preferred) { selectedNames.add(preferred.reviewer.name); stageReasons.set(preferred.stage, `${risk} artifact risk requires one ${risk === 'medium' ? 'focused' : 'deep'} review`); }
+    }
   }
 
   let used = 0;
@@ -222,9 +248,9 @@ export function createReviewPlan(evidence: ReviewRouterEvidence, configured: Rev
     riskScore: score,
     riskReasons: reasons,
     intensity,
-    depth: intensity.tier === 'independent' ? 'escalated' : ['specialist', 'subsystem'].includes(intensity.tier) ? 'deep' : ['contract', 'local'].includes(intensity.tier) ? 'targeted' : 'deterministic',
-    modelClass: selectedAgentCount === 0 ? 'none' : ['specialist', 'independent'].includes(intensity.tier) ? 'strong' : 'cheap',
-    reviewRequired: selectedAgentCount > 0 || deterministic.length > 0,
+    depth: lean ? risk === 'low' ? 'deterministic' : risk === 'medium' ? 'targeted' : 'deep' : intensity.tier === 'independent' ? 'escalated' : ['specialist', 'subsystem'].includes(intensity.tier) ? 'deep' : ['contract', 'local'].includes(intensity.tier) ? 'targeted' : 'deterministic',
+    modelClass: selectedAgentCount === 0 ? 'none' : lean ? risk === 'medium' ? 'cheap' : 'strong' : ['specialist', 'independent'].includes(intensity.tier) ? 'strong' : 'cheap',
+    reviewRequired: lean ? risk !== 'low' : selectedAgentCount > 0 || deterministic.length > 0,
     deterministicSufficient,
     verificationRequired,
     independentReviewers: reviewers.filter((reviewer) => reviewer.selected && reviewer.stage === 'independent').length,

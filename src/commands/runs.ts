@@ -1,7 +1,8 @@
 // Run-history commands: `new-run` archives the active run and starts fresh,
 // `runs` lists/shows/archives the runs kept beside the project.
 import { existsSync } from 'node:fs';
-import { assertNoForeignLock } from '../store.js';
+import { assertNoForeignLock, saveRun } from '../store.js';
+import { executionProfilePatch } from '../execution-policy.js';
 import { activeRunFile, archiveRun, findRun, listRuns, projectOf, startNewRun } from '../runs.js';
 import { emit, flag, guard } from '../cli-args.js';
 
@@ -24,6 +25,8 @@ export function newRunCmd(argv: string[]): void {
     }
   }
   const { run, archivedTo } = startNewRun(dir, objective);
+  Object.assign(run.settings, executionProfilePatch(flag(argv, 'profile')));
+  saveRun(run, active);
   emit(
     argv,
     { runId: run.id, archivedTo, file: active },

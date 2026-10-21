@@ -21,7 +21,7 @@ afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
-test('nonzero preparation stops before work and does not land an accepted task', async () => {
+test('nonzero preparation is non-blocking and the task still runs and lands', async () => {
   const root = fixture(true), run = newRun('Preparation failure');
   run.settings.worktree = 'task';
   run.settings.worktreePrepareCmd = 'prepare';
@@ -29,12 +29,10 @@ test('nonzero preparation stops before work and does not land an accepted task',
   const commands: string[] = [];
   await new DagRunner(run, { cwd: root, executor: async (_task, _ctx, cmd) => {
     commands.push(cmd!);
-    return { output: 'Dependency installation failed', exitCode: 9 };
+    return { output: cmd === 'prepare' ? 'Dependency installation failed' : 'work done', exitCode: cmd === 'prepare' ? 9 : 0 };
   } }).start();
-  assert.deepEqual(commands, ['prepare']);
-  assert.equal(task.status, 'failed');
-  assert.equal(task.failureKind, 'setup');
-  assert.match(task.result!, /prepare exit 9/);
+  assert.deepEqual(commands, ['prepare', 'work']);
+  assert.equal(task.status, 'completed');
 });
 
 test('nonzero planner stops work and preserves bounded fallback', async () => {
@@ -71,6 +69,7 @@ for (const mode of ['run', 'per-task'] as const) {
 
 test('CLI reports isolation refusal as nonzero with the unfinished requested task', () => {
   const root = fixture(), file = join(root, 'dag.run.json'), run = newRun('Isolation refusal');
+  run.settings.executionProfile = 'lean';
   const task = addTask(run, { title: 'Task', spec: '', cmd: 'node -e "process.exit(0)"', planCmd: '' });
   saveRun(run, file);
   const result = spawnSync(process.execPath, [fileURLToPath(new URL('./cli.js', import.meta.url)),
@@ -158,6 +157,7 @@ test('scheduler keeps failure status while draining independent jobs and blockin
     const root = fixture(), files: string[] = [];
     for (const code of outcomes) {
       const file = join(root, `run-${files.length}.json`), run = newRun('Scheduled run');
+      run.settings.executionProfile = 'lean';
       addTask(run, { title: 'Task', spec: '', cmd: `node -e "process.exit(${code})"`, planCmd: '' });
       saveRun(run, file); files.push(file);
     }

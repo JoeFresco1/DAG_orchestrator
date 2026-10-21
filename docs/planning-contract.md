@@ -1,5 +1,28 @@
 # Specification decomposition and acceptance lint
 
+## Keep review bounded
+
+Planning review blocks on concrete execution problems: prerequisites, interfaces,
+dependency order, ownership conflicts, impossible local acceptance, or lost or
+weakened requirements. Test-detail suggestions, report polish and speculative
+edge cases remain nonblocking follow-ups for integration. Missing evidence remains
+inconclusive. The correction helper allows one correction and one recheck, and
+refuses to rerun an unchanged plan. Project reviewers can retain genuinely accepted
+unchanged packets using their existing evidence comparison; this adds no second
+review cache or planning authority.
+
+New canonical tasks get one task-review pass with **no automatic implementation
+redo**. Existing persisted review policies are preserved. Executable local checks
+and final requirement verification remain mandatory. A project may explicitly
+authorize a bounded integration repair pass for cross-component defects; this
+does not silently grant new attempts or authorize accepting unfinished local work.
+
+Native `codex exec` prompts use stdin rather than an oversized command line,
+including planning, task reviews and final reviews. Model, reasoning, schema and
+other supported options remain in argv. The full context is preserved without
+truncating requirements to fit a terminal limit. Other harnesses and explicit
+Codex stdin/resume/review subcommands retain their existing input protocols.
+
 New structured plans use one `PlanningManifest` version 2, compiled into the
 existing DAG task representation. Existing CLI tasks and version 1 factory goals
 keep their previous behavior. This adds no recovery controller or new runner.
@@ -82,3 +105,15 @@ For new decomposition, author the canonical manifest first, run `dag plan valida
 ```
 
 Every field must be a positive integer; a malformed budget fails closed. The independent semantic reviewer receives the active budget in its instructions and reports the same three rules with the split it would make, so a semantically oversized plan that still passes the character count is caught independently.
+
+## Findings and follow-up backlog
+
+Record discoveries without adding tasks during execution. `dag followups add --file F --input findings.json --task TASK --stage review` accepts a proposal or array of proposals. Each proposal has `id`, `message`, `evidence` and `references`; optional fields are `requirements`, `suggestedOwner`, `acceptance` and `blocking`. References identify existing task, criterion, requirement or file evidence. Repeated findings retain their occurrence history instead of creating duplicate work. Inspect them with `dag followups list --file F --json`.
+
+Workers can emit one `DAG_FOLLOW_UPS: <JSON array>` line. Grounded structured reviewer findings are captured automatically as well. A worker finding marked `blocking: true` fails the current task; malformed discovery packets also fail closed. Optional discoveries leave all checks and review gates in effect. Evidence references are observations, not proof of correctness: known requirement and owner IDs are validated, and triage must assess the cited evidence. Candidate owners are suggested from existing tasks, capabilities, criteria and declared files; they are not automatically assigned.
+
+The run sidecar's `followups.json` stores proposals, occurrences and decision history under its own write lock. Deduplication uses the finding ID with its sorted references and requirements; repeated delivery of the same packet and origin is idempotent. Distinct IDs or changed references remain separate until the coordinator links duplicates, preserving their evidence.
+
+The coordinator classifies each finding with `dag followups triage --file F --id ID --disposition TYPE --reason R`. Use `blocker` for work required by the current task, `existing-task` when a later producer already owns it, `follow-up` for independent additional work, or `dismissed` for unsupported suggestions. `blocker` and `existing-task` require `--owner TASK`; new follow-ups require an acceptance check, provided in the proposal or with `--acceptance CHECK`. Use `--duplicate-of ID` to associate duplicate findings.
+
+These decisions only maintain the backlog. They never waive checks, mark tasks accepted, restart a run, or insert executable tasks. Required missing functionality stays assigned to its existing producer; checks that consume it belong downstream of that producer. Apply any scope or dependency correction through the validated stopped amendment workflow above. Add approved new work through normal planning, preserving original acceptance and attempt history.

@@ -1,6 +1,6 @@
 // Enumerate explicitly so Windows and Node 20 run the same complete suite.
-import { readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readdirSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 function tests(directory, suffix) {
@@ -9,6 +9,15 @@ function tests(directory, suffix) {
     return entry.isDirectory() ? tests(path, suffix) : entry.name.endsWith(suffix) ? [path] : [];
   });
 }
-const result = spawnSync(process.execPath, ['--test', ...tests('dist', '.test.js')], { stdio: 'inherit', windowsHide: true });
+// TypeScript leaves old emitted files behind when a source test is removed.
+// Derive the suite from current source so those stale artifacts cannot execute.
+const compiled = tests('src', '.test.ts').sort().map(source =>
+  join('dist', relative('src', source).replace(/\.ts$/, '.js')));
+const missing = compiled.filter(path => !existsSync(path));
+if (missing.length > 0) {
+  throw new Error(`Missing compiled tests; rebuild before testing: ${missing.join(', ')}`);
+}
+if (compiled.length === 0) throw new Error('No source tests found');
+const result = spawnSync(process.execPath, ['--test', ...compiled], { stdio: 'inherit', windowsHide: true });
 if (result.error) console.error(result.error.message);
 process.exitCode = result.status ?? 1;

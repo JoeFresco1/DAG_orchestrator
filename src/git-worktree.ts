@@ -23,17 +23,18 @@ export interface GitResult {
  * Run git in `dir` with long-path support. stdout/stderr are trimmed and the
  * exit code defaults to 1 so a missing or crashed process reads as failure.
  */
-export function git(dir: string, args: string[], env?: NodeJS.ProcessEnv): GitResult {
+export function git(dir: string, args: string[], env?: NodeJS.ProcessEnv, timeoutMs?: number): GitResult {
   const res = spawnSync('git', ['-c', 'core.longpaths=true', ...args], {
     cwd: dir,
     encoding: 'utf8',
     windowsHide: true,
+    timeout: timeoutMs,
     env: env ? { ...process.env, ...env } : process.env,
   });
   return {
     code: res.status ?? 1,
     stdout: (res.stdout ?? '').trim(),
-    stderr: (res.stderr ?? '').trim(),
+    stderr: (res.stderr ?? '').trim() || res.error?.message || '',
   };
 }
 
@@ -389,9 +390,13 @@ export interface CommitResult {
 }
 
 /** Stage everything and commit; an empty staging area yields commit: null. */
-export function commitAll(worktree: string, message: string): CommitResult {
+export function commitAll(worktree: string, message: string, excludes: string[] = []): CommitResult {
   const add = git(worktree, ['add', '-A']);
   if (add.code !== 0) throw new Error(`git add failed: ${add.stderr}`);
+  if (excludes.length) {
+    const reset = git(worktree, ['reset', '--quiet', 'HEAD', '--', ...excludes]);
+    if (reset.code !== 0) throw new Error(`git cache exclusion failed: ${reset.stderr}`);
+  }
   const staged = git(worktree, ['diff', '--cached', '--name-only']);
   const files = staged.stdout ? staged.stdout.split('\n').filter(Boolean).length : 0;
   if (files === 0) return { commit: null, files: 0 };

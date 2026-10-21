@@ -1,7 +1,12 @@
 import { createHash } from 'node:crypto';
 
 /** Extends the reliability contract vocabulary. This is the only new plan format. */
-export interface PlanningCheck { id: string; program: string; args: string[]; timeoutMs: number; files?: string[] }
+export interface PlanningCheck {
+  id: string; program: string; args: string[]; timeoutMs: number; files?: string[];
+  kind?: 'command' | 'test';
+  /** A runner summary regex with the selected test count in capture group 1. */
+  selectedTests?: { pattern: string; allowEmpty?: boolean };
+}
 export interface PlanningSource { path: string; sha256: string }
 export interface PlanningInterface { id: string; version: string; digest?: string }
 export interface PlanningCapability {
@@ -39,6 +44,8 @@ export interface PlanningManifest {
   capacities?: Record<string, number>;
   sizing?: PlanningSizing;
   semanticReview?: { mode: 'off' | 'auto' | 'required'; command?: Omit<PlanningCheck, 'id'> };
+  provenance?: { baselineCommit: string; baselineSources: PlanningSource[];
+    fragments: { namespace: string; revision: string; requirements: Record<string, string>; criteria: Record<string, string> }[] };
 }
 export interface PlanningFinding {
   id: string; rule: string; tasks: string[]; references: string[]; evidence: string[];
@@ -78,6 +85,9 @@ export function digest(value: unknown): string {
 }
 
 export function assertPlanningRequirementsPreserved(before: PlanningManifest, after: PlanningManifest): void {
+  if (before.provenance && (!after.provenance || before.provenance.baselineCommit !== after.provenance.baselineCommit ||
+    digest(before.provenance.baselineSources) !== digest(after.provenance.baselineSources) ||
+    before.provenance.fragments.some(f => !after.provenance!.fragments.some(next => digest(next) === digest(f))))) throw Error('Correction changes original import provenance');
   for (const original of before.sources) if (!after.sources.some(s => s.path === original.path && s.sha256 === original.sha256)) throw Error(`Correction changes authoritative source ${original.path}`);
   for (const original of before.criteria) {
     const replacement = after.criteria.find(c => c.id === original.id);
@@ -101,6 +111,33 @@ function source(v: unknown): void {
 function interfaceValue(v: unknown): void {
   if (!record(v) || !text(v.id) || !text(v.version) || v.digest !== undefined && !text(v.digest)) throw Error('Invalid interface identity');
 }
+/** Known test entry points require explicit count policy; opaque custom commands opt in. */
+export function isKnownTestCommand(program: string, args: string[]): boolean {
+  const commandBase = (value: string): string => value.replace(/\\/g, '/').split('/').pop()!.toLowerCase().replace(/\.(exe|cmd|bat|ps1|mjs|cjs|js)$/, '');
+  const base = commandBase(program);
+  const runners = new Set(['pytest', 'py.test', 'vitest', 'jest', 'mocha', 'ava', 'tap', 'tsx-test']);
+  if (runners.has(base)) return true;
+  if (/^(python(?:\d+(?:\.\d+)?)?|py)$/.test(base)) return args.some((arg, index) => arg === '-m' && args[index + 1] === 'pytest');
+  if (base === 'node') return args.includes('--test') || !!args[0] && runners.has(commandBase(args[0]));
+  if (['npm', 'pnpm', 'yarn', 'bun', 'npx'].includes(base)) {
+    const valueOptions = new Set(['--prefix', '--dir', '-C', '--cwd', '--workspace', '-w', '--filter', '-F', '--cache', '--registry', '--userconfig']);
+    const positional: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+      if (valueOptions.has(args[i]!)) { i++; continue; }
+      if (!args[i]!.startsWith('-')) positional.push(args[i]!);
+    }
+    const command = positional[0];
+    if (command && /^test(?::|$)/.test(command)) return true;
+    if (command === 'run' || command === 'run-script') {
+      const script = positional[1];
+      if (script && /^test(?::|$)/.test(script)) return true;
+      return false;
+    }
+    const executable = ['exec', 'dlx', 'x'].includes(command ?? '') ? positional[1] : command;
+    return !!executable && runners.has(commandBase(executable));
+  }
+  return false;
+}
 export function validatePlanningCheck(v: unknown): asserts v is PlanningCheck {
   if (!record(v) || !text(v.id) || !text(v.program) || !Array.isArray(v.args) ||
     v.args.some(a => typeof a !== 'string' || /[\0\r\n]/.test(a)) ||
@@ -109,6 +146,14 @@ export function validatePlanningCheck(v: unknown): asserts v is PlanningCheck {
     if (!Array.isArray(v.files)) throw Error('Acceptance files must be a path array');
     v.files.forEach(safePlanningPath);
   }
+  if (v.kind !== undefined && !['command', 'test'].includes(String(v.kind))) throw Error('Invalid check kind');
+  if (v.kind !== 'command' && isKnownTestCommand(v.program, v.args as string[]) && v.kind !== 'test') throw Error('Known test runners require kind: test and a selectedTests count contract; kind: command is an explicit exemption');
+  if (v.kind === 'test' && !v.selectedTests) throw Error('Test checks require a selectedTests count contract');
+  if (v.selectedTests !== undefined) {
+    if (v.kind !== 'test' || !record(v.selectedTests) || !text(v.selectedTests.pattern) ||
+      v.selectedTests.allowEmpty !== undefined && typeof v.selectedTests.allowEmpty !== 'boolean') throw Error('Invalid selectedTests contract');
+    try { new RegExp(v.selectedTests.pattern, 'm'); } catch { throw Error('Invalid selectedTests pattern'); }
+  }
 }
 /** Shape checks only. Relationship errors are returned as actionable findings. */
 export function validatePlanningManifest(v: unknown): asserts v is PlanningManifest {
@@ -116,6 +161,13 @@ export function validatePlanningManifest(v: unknown): asserts v is PlanningManif
     !Array.isArray(v.sources) || !Array.isArray(v.requirements) || !Array.isArray(v.criteria) ||
     !Array.isArray(v.tasks) || !v.tasks.length) throw Error('Expected version 2 planning manifest with sources, requirements, criteria and tasks');
   v.sources.forEach(source);
+  if (v.provenance !== undefined) {
+    if (!record(v.provenance) || typeof v.provenance.baselineCommit !== 'string' || !/^[a-f0-9]{40}$/.test(v.provenance.baselineCommit) ||
+      !Array.isArray(v.provenance.baselineSources) || !Array.isArray(v.provenance.fragments)) throw Error('Invalid import provenance');
+    v.provenance.baselineSources.forEach(source);
+    for (const f of v.provenance.fragments) if (!record(f) || !text(f.namespace) || typeof f.revision !== 'string' || !/^[a-f0-9]{64}$/.test(f.revision) ||
+      !record(f.requirements) || !record(f.criteria) || [...Object.values(f.requirements), ...Object.values(f.criteria)].some(id => !text(id))) throw Error('Invalid fragment provenance');
+  }
   for (const r of v.requirements) if (!record(r) || !text(r.id) || !text(r.title) || typeof r.description !== 'string' || !strings(r.acceptance) || !r.acceptance.length) throw Error('Requirement needs acceptance IDs');
   for (const c of v.criteria) if (!record(c) || !text(c.id) || typeof c.text !== 'string' || !c.text.trim() ||
     !['local', 'integration', 'final'].includes(String(c.stage)) || !text(c.owner) || !strings(c.contributors) || !strings(c.checks) || !c.checks.length ||

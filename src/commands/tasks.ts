@@ -2,7 +2,8 @@
 // reviewers attached to a task, gates, logs, and the diagnostic views
 // (list/status/ready/blocked/show/dot).
 import { readdirSync, rmSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
+import { executionReport } from '../execution-report.js';
 import {
   addTask,
   attemptLogFiles,
@@ -46,6 +47,22 @@ import {
   taskTimingFlags,
 } from '../cli-args.js';
 import { TASK_STATUSES, type TaskStatus } from '../types.js';
+import { validateBrief } from '../flow3/graph.js';
+
+function nodeFlags(argv: string[], previous?: Parameters<typeof addTask>[1]['node']): Parameters<typeof addTask>[1]['node'] {
+  const fields = ['goal', 'touches', 'creates', 'relies-on', 'verify'];
+  if (!fields.some(name => argv.includes(`--${name}`))) return undefined;
+  const node = {
+    goal: flag(argv, 'goal') ?? previous?.goal ?? flag(argv, 'spec') ?? flag(argv, 'title') ?? '',
+    touches: argv.includes('--touches') ? parseList(flag(argv, 'touches')) : previous?.touches ?? [],
+    creates: argv.includes('--creates') ? parseList(flag(argv, 'creates')) : previous?.creates ?? [],
+    relies_on: argv.includes('--relies-on') ? parseList(flag(argv, 'relies-on')) : previous?.relies_on ?? [],
+    verify: flag(argv, 'verify') ?? previous?.verify ?? '',
+  };
+  const errors = validateBrief(node);
+  if (errors.length) throw Error(errors.join('; '));
+  return node;
+}
 
 // A redundant dep (reachable via another direct dep) adds blocking without
 // adding order. Warn on stderr so --json stdout stays parseable; the edge is
@@ -75,6 +92,8 @@ export function addCmd(argv: string[]): void {
   const timing = taskTimingFlags(argv);
   if (has(argv, 'no-plan')) timing.planCmd = '';
   const task = addTask(run, {
+    node: nodeFlags(argv),
+    id: flag(argv, 'id'),
     title,
     spec,
     deps: parseList(flag(argv, 'deps')),
@@ -95,6 +114,8 @@ export function editCmd(argv: string[]): void {
   const id = flag(argv, 'id');
   if (!id) throw new Error('--id is required');
   const patch: Parameters<typeof editTask>[2] = {};
+  const node = nodeFlags(argv, run.tasks[id]?.node);
+  if (node) patch.node = node;
   const title = flag(argv, 'title');
   const spec = flag(argv, 'spec');
   const cmdV = cmdFlag(argv);
@@ -199,6 +220,7 @@ export function statusCmd(argv: string[]): void {
       ready: getReady(run).map((t) => t.id),
       blocked: getBlocked(run).map((t) => t.id),
       stuck: describeStuck(run),
+      execution: executionReport(run, { root: dirname(resolve(file)) }),
     },
     () => summarize(run),
   );

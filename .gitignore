@@ -1,6 +1,9 @@
 node_modules/
 dist/
 
+# Local copies of chat uploads
+.codex-remote-attachments/
+
 # run data and runtime artifacts (these belong to each user's project, not here)
 *.run.json
 *.run.json.bak

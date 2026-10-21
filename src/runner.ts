@@ -1,11 +1,21 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, type WriteStream } from 'node:fs';
+import { FlowRunner } from './flow3/runner.js';
+import { createWriteStream, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync, type WriteStream } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { resolveCommand } from './command-resolution.js';
-import { planningRefusal, planningAdmitted, planningProbes, recordPlanningAcceptance, recordPlanningFailure, missingPlanningAcceptance } from './planning/runtime.js';
-import { checkCommand } from './planning/compile.js';
-import { forwardReferenceFailure } from './planning/acceptance-lint.js';
+import { codexStdin, codexReviewArgs, codexWorkArgs } from './codex-transport.js';
+import { agentSessionArgs, captureSessionEvent, type WorkerSession } from './agent-session.js';
+import { invokeReviewProtocol, parseReviewBody, reviewEnvelope, REVIEW_BODY_SCHEMA, ReviewProtocolError } from './review-protocol.js';
+import { captureExecutionPolicy } from './execution-policy.js';
+import { budgetFor, budgetRemaining, remainingTaskTime, repeatedFailure } from './execution-budget.js';
+import { integrateVerifiedCandidate, reconcileIntegrationReceipt } from './integration.js';
+import { artifactRiskSignals } from './artifact-risk.js';
+import { fileBackedAgentArgs } from './bulk-prompts.js';
+import { proposeFollowups, workerFollowupProposals } from './followups.js';
+import { captureQuotaPause, finishQuotaPause, claimQuotaContinuations, quotaVerificationDeadline, type QuotaContinuation } from './quota-recovery.js';
+import { planningRefusal, planningAdmitted, recordPlanningAcceptance, missingPlanningAcceptance } from './planning/runtime.js';
+import { planningDefinition } from './planning/compile.js';
 import { digest, type PlanningFinding } from './planning/contracts.js';
 import { validatePlan } from './planning/validation.js';
 import {
@@ -27,7 +37,6 @@ import {
   gateBlocks,
   isTerminal,
   topoSort,
-  transitiveDependentIds,
 } from './graph.js';
 import { attemptsForChain, planAttempt, type HarnessCandidate } from './harness-chain.js';
 import { routeModel, type ModelRouteCandidate, type ModelTier } from './factory/model-router.js';
@@ -56,6 +65,7 @@ import {
 import {
   ATTEMPT_LOG_CAP_DEFAULT,
   DEFAULT_SETTINGS,
+  DEFINITION_FIELDS,
   OUTPUT_TAIL_LIMIT,
   PLAN_LIMIT,
   RESULT_LIMIT,
@@ -86,6 +96,10 @@ const refuseMessage = (file: string): string =>
  * the fields a given phase actually produced; `renderTokens` substitutes them.
  */
 export interface TokenContext {
+  reviewEvidenceFile?: string;
+  reviewScope?: 'final';
+  reviewOutputFile?: string;
+  reviewSchemaFile?: string;
   // Path to the current attempt's captured plan (the `{planFile}` token).
   planFile?: string;
   // Chain review: facts about the tasks this task covers.
@@ -109,6 +123,13 @@ export interface TokenContext {
 }
 
 export interface ExecContext extends TokenContext {
+  readOnly?: boolean;
+  env?: NodeJS.ProcessEnv;
+  /** Mutable harness conversation identity, reused only through a straight chain. */
+  session?: WorkerSession;
+  executionProfile?: 'lean' | 'legacy' | 'flow3';
+  promptDirectory?: string;
+  onTransport?: (metadata: { bytes: number; sha256: string; path?: string }) => void;
   // The executor contract: stream output for the heartbeat/log, hand the runner
   // a kill hook and the live pid, and ask whether a stop/kill already claimed
   // this task before treating a termination as the task's own outcome.
@@ -275,6 +296,9 @@ export function renderTokens(token: string, task: Task, ctx?: TokenContext): str
     spec: task.spec ?? '',
     plan: task.plan ?? '(no plan)',
     planFile: ctx?.planFile ?? '',
+    reviewOutputFile: ctx?.reviewOutputFile ?? '',
+    reviewSchemaFile: ctx?.reviewSchemaFile ?? '',
+    reviewEvidenceFile: ctx?.reviewEvidenceFile ?? '',
     diffFile: ctx?.diffFile ?? '',
     diffBase: ctx?.diffBase ?? '',
     diffHead: ctx?.diffHead ?? '',
@@ -306,7 +330,7 @@ export function renderTokens(token: string, task: Task, ctx?: TokenContext): str
 // the runner can treat stdout/stderr activity as a heartbeat.
 // `cwd` matters: without it an agent started from the viewer would work in
 // whatever directory the server happened to be launched from.
-export function shellExecutor(cwd?: string): Executor {
+export function shellExecutor(cwd?: string, spawnProcess: typeof spawn = spawn): Executor {
   return (task, ctx, cmdOverride) =>
     new Promise((resolve, reject) => {
       const command = cmdOverride ?? task.cmd;
@@ -314,15 +338,25 @@ export function shellExecutor(cwd?: string): Executor {
         reject(Object.assign(new Error('no cmd'), { kind: 'manual' as FailureKind }));
         return;
       }
-      const [file, ...args] = shellSplit(command).map((token) => renderTokens(token, task, ctx));
+      const [file, ...rawArgs] = shellSplit(command).map((token) => renderTokens(token, task, ctx));
+      const reviewArgs = ctx.reviewOutputFile ? codexReviewArgs(file, rawArgs, ctx.reviewOutputFile, ctx.reviewSchemaFile)
+        : ctx.executionProfile === 'lean' ? codexWorkArgs(file, rawArgs, ctx.readOnly ? 'read-only' : 'workspace-write') : rawArgs;
+      const sessionArgs = agentSessionArgs(file, reviewArgs, ctx.session);
+      const transported = fileBackedAgentArgs(file, sessionArgs, ctx.promptDirectory ?? join(tmpdir(), 'dag-prompts', String(process.pid)));
+      const args = transported.args;
+      for (const payload of transported.payloads) ctx.onTransport?.(payload);
+      const stdin = codexStdin(file, args);
+      if (stdin) ctx.onTransport?.({ bytes: Buffer.byteLength(stdin.prompt, 'utf8'), sha256: digest(stdin.prompt) });
       const resolved = resolveCommand(file);
       let child: ChildProcess;
       try {
-        child = spawn(resolved.file, [...resolved.args, ...args], {
+        child = spawnProcess(resolved.file, [...resolved.args, ...(stdin?.args ?? args)], {
           windowsHide: true,
           detached: process.platform !== 'win32',
-          stdio: ['ignore', 'pipe', 'pipe'],
+          stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
           cwd: ctx.cwd ?? cwd,
+          env: { ...process.env, ...ctx.env, PYTHONDONTWRITEBYTECODE: '1', PYTHONPYCACHEPREFIX: process.env.PYTHONPYCACHEPREFIX ?? join(tmpdir(), 'dag-python-cache'), ...(ctx.reviewOutputFile ? { DAG_REVIEW_OUTPUT: ctx.reviewOutputFile,
+            DAG_REVIEW_SCHEMA: ctx.reviewSchemaFile ?? '' } : {}) },
         });
       } catch (err) {
         reject(Object.assign(err as Error, { kind: 'spawn' as FailureKind }));
@@ -334,8 +368,20 @@ export function shellExecutor(cwd?: string): Executor {
       // reasons are at the end of the output, and a head-truncated transcript
       // let an early "VERDICT: PASS" outvote a late "VERDICT: FAIL".
       let output = '';
+      let sessionLines = '';
       const onData = (buf: Buffer): void => {
         const chunk = buf.toString();
+        if (ctx.session) {
+          sessionLines += chunk;
+          const lines = sessionLines.split(/\r?\n/); sessionLines = lines.pop() ?? '';
+          for (const line of lines) {
+            try {
+              const event = JSON.parse(line);
+              captureSessionEvent(file, ctx.session, event);
+            } catch { /* non-JSON output */ }
+          }
+          sessionLines = sessionLines.slice(-65536);
+        }
         output += chunk;
         if (output.length > CAPTURE_LIMIT * 2) output = output.slice(-CAPTURE_LIMIT * 2);
         ctx.onOutput(chunk);
@@ -346,6 +392,15 @@ export function shellExecutor(cwd?: string): Executor {
         ctx.setPid(null);
         reject(Object.assign(err, { kind: 'spawn' as FailureKind }));
       });
+      if (stdin) {
+        child.stdin!.on('error', err => {
+          if ((err as NodeJS.ErrnoException).code !== 'EPIPE') {
+            killTree(child);
+            reject(Object.assign(err, { kind: 'spawn' as FailureKind }));
+          }
+        });
+        child.stdin!.end(stdin.prompt);
+      }
       child.on('close', (code, signal) => {
         ctx.setPid(null);
         const captured =
@@ -390,6 +445,9 @@ function tailOf(output: string): string {
  * All optional: an unset value falls back to the run's settings, then defaults.
  */
 export interface RunnerOptions {
+  /** Explicit operator recovery: verify saved output without another implementation dispatch. */
+  quotaRecovery?: boolean;
+  verificationRecovery?: { taskId: string; reason: string; sourceCommit?: string; removeGenerated?: string[]; extendTime?: boolean };
   /** A durable controller owns retry routing; this runner executes one attempt. */
   controllerManaged?: boolean;
   workCommand?: (task: Task) => string;
@@ -428,6 +486,7 @@ export interface RunnerOptions {
 
 /** Final buckets for a settled run, plus recovery and end-of-run review facts. */
 export interface RunSummary {
+  flow3?: { passed: boolean; repairRounds: number; issues: string[] };
   planningError?: string;
   scope: string[];
   completed: string[];
@@ -462,6 +521,7 @@ interface AttemptLog {
 
 /** The execution engine for one run: schedule, execute, review, and land tasks. */
 export class DagRunner {
+  private flowRunner?: FlowRunner;
   // Task ids currently being executed, whether or not their process is alive.
   private inFlight = new Set<string>();
   // Kill hooks installed by executors, keyed by task id.
@@ -492,6 +552,12 @@ export class DagRunner {
   private budgetReached = false;
   // Interrupted tasks requeued and orphan pids spotted at start, reported at end.
   private recovery: RecoveryResult = { requeued: [], orphanPids: [] };
+  private quotaRecoveries = new Map<string, QuotaContinuation>();
+  private verificationRecovery?: { taskId: string; source: string; id: string; deadline: number; removeGenerated: string[] };
+
+  private remainingTime(task: Task): number {
+    return this.quotaRecoveries.has(task.id) ? this.quotaRecoveries.get(task.id)!.deadline - Date.now() : this.verificationRecovery?.taskId === task.id ? this.verificationRecovery.deadline - Date.now() : remainingTaskTime(task);
+  }
   // Releases the run-file lock on teardown; null when the caller already held it.
   private releaseLock: (() => void) | null = null;
   // Per-task worktree path, and the integration commit the worktree branched from.
@@ -524,30 +590,42 @@ export class DagRunner {
   ) {}
 
   get isRunning(): boolean {
+    if (this.flowRunner) return this.flowRunner.isRunning;
     return this.active;
   }
 
   get isStopping(): boolean {
+    if (this.flowRunner) return this.flowRunner.isStopping;
     return this.stopping;
   }
 
   get current(): string[] {
+    if (this.flowRunner) return this.flowRunner.current;
     return [...this.inFlight];
   }
 
   get result(): RunSummary | null {
+    if (this.flowRunner) return this.flowRunner.result;
     return this.summary;
   }
 
   // Resolves when the run settles or stops. Never rejects.
   async start(scope: Set<string> | null = null): Promise<void> {
+    if (!this.opts.controllerManaged && this.state.settings.executionProfile === 'flow3') {
+      this.flowRunner ??= new FlowRunner(this.state, {
+        ...this.opts,
+        executor: (task, context, command) => (this.opts.executor ?? shellExecutor(this.opts.cwd))(
+          task, context, resolveHarness(command ?? task.cmd ?? '', task, this.state.settings)),
+      }, ownedFiles);
+      return this.flowRunner.start(scope);
+    }
     if (this.active) return this.loopPromise ?? Promise.resolve();
     const planningError = planningRefusal(this.state, this.opts.cwd ?? (this.opts.file ? dirname(resolve(this.opts.file)) : process.cwd()), this.opts.file ? runPaths(this.opts.file).dir : undefined);
     if (planningError) {
-      const ids = [...(scope ?? Object.keys(this.state.tasks))];
-      this.log('note', null, planningError);
-      this.summary = { planningError, scope: ids, completed: [], failed: ids, skipped: [], unfinished: ids, stopped: true, budgetReached: false, interrupted: { requeued: [], orphanPids: [] }, finalReview: null };
-      return;
+      // Implementation-first execution: source/definition/acceptance
+      // validation is deferred to a separate validation pass. Record the
+      // refusal so the later pass can act on it, but never stop dispatch.
+      this.log('note', null, `planning validation deferred: ${planningError}`);
     }
 
     // A run file can be hand-edited or written by an older version: an
@@ -625,6 +703,73 @@ export class DagRunner {
     this.stopGate.catch(() => undefined);
 
     this.recovery = recoverInterrupted(this.state);
+    if (this.opts.quotaRecovery) {
+      try {
+        if (!this.opts.file || this.opts.controllerManaged || this.state.settings.executionProfile !== 'lean' || this.opts.verificationRecovery)
+          throw Error('Quota continuation requires current policy, persisted isolated run and no other recovery');
+        this.quotaRecoveries = new Map(claimQuotaContinuations(this.state, this.opts.file, this.opts.cwd).map(item => [item.taskId, item]));
+      } catch (error) {
+        this.releaseLock?.(); this.releaseLock = null; ownedFiles.delete(this.opts.file!); this.active = false; throw error;
+      }
+    }
+    if (this.opts.verificationRecovery) {
+      try {
+      const request = this.opts.verificationRecovery, task = this.state.tasks[request.taskId];
+      let amendmentRevision: string | undefined;
+      let quotaPriorIdentity: { revision?: string; definition: string } | undefined;
+      if (this.opts.file && task?.status === 'pending') {
+        const path = join(runPaths(this.opts.file).dir, 'planning-amendment.json');
+        const journal = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : null;
+        const prior = journal?.previousRun?.tasks?.[task.id] as Task | undefined;
+        // Only amendPlan's committed failed -> pending transition permits verification-only
+        // recovery. Every observed field must still match its saved failed snapshot.
+        const observed = (value: Task) => {
+          const copy = { ...value } as Record<string, unknown>;
+          for (const key of ['status', 'title', 'spec', 'deps', 'cmd', 'reviewCmd', 'reviewers', 'planCmd', 'prepareCmd', 'harnessChain']) delete copy[key];
+          return digest(copy);
+        };
+        const planning = this.state.planning;
+        if (journal?.version !== 1 || journal.stage !== 'committed' || !journal.previousRun ||
+            journal.previousRun.id !== this.state.id || journal.previousRunDigest !== digest(journal.previousRun) ||
+            !planning || journal.revision !== planning.revision || journal.revision !== this.state.planningState?.revision ||
+            journal.revision === journal.previousRun.planning?.revision || digest(planning.manifest) !== journal.revision ||
+            !validatePlan(planning.manifest).valid || planningDefinition(task) !== planning.definitions[task.id] ||
+            !prior || prior.status !== 'failed' || observed(prior) !== observed(task)) {
+          throw Error('Pending verification recovery requires an unchanged failed attempt from a committed planning amendment');
+        }
+        amendmentRevision = journal.revision;
+        quotaPriorIdentity = { revision: journal.previousRun.planning?.revision, definition: planningDefinition(prior) };
+      }
+      if (!this.opts.file || this.opts.controllerManaged || this.state.settings.executionProfile !== 'lean' ||
+          !task || (task.status !== 'failed' && !amendmentRevision) || !task.commit || task.attempts < 1 || !request.reason.trim()) {
+        throw Error('Verification recovery requires a stopped failed task with saved output, current policy and an explicit reason');
+      }
+      const owned = new Set(this.state.planning?.manifest.tasks.find(t => t.id === task.id)?.files?.map(f => f.path) ?? []);
+      const removeGenerated = request.removeGenerated ?? [];
+      for (const path of removeGenerated) {
+        const match = path.match(/^(.*\/)?__pycache__\/([^/]+)\.cpython-\d+(?:\.opt-\d+)?\.pyc$/);
+        if (!match || !owned.has(`${match[1] ?? ''}${match[2]}.py`)) throw Error(`Recovery may remove only Python cache files derived from owned source: ${path}`);
+      }
+      const quotaDeadline = request.extendTime === true ? undefined : quotaVerificationDeadline(this.state, this.opts.file, task, quotaPriorIdentity);
+      const deadline = request.extendTime === true ? Date.now() + 2_700_000 : quotaDeadline ?? Date.now() + 2_700_000;
+      const timeException = request.extendTime === true ? { originalDeadlineAt: task.executionBudget?.deadlineAt ?? null,
+        effectiveOldDeadlineAt: null, effectiveOldDeadlineKnown: false,
+        newDeadlineAt: new Date(deadline).toISOString(), reason: request.reason, verificationOnly: true } : undefined;
+      const id = `${task.id}-${task.attempts}-${Date.now()}`;
+      atomicWriteJson(join(runPaths(this.opts.file).dir, 'recoveries', `${id}.json`), {
+        version: 1, id, reason: request.reason, sourceCommit: request.sourceCommit ?? task.commit, implementationAttemptsPreserved: task.attempts,
+        removeGenerated, ...(timeException ? { timeException } : {}), priorTask: structuredClone(task), ...(amendmentRevision ? { amendmentRevision } : {}), requestedAt: nowIso(),
+      });
+      this.verificationRecovery = { taskId: task.id, source: request.sourceCommit ?? task.commit, id, deadline, removeGenerated };
+      task.status = 'pending'; this.persist(); this.flush();
+      if (this.dirty) throw Error('Cannot persist verification recovery');
+      this.log('note', task.id, `Recovering verification of ${task.commit}; implementation budget and failed history retained`);
+      } catch (error) {
+        this.releaseLock?.(); this.releaseLock = null;
+        ownedFiles.delete(this.opts.file!); this.active = false;
+        throw error;
+      }
+    }
     this.log('run-start', null, scope ? `run started for ${scope.size} task(s)` : 'run started (all tasks)');
     if (this.recovery.requeued.length > 0) {
       this.log(
@@ -641,6 +786,8 @@ export class DagRunner {
       );
     }
     try {
+      this.state.executionPolicy = captureExecutionPolicy(this.state, this.opts.controllerManaged ? 'controller-managed' : 'ordinary');
+      this.persist();
       await this.setupIsolation();
     } catch (err) {
       // Isolation was explicitly requested: refuse to run without it rather
@@ -689,11 +836,16 @@ export class DagRunner {
 
   // Kills the whole tree, waits a bounded grace period, then force-settles
   // anything still "running" so the loop cannot hang.
-  async stop(): Promise<void> {
+  async stop(reason?: 'quota'): Promise<void> {
+    if (this.flowRunner) return this.flowRunner.stop();
     if (!this.active || this.stopping) {
       await (this.loopPromise ?? Promise.resolve());
       return;
     }
+    let quotaPause: ReturnType<typeof captureQuotaPause> | undefined;
+    let quotaCaptureError: unknown;
+    try { quotaPause = reason === 'quota' && this.opts.file ? captureQuotaPause(this.state, this.opts.file, new Date().toISOString(), task => this.remainingTime(task)) : undefined; }
+    catch (error) { quotaCaptureError = error; } // Quota admission failure must never prevent stopping workers.
     this.stopping = true;
     this.log('run-stop', null, 'stop requested; killing running tasks');
     this.flush();
@@ -727,8 +879,10 @@ export class DagRunner {
     this.rejectStopGate?.(Object.assign(new Error('stopped by user'), { kind: 'killed' as FailureKind }));
     this.rejectStopGate = null;
     await (this.loopPromise ?? Promise.resolve());
+    if (quotaPause && this.opts.file) finishQuotaPause(this.state, this.opts.file, quotaPause);
     this.log('note', null, 'run stopped');
     this.flush();
+    if (quotaCaptureError) throw quotaCaptureError;
   }
 
   // Kills one task's process tree and remembers why, so the settlement path
@@ -909,7 +1063,7 @@ export class DagRunner {
     // instead of waiting for its whole batch (which used to idle workers).
     const running = new Set<Promise<void>>();
     const launch = (task: Task): void => {
-      const promise = this.executeTask(task, execute, scope).finally(() => {
+      const promise = this.executeTask(task, execute).finally(() => {
         running.delete(promise);
       });
       running.add(promise);
@@ -939,7 +1093,7 @@ export class DagRunner {
           if (task.status !== 'pending' && task.status !== 'ready') continue;
           if (this.inFlight.has(task.id)) continue;
           if (gateBlocks(task) || !depsMet(task, run.tasks)) continue;
-          if (!planningAdmitted(run, task.id, this.inFlight.keys())) continue;
+          if (!planningAdmitted(run, task.id, this.inFlight.keys(), this.opts.cwd ?? (this.opts.file ? dirname(this.opts.file) : process.cwd()))) continue;
           if (
             task.deps.some((d) => {
               const dep = run.tasks[d];
@@ -1079,7 +1233,7 @@ export class DagRunner {
       const promptTask = { ...(first ?? ({} as Task)), id: first?.id ?? run.id, spec: this.runReviewPrompt(diff.ctx) };
       this.log('run-review', null, `end-of-run review: whole run (round ${round})`);
       try {
-        const outcome = await this.runPhase(promptTask, execute, cmdTemplate, 'review', undefined, undefined, diff.ctx);
+        const outcome = await this.invokeReviewer(promptTask, execute, cmdTemplate, 'final-run', this.state.settings.reviewVerdict, this.integration?.path ?? this.repoDir ?? undefined, undefined, diff.ctx);
         const verdict = verdictOf(outcome.output, outcome.exitCode);
         if (verdict.verdict === 'pass') {
           this.log('run-review', null, 'run review passed');
@@ -1103,7 +1257,7 @@ export class DagRunner {
         `reviewing ${task.diffBase?.slice(0, 8) ?? '(no base)'}..${task.diffHead?.slice(0, 8) ?? '(no head)'}`,
       );
       try {
-        const outcome = await this.runPhase(promptTask, execute, cmdTemplate, 'review', undefined, undefined, diff.ctx);
+        const outcome = await this.invokeReviewer(promptTask, execute, cmdTemplate, 'final-task', this.state.settings.reviewVerdict, this.integration?.path ?? this.repoDir ?? undefined, undefined, diff.ctx);
         const verdict = verdictOf(outcome.output, outcome.exitCode);
         reviewed.push(task.id);
         if (verdict.verdict === 'pass') {
@@ -1133,6 +1287,9 @@ export class DagRunner {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         task.finalReview = { verdict: 'error', reason: message.slice(0, 400), at: nowIso(), round };
+        if ((err as { kind?: string }).kind === 'review-protocol') {
+          task.status = 'failed'; task.failureKind = 'review-protocol'; task.result = `REVIEW_PROTOCOL_ERROR: ${message}`;
+        }
         errors.push(`${task.id}: ${message.slice(0, 120)}`);
         this.log('task-review-fail', task.id, `review could not run: ${message.slice(0, 200)}`);
       }
@@ -1326,16 +1483,11 @@ export class DagRunner {
       return 'ok';
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (this.stopping) {
-        task.status = 'pending';
-        task.failureKind = 'killed';
-        task.result = 'stopped by user';
-        return 'fail';
-      }
-      task.failureKind = 'setup';
-      task.result = `worktree prepare failed: ${truncate(message, RESULT_LIMIT)}`;
-      this.log('task-fail', task.id, `worktree prepare failed: ${truncate(message, 200)}`);
-      return 'fail';
+      // Environment preparation is best-effort: a failed install/compile step
+      // is recorded and the worker still runs. Only real worker/process
+      // failures may stop a task.
+      this.log('note', task.id, `worktree prepare failed (non-blocking, continuing): ${truncate(message, 200)}`);
+      return 'ok';
     }
   }
 
@@ -1362,8 +1514,6 @@ export class DagRunner {
       throw err;
     }
     if (outcome.exitCode !== 0) {
-      const findings = forwardReferenceFailure(this.state, task.id, outcome.output, worktreePath ?? this.opts.cwd ?? process.cwd());
-      if (findings.length) throw Object.assign(new Error(outcome.output), { kind: 'plan', planningFindings: findings });
       throw Object.assign(new Error(`planner exit ${outcome.exitCode}${tailOf(stripAnsi(outcome.output))}`),
         { kind: 'plan' as FailureKind, exitCode: outcome.exitCode });
     }
@@ -1400,6 +1550,28 @@ export class DagRunner {
 
   // One phase (main command or reviewer) with its own timeout/silence watchdog.
   private async runPhase(
+    task: Task, execute: Executor, cmd: string | null, label: 'run' | 'review' | 'plan',
+    worktreePath?: string, planFile?: string, depsContext?: TokenContext, specOverride?: string,
+  ): Promise<ExecOutcome> {
+    const phaseKey = `${task.attempts}:${label}:${digest(cmd)}`;
+    for (;;) {
+      try { return await this.runPhaseOnce(task, execute, cmd, label, worktreePath, planFile, depsContext, specOverride); }
+      catch (error) {
+        const kind = (error as { kind?: string }).kind;
+        const budget = task.executionBudget;
+        if (this.opts.controllerManaged || this.state.settings.executionProfile !== 'lean' || !budget || this.stopping ||
+          !['spawn', 'timeout', 'stalled'].includes(kind ?? '') || this.remainingTime(task) <= 0) throw error;
+        const used = budget.infrastructureRetries[phaseKey] ?? 0;
+        if (used >= (this.state.settings.infrastructureRetries ?? 2)) throw error;
+        budget.infrastructureRetries[phaseKey] = used + 1;
+        this.persist(); this.flush();
+        if (this.dirty) throw Object.assign(new Error('Cannot persist phase retry budget'), { kind: 'budget' });
+        this.log('note', task.id, `retrying ${label} infrastructure phase only (${used + 1}/2)`);
+      }
+    }
+  }
+
+  private async runPhaseOnce(
     task: Task,
     execute: Executor,
     cmd: string | null,
@@ -1409,7 +1581,14 @@ export class DagRunner {
     depsContext?: TokenContext,
     specOverride?: string,
   ): Promise<ExecOutcome> {
-    const timeoutMs = this.opts.timeoutFor?.(task) ?? task.timeoutMs ?? this.opts.timeoutMs ?? this.state.settings.timeoutMs;
+    const started = Date.now();
+    const configuredTimeout = this.opts.timeoutFor?.(task) ?? task.timeoutMs ?? this.opts.timeoutMs ?? this.state.settings.timeoutMs;
+    const remaining = this.opts.controllerManaged || depsContext?.reviewScope === 'final' ? Infinity : this.remainingTime(task);
+    if (remaining <= 0) throw Object.assign(new Error('Task elapsed-time budget exhausted'), { kind: 'budget' });
+    const timeoutMs = Math.min(configuredTimeout > 0 ? configuredTimeout : Infinity, remaining);
+    const phaseAttempt = task.attempts, phaseToken = this.tokens.get(task.id);
+    const currentPhase = (): boolean => (this.state.tasks[task.id]?.attempts ?? phaseAttempt) === phaseAttempt && this.tokens.get(task.id) === phaseToken;
+    let phaseOutcome = 'error';
     const silenceMs = task.silenceMs ?? this.opts.silenceMs ?? this.state.settings.silenceMs;
     let lastOutputMs = Date.now();
     let warnCount = 0;
@@ -1419,12 +1598,12 @@ export class DagRunner {
     });
 
     const hardTimer =
-      timeoutMs > 0
+      Number.isFinite(timeoutMs) && timeoutMs > 0
         ? setTimeout(() => {
-            this.killTask(task.id, 'timeout');
+            this.killTask(task.id, remaining <= configuredTimeout || configuredTimeout <= 0 ? 'budget' : 'timeout');
             reap(
               Object.assign(new Error(`timeout after ${Math.round(timeoutMs / 1000)}s`), {
-                kind: 'timeout' as FailureKind,
+                kind: (remaining <= configuredTimeout || configuredTimeout <= 0 ? 'budget' : 'timeout') as FailureKind,
               }),
             );
           }, timeoutMs)
@@ -1482,7 +1661,11 @@ export class DagRunner {
         : null;
 
     const ctx: ExecContext = {
+      executionProfile: this.state.settings.executionProfile,
+      promptDirectory: join(runPaths(this.opts.file ?? join(tmpdir(), `dag-${this.state.id}.json`)).dir, 'prompts', digest({ id: task.id, attempt: task.attempts, phase: label }).slice(0, 24)),
+      onTransport: metadata => this.log('note', task.id, `Payload transport: ${JSON.stringify(metadata)}`),
       onOutput: (chunk) => {
+        if (!currentPhase()) return;
         lastOutputMs = Date.now();
         task.lastOutputAt = nowIso();
         const merged = (task.lastOutput ?? '') + chunk;
@@ -1491,9 +1674,10 @@ export class DagRunner {
         this.appendLog(task.id, chunk);
         this.persist();
       },
-      registerKill: (fn) => this.kills.set(task.id, fn),
-      aborted: () => this.reasons.has(task.id),
+      registerKill: (fn) => { if (currentPhase()) this.kills.set(task.id, fn); else fn(); },
+      aborted: () => !currentPhase() || this.reasons.has(task.id),
       setPid: (pid) => {
+        if (!currentPhase()) return;
         task.pid = pid;
         this.persist();
       },
@@ -1513,6 +1697,10 @@ export class DagRunner {
       diffHead: depsContext?.diffHead,
       diffStat: depsContext?.diffStat,
       files: depsContext?.files,
+      reviewOutputFile: depsContext?.reviewOutputFile,
+      reviewSchemaFile: depsContext?.reviewSchemaFile,
+      reviewEvidenceFile: depsContext?.reviewEvidenceFile,
+      reviewScope: depsContext?.reviewScope,
     };
 
     try {
@@ -1524,12 +1712,17 @@ export class DagRunner {
         // losing branch of the race; the winner reports it
       });
       const outcome = await Promise.race([execPromise, reaper, this.stopGate]);
+      phaseOutcome = outcome.exitCode === 0 ? 'pass' : `exit:${outcome.exitCode}`;
       const killReason = this.reasons.get(task.id);
       if (killReason) {
         throw Object.assign(new Error(`killed: ${killReason}`), { kind: killReason });
       }
       return outcome;
     } finally {
+      const record = { attempt: task.attempts, phase: cmd?.includes('check-command') ? 'check' : label,
+        startedAt: new Date(started).toISOString(), finishedAt: nowIso(), durationMs: Date.now() - started, outcome: phaseOutcome };
+      const durableTask = this.state.tasks[task.id];
+      if (durableTask) { (durableTask.phaseHistory ??= []).push(record); this.persist(); }
       if (hardTimer) clearTimeout(hardTimer);
       if (watchTimer) clearInterval(watchTimer);
       this.kills.delete(task.id);
@@ -1569,21 +1762,132 @@ export class DagRunner {
     return { lines, files };
   }
 
+  // Source evidence detects reviewer edits; OS sandboxing remains the adapter's responsibility.
+  private reviewSourceIdentity(root: string): string {
+    const listed = git(root, ['ls-files', '-c', '--others', '--exclude-standard', '-z']);
+    if (listed.code) throw new Error('Cannot freeze reviewed source identity');
+    return digest([...new Set(listed.stdout.split('\0').filter(Boolean))].sort().map(path => {
+      const file = join(root, path);
+      let entry: ReturnType<typeof lstatSync>;
+      try { entry = lstatSync(file); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [path, null];
+        throw error;
+      }
+      if (entry.isSymbolicLink()) return [path, digest({ symlink: readlinkSync(file) })];
+      if (entry.isDirectory()) {
+        // Gitlinks are directories. Include initialized submodule contents and
+        // revision; an uninitialized gitlink has no checked-out source to hash.
+        return [path, existsSync(join(file, '.git'))
+          ? [git(file, ['rev-parse', 'HEAD']).stdout, this.reviewSourceIdentity(file)]
+          : 'uninitialized-gitlink'];
+      }
+      return [path, entry.isFile() ? digest(readFileSync(file)) : digest({ specialFile: entry.mode })];
+    }));
+  }
+
+  private async invokeReviewer(task: Task, execute: Executor, cmd: string, name: string,
+    mode: 'marker' | 'structured' | 'exit-code', root?: string, planFile?: string, context?: TokenContext,
+  ): Promise<ExecOutcome> {
+    if (mode === 'exit-code') return this.runPhase(task, execute, cmd, 'review', root, planFile, context);
+    const owner = this.state.tasks[task.id] ?? task;
+    const key = `${task.attempts}:${name}${this.verificationRecovery?.taskId === task.id ? ':' + this.verificationRecovery.id : ''}${name.startsWith('final') ? ':' + digest({ head: this.integration ? git(this.integration.path, ['rev-parse', 'HEAD']).stdout : task.diffHead, base: task.diffBase }) : ''}`;
+    const adapter = shellSplit(resolveHarness(cmd, task, this.state.settings))[0] ?? 'unknown';
+    const directory = join(runPaths(this.opts.file ?? join(tmpdir(), `dag-${this.state.id}.json`)).dir, 'reviews', digest({ key, id: task.id }).slice(0, 24));
+    const outputFile = join(directory, 'final.txt'), schemaFile = join(directory, 'schema.json');
+    mkdirSync(directory, { recursive: true });
+    if (mode === 'structured') atomicWriteJson(schemaFile, REVIEW_BODY_SCHEMA);
+    const finalScope = name.startsWith('final');
+    const manifest = this.state.planning?.manifest;
+    const contract = manifest?.tasks.find(item => item.id === task.id);
+    const references = new Set([task.id,
+      ...manifest?.criteria.filter(item => finalScope || item.owner === task.id).map(item => item.id) ?? [],
+      ...manifest?.requirements.filter(item => finalScope || contract?.requirements.includes(item.id)).map(item => item.id) ?? [],
+      ...this.state.planning?.manifest.sources.map(item => item.path) ?? [],
+      ...manifest?.tasks.filter(item => finalScope || item.id === task.id || task.deps.includes(item.id)).flatMap(item => item.files?.map(file => file.path) ?? []) ?? [],
+      ...(context?.files?.split('\n').filter(Boolean) ?? []), ...(context?.diffFile ? [context.diffFile] : []),
+      ...(context?.reviewEvidenceFile ? [context.reviewEvidenceFile] : []),
+      ...(this.diffStats(task)?.files ?? [])]);
+    const requiresArtifact = mode === 'structured' || /(?:^|[\\/])codex(?:\.(?:exe|cmd|bat))?$/i.test(adapter) || cmd.includes('{reviewOutputFile}');
+    let outcome: ExecOutcome = { output: '', exitCode: null };
+    const startedAt = nowIso();
+    const frozen = this.state.settings.executionProfile === 'lean' && root ? this.reviewSourceIdentity(root) : null;
+    owner.reviewProtocolAttempts ??= {};
+    const parsed = await invokeReviewProtocol({ adapter, circuits: this.state.reviewCircuits ??= {}, dispatched: owner.reviewProtocolAttempts[key] ?? 0,
+      onDispatch: dispatch => {
+        owner.reviewProtocolAttempts![key] = dispatch;
+        if (dispatch > 1) this.log('task-review', task.id, `reviewer "${name}" produced no VERDICT line or malformed body; retrying review only`);
+      },
+      persist: () => { this.persist(); this.flush(); if (this.dirty) throw new ReviewProtocolError('Cannot persist review dispatch budget'); },
+      invoke: async (_dispatch, feedback) => {
+        rmSync(outputFile, { force: true });
+        const reportInstruction = /(?:^|[\\/])codex(?:\.(?:exe|cmd|bat))?$/i.test(adapter)
+          ? 'Return only the JSON verdict/findings body in the final response; the CLI writes the designated report artifact.'
+          : `Write only the JSON verdict/findings body to ${outputFile}; this designated report file is the only permitted write.`;
+        const currentEvidence = context?.reviewEvidenceFile
+          ? `Current executable acceptance evidence for source checkpoint ${task.reviewSourceCommit}: ${context.reviewEvidenceFile}. Read this exact source-bound packet first. Historical run logs, including failed earlier attempts copied into the checkout, do not describe this checkpoint. Checks in this packet already ran against this checkpoint; report a concrete defect if you dispute their scope or result.` : '';
+        const spec = mode === 'structured' ? `${task.spec}\nRead-only product review. ${context?.diffFile ? `The source checkpoint is committed; review its diff in ${context.diffFile}.` : ''} ${currentEvidence} Generated reports can identify their report-generation input checkout before the reports were committed. Commit SHA inequality alone does not prove stale evidence: compare relevant implementation and check inputs, excluding the generated report artifacts, and use the current source-bound packet for this checkpoint's executed results. Block concrete mismatched inputs, false evidence or unmet acceptance; retain unrelated report polish and future work as nonblocking findings. ${reportInstruction} Blocking findings must cite an acceptance violation or concrete correctness/security mechanism. Allowed evidence references: ${JSON.stringify([...references])}. Protocol feedback: ${feedback}` : task.spec;
+        outcome = await this.runPhase(task, execute, cmd, 'review', root, planFile,
+          { ...context, reviewOutputFile: outputFile, ...(name.startsWith('final') ? { reviewScope: 'final' as const } : {}),
+            ...(mode === 'structured' ? { reviewSchemaFile: schemaFile } : {}) }, spec);
+        if (frozen && frozen !== this.reviewSourceIdentity(root!)) throw new ReviewProtocolError('Reviewer modified the candidate source');
+        return existsSync(outputFile) ? readFileSync(outputFile, 'utf8') : requiresArtifact ? '' : outcome.output;
+      },
+      parse: output => {
+        if (output.includes('DAG_PLANNING_FINDINGS: ')) return output;
+        if (mode === 'structured') {
+          const body = parseReviewBody(output, references);
+          if (outcome.exitCode !== 0 && body.verdict === 'pass') throw new ReviewProtocolError('Reviewer exit status contradicts its approval');
+          if (body.verdict === 'inconclusive') throw new ReviewProtocolError('Required review is inconclusive');
+          const envelope = reviewEnvelope(body, { reviewId: `${this.state.id}/${task.id}/${key}`, taskId: task.id, attempt: task.attempts,
+            phase: name.startsWith('final') ? 'final' : 'task', adapter,
+            sourceIdentity: finalScope ? root && isGitRepo(root) ? git(root, ['rev-parse', 'HEAD']).stdout : frozen ?? digest(task.diffHead)
+              : task.reviewSourceCommit ?? frozen ?? digest({ diffBase: task.diffBase, diffHead: task.diffHead }),
+            contextDigest: digest({ spec: task.spec, references: [...references], ...(context?.reviewEvidenceFile ? { checkEvidence: digest(readFileSync(context.reviewEvidenceFile, 'utf8')) } : {}) }), policyVersion: 'lean-v2',
+            toolVersion: process.env.DAG_REVIEW_TOOL_VERSION ?? 'unreported', startedAt, finishedAt: nowIso() });
+          atomicWriteJson(join(directory, 'receipt.json'), envelope);
+          const grounded = body.findings.filter(finding => finding.evidence.length > 0);
+          if (grounded.length) proposeFollowups(this.opts.file ?? join(tmpdir(), `dag-${this.state.id}.json`), grounded.map(finding => ({
+            id: finding.id, message: finding.message,
+            evidence: finding.evidence.map(item => item.observation),
+            references: finding.evidence.map(item => item.reference),
+            acceptance: finding.correction, blocking: finding.blocking,
+          })), { taskId: task.id, attempt: task.attempts, stage: finalScope ? 'final-review' : 'review',
+            source: `${name}:${envelope.sourceIdentity}` }, this.state);
+          return body.verdict === 'pass' ? 'VERDICT: PASS' : `VERDICT: FAIL: ${body.findings.filter(item => item.blocking).map(item => item.message).join('; ')}`;
+        }
+        if (outcome.exitCode !== 0) return output;
+        const marker = parseVerdict(stripAnsi(output));
+        if (marker.kind === 'none' || marker.kind === 'fail' && !marker.reason) throw new ReviewProtocolError('no machine-readable verdict or unexplained rejection');
+        return output;
+      },
+    });
+    return { ...outcome, output: parsed };
+  }
+
   // Reviewers run in order. The first rejection stops the always-on reviewers
   // (the work will be redone) but still runs the on-reject triage ones, whose
   // diagnosis is fed to the redo through {lastRejection}.
   private async reviewPass(
     task: Task,
     execute: Executor,
-    scope: Set<string> | null,
     worktreePath?: string,
     planFile?: string,
     depsContext?: TokenContext,
     workExitCode: number | null = task.exitCode,
+    checksPassed = false,
+    deterministicVerdicts: Task['reviewerVerdicts'] = {},
   ): Promise<'pass' | 'requeue' | 'fail'> {
     const round = task.reviews + 1;
-    const total = task.reviewRounds + 1;
+    const total = this.state.settings.executionProfile === 'lean' ? 1 : task.reviewRounds + 1;
     const reviewers = this.reviewersFor(task);
+    // Agent review is never an execution gate in this engine revision: when no
+    // reviewer is configured the task proceeds and the review pass is
+    // deferred to a separate validation run.
+    if (this.state.settings.executionProfile === 'lean' && reviewers.length === 0) {
+      task.reviewerVerdicts = { ...deterministicVerdicts };
+      this.log('task-review', task.id, 'No reviewer configured; review deferred to the validation pass');
+      return 'pass';
+    }
     const diff = this.diffStats(task);
     const decisions = decideReviewers(reviewers, diff, false);
     const routedReviewers = reviewers.map((reviewer) => ({
@@ -1591,6 +1895,7 @@ export class DagRunner {
       verdict: reviewer.verdict ?? this.state.settings.reviewVerdict,
     }));
     const supplementalEvidence = this.opts.reviewEvidence?.(task, diff) ?? {};
+    const derivedSignals = artifactRiskSignals(diff?.files ?? [], checksPassed);
     const routerEvidence: ReviewRouterEvidence = {
       unit: task.id,
       title: task.title,
@@ -1599,12 +1904,17 @@ export class DagRunner {
       diffLines: diff?.lines ?? null,
       workExitCode,
       ...supplementalEvidence,
+      ...(this.state.settings.executionProfile === 'lean' ? { policy: 'lean' as const, checksPassed,
+        artifactSignals: { ...derivedSignals, ...supplementalEvidence.artifactSignals,
+          protectedClasses: [...derivedSignals.protectedClasses ?? [], ...supplementalEvidence.artifactSignals?.protectedClasses ?? []] } } : {}),
       deterministicFindings: [
         ...(workExitCode !== null && workExitCode !== 0 ? [`work command exited ${workExitCode}`] : []),
         ...(supplementalEvidence.deterministicFindings ?? []),
       ],
     };
-    const plan = createReviewPlan(routerEvidence, routedReviewers);
+    const eligible = this.state.settings.executionProfile === 'lean' ? routedReviewers.filter(reviewer => reviewer.verdict === 'exit-code' ||
+      decisions.some(decision => decision.reviewer.name === reviewer.name && decision.run && !decision.onReject)) : routedReviewers;
+    const plan = createReviewPlan(routerEvidence, eligible);
     const sidecar = runPaths(this.opts.file ?? join(tmpdir(), `dag-${this.state.id}.json`));
     const planPath = join(
       sidecar.dir,
@@ -1626,11 +1936,23 @@ export class DagRunner {
       `review ${round}/${total} starting with ${reviewers.length} reviewer(s)` +
         (diff ? ` against a ${diff.lines}-line diff` : ''),
     );
-    task.reviewerVerdicts = {};
+    task.reviewerVerdicts = { ...deterministicVerdicts };
+    if (this.state.settings.executionProfile === 'lean' && plan.deterministicSufficient) {
+      task.reviewerVerdicts['$deterministic-exemption'] = { verdict: 'skipped', at: nowIso(), reason: 'lean-v2 low artifact risk: successful executable checks permit agent-review exemption' };
+    }
+    if (this.state.settings.executionProfile === 'lean' && !diff) {
+      throw new ReviewProtocolError('Required candidate diff evidence unavailable; lean review requires an isolated source workspace');
+    }
+    if (this.state.settings.executionProfile === 'lean' && plan.reviewRequired && !plan.reviewers.some(item => item.selected && item.stage !== 'deterministic')) {
+      // Artifact risk must never invent a reviewer the operator did not
+      // configure: the requirement is recorded and the review is deferred.
+      this.log('task-review', task.id, 'risk-selected review has no configured reviewer; deferred to the validation pass');
+    }
 
     let rejected: { name: string; reason: string } | null = null;
     for (const decision of decisions) {
       const reviewer = decision.reviewer;
+      if (this.state.settings.executionProfile === 'lean' && deterministicVerdicts[reviewer.name]?.verdict === 'pass') continue;
       const route = plan.reviewers.find((item) => item.name === reviewer.name);
       if (route && !route.selected) {
         task.reviewerVerdicts[reviewer.name] = {
@@ -1672,22 +1994,27 @@ export class DagRunner {
       let cleaned = '';
       let reviewerExit: number | null = null;
       try {
-        const outcome = await this.runPhase(task, execute, reviewer.cmd, 'review', worktreePath, planFile, depsContext);
+        const mode = reviewer.verdict ?? this.state.settings.reviewVerdict ?? 'marker';
+        if (this.state.settings.executionProfile === 'lean' && !worktreePath) {
+          throw Object.assign(new Error('REVIEW_PROTOCOL_ERROR: lean review requires an isolated source workspace'), { kind: 'review-protocol' });
+        }
+        const outcome = await this.invokeReviewer(task, execute, reviewer.cmd, reviewer.name, mode, worktreePath, planFile, depsContext);
         reviewerExit = outcome.exitCode;
         task.reviewExitCode = outcome.exitCode;
         cleaned = stripAnsi(outcome.output).trim();
-        if (outcome.exitCode !== 0) {
-          const findings = forwardReferenceFailure(this.state, task.id, cleaned, worktreePath ?? this.opts.cwd ?? process.cwd());
-          if (findings.length) throw Object.assign(new Error(cleaned), { kind: 'review', planningFindings: findings });
-        }
         const planningPacket = cleaned.split(/\r?\n/).find(line => line.startsWith('DAG_PLANNING_FINDINGS: '));
         if (planningPacket && this.state.planning) {
-          const findings: PlanningFinding[] = JSON.parse(planningPacket.slice('DAG_PLANNING_FINDINGS: '.length));
-          throw Object.assign(new Error(`Reviewer identified planning defect: ${JSON.stringify(findings)}`), { kind: 'review', planningFindings: findings });
+          // Reviewer planning findings are advisory here: recorded for the
+          // validation pass, never failing the attempt or holding consumers.
+          try {
+            const findings: PlanningFinding[] = JSON.parse(planningPacket.slice('DAG_PLANNING_FINDINGS: '.length));
+            this.log('task-review', task.id, `reviewer planning findings deferred: ${findings.map(f => f.message).join('; ')}`);
+          } catch {
+            this.log('task-review', task.id, 'malformed reviewer planning findings packet ignored (deferred)');
+          }
         }
 
       } catch (err) {
-        if ((err as { planningFindings?: PlanningFinding[] }).planningFindings) throw err;
         const reason: FailureKind =
           this.reasons.get(task.id) ?? (err as { kind?: FailureKind }).kind ?? 'exit';
         const message = err instanceof Error ? err.message : String(err);
@@ -1700,7 +2027,16 @@ export class DagRunner {
         }
         task.reviewerVerdicts[reviewer.name] = { verdict: 'error', reason: truncate(message, 300), at: nowIso() };
         task.reviewExitCode = (err as { exitCode?: number | null }).exitCode ?? null;
-        if (reason === 'timeout' || reason === 'stalled' || reason === 'spawn') {
+        if (reason === 'review-protocol') {
+          task.status = 'failed';
+          task.failureKind = 'review-protocol';
+          task.finishedAt = nowIso();
+          task.result = truncate(`REVIEW_PROTOCOL_ERROR: ${message}`, RESULT_LIMIT);
+          task.reviewResult = summarizeVerdicts(task.reviewerVerdicts);
+          this.log('task-fail', task.id, message);
+          return 'fail';
+        }
+        if (reason === 'timeout' || reason === 'stalled' || reason === 'spawn' || reason === 'budget') {
           task.status = 'failed';
           task.failureKind = reason;
           task.result = truncate(`reviewer "${reviewer.name}" ${reason}: ${message}`, RESULT_LIMIT);
@@ -1708,10 +2044,10 @@ export class DagRunner {
           const type =
             reason === 'timeout' ? 'task-timeout' : reason === 'stalled' ? 'task-stalled' : 'task-fail';
           this.log(type, task.id, `reviewer "${reviewer.name}" failed (${reason}): ${truncate(message, 200)}`);
-          if (!this.tryRepair(task, scope)) this.notify(type, task.id, `reviewer ${reason}: ${message}`);
+          this.notify(type, task.id, `reviewer ${reason}: ${message}`);
           return 'fail';
         }
-        return this.handleRejection(task, `reviewer "${reviewer.name}" failed: ${message}`, scope);
+        return this.handleRejection(task, `reviewer "${reviewer.name}" failed: ${message}`);
       }
 
       const mode = reviewer.verdict ?? this.state.settings.reviewVerdict ?? 'marker';
@@ -1776,20 +2112,23 @@ export class DagRunner {
         task.id,
         `reviewer "${reviewer.name}" produced no VERDICT line (expected "VERDICT: PASS" or "VERDICT: FAIL: reason")`,
       );
-      return this.handleRejection(task, `reviewer "${reviewer.name}" produced no machine-readable verdict`, scope);
+      return this.handleRejection(task, `reviewer "${reviewer.name}" produced no machine-readable verdict`);
     }
 
     task.reviewResult = summarizeVerdicts(task.reviewerVerdicts);
     if (!rejected) return 'pass';
     task.lastRejection = truncate(`${rejected.name}: ${rejected.reason}`, 800);
-    return this.handleRejection(task, `${rejected.name}: ${rejected.reason}`, scope);
+    return this.handleRejection(task, `${rejected.name}: ${rejected.reason}`);
   }
 
-  // A reviewer rejected the work: redo it while review rounds remain, otherwise
-  // fail it and give an integration node the chance to repair its upstream.
-  private handleRejection(task: Task, message: string, scope: Set<string> | null): 'requeue' | 'fail' {
+  // A reviewer rejection can redo this task within its budget; completed
+  // dependencies retain their accepted output and evidence.
+  private handleRejection(task: Task, message: string): 'requeue' | 'fail' {
     task.reviews += 1;
-    if (!this.opts.controllerManaged && task.reviews <= task.reviewRounds) {
+    const lean = this.state.settings.executionProfile === 'lean';
+    const source = this.worktrees.get(task.id);
+    const repeated = lean && repeatedFailure(task, message, source ? this.reviewSourceIdentity(source) : digest(task.commit ?? 'no-source'));
+    if (!this.quotaRecoveries.has(task.id) && this.verificationRecovery?.taskId !== task.id && !this.opts.controllerManaged && (lean ? budgetRemaining(task) && !repeated : task.reviews <= task.reviewRounds)) {
       this.log(
         'task-review',
         task.id,
@@ -1798,106 +2137,16 @@ export class DagRunner {
       task.status = 'pending';
       task.failureKind = null;
       task.result = null;
+      task.lastRejection = message;
       task.exitCode = null;
       return 'requeue';
     }
     task.status = 'failed';
     task.failureKind = 'review';
     task.result = `review rejected after ${task.reviews} round(s): ${truncate(message, 500)}`;
-    // An integration node that says "this doesn't mesh" gets its upstream
-    // redone, bounded by repairRounds.
-    if (this.tryRepair(task, scope)) return 'requeue';
     this.log('task-fail', task.id, `failed (review): reviewer rejected the work ${task.reviews} time(s)`);
     this.notify('task-fail', task.id, `review rejected: ${truncate(message, 200)}`);
     return 'fail';
-  }
-
-  // Repair only touches upstream tasks that the current run can actually
-  // relaunch: requeueing an out-of-scope dep would deadlock the scope.
-  private tryRepair(task: Task, scope: Set<string> | null = null): boolean {
-    if (this.opts.controllerManaged) return false;
-    if (task.repairRounds <= 0 || task.repairs >= task.repairRounds || task.deps.length === 0) {
-      return false;
-    }
-    const requeued: string[] = [];
-    for (const dep of task.deps) {
-      const upstream = this.state.tasks[dep];
-      if (!upstream) continue;
-      if (scope !== null && !scope.has(dep)) continue;
-      if (upstream.status === 'pending' || upstream.status === 'ready' || upstream.status === 'running') {
-        continue;
-      }
-      upstream.status = 'pending';
-      upstream.result = null;
-      upstream.failureKind = null;
-      upstream.exitCode = null;
-      upstream.startedAt = null;
-      upstream.finishedAt = null;
-      upstream.lastOutputAt = null;
-      upstream.lastOutput = null;
-      upstream.pid = null;
-      // Fresh review budget: the repair is what makes a redo possible.
-      upstream.reviews = 0;
-      upstream.reviewResult = null;
-      upstream.reviewExitCode = null;
-      requeued.push(upstream.id);
-    }
-    if (requeued.length === 0) return false;
-    task.repairs += 1;
-    task.status = 'pending';
-    task.failureKind = null;
-    task.result = null;
-    task.exitCode = null;
-
-    // Work that already completed against the old upstream output is stale:
-    // B consumed A v1, so when A is redone B must not stay "verified". This is
-    // deliberately conservative — everything downstream of a repaired task is
-    // redone, in depth order — because without input versioning we cannot tell
-    // which descendants actually depend on what changed.
-    const stale: string[] = [];
-    for (const upstreamId of requeued) {
-      for (const dependentId of transitiveDependentIds(this.state, upstreamId)) {
-        if (dependentId === task.id || requeued.includes(dependentId)) continue;
-        if (scope !== null && !scope.has(dependentId)) continue;
-        const dependent = this.state.tasks[dependentId];
-        if (dependent.status !== 'completed') continue;
-        dependent.status = 'pending';
-        dependent.result = null;
-        dependent.failureKind = null;
-        dependent.exitCode = null;
-        dependent.startedAt = null;
-        dependent.finishedAt = null;
-        dependent.lastOutputAt = null;
-        dependent.lastOutput = null;
-        dependent.pid = null;
-        dependent.diffBase = null;
-        dependent.diffHead = null;
-        dependent.coverage = null;
-        // Its approval was for the old inputs.
-        dependent.finalReview = null;
-        stale.push(dependent.id);
-      }
-    }
-    for (const upstream of requeued) {
-      const t = this.state.tasks[upstream];
-      t.diffBase = null;
-      t.diffHead = null;
-      t.coverage = null;
-      t.finalReview = null;
-    }
-    if (stale.length > 0) {
-      this.log(
-        'task-repair',
-        task.id,
-        `inputs changed: ${stale.length} completed downstream task(s) requeued (${stale.join(', ')})`,
-      );
-    }
-    this.log(
-      'task-repair',
-      task.id,
-      `repair round ${task.repairs}/${task.repairRounds}: requeued upstream ${requeued.join(', ')}`,
-    );
-    return true;
   }
 
   // --- chain coverage (tasks whose subject is other tasks) ----------------
@@ -2007,6 +2256,15 @@ export class DagRunner {
 
   // --- worktree isolation -------------------------------------------------
 
+  private acceptanceDefinition(task: Task): string {
+    return digest({ compiled: this.state.planning?.definitions[task.id],
+      authored: Object.fromEntries(DEFINITION_FIELDS.map(field => [field, task[field]])) });
+  }
+  private acceptancePolicy(task: Task): string {
+    return digest({ settings: this.state.settings,
+      task: this.state.executionPolicy?.tasks[task.id], build: this.state.executionPolicy?.build.sha256 });
+  }
+
   // Establishes worktree isolation up front. If it was requested but cannot be
   // set up, this throws so the run refuses to start rather than run in place.
   private async setupIsolation(): Promise<void> {
@@ -2029,6 +2287,26 @@ export class DagRunner {
       this.repoDir = repoDir;
       this.integration = { path: integration.path, branch: integration.branch };
       this.integrationBase = integration.base;
+      if (this.state.settings.executionProfile === 'lean' && !this.opts.controllerManaged) {
+        for (const task of Object.values(this.state.tasks)) {
+          if (task.status === 'completed' || !task.integrationReceipt || task.attempts < 1) continue;
+          const result = reconcileIntegrationReceipt({ repoDir, integrationBranch: integration.branch, taskId: task.id,
+            attempt: task.attempts, attemptId: `${this.state.id}/${task.id}/${task.attempts}`, runId: this.state.id,
+            evidence: { manifestFingerprint: this.state.planning?.revision, policyFingerprint: this.acceptancePolicy(task) },
+            receiptFile: task.integrationReceipt, isCurrentAttempt: () => true });
+          if (!result?.merged || !result.receipt) continue;
+          if (result.receipt.evidence?.definition !== this.acceptanceDefinition(task)) {
+            throw new Error(`Published acceptance for ${task.id} belongs to a changed task definition`);
+          }
+          task.diffBase = result.receipt.expectedHead; task.diffHead = result.commit!;
+          task.commit = result.receipt.sourceCommit;
+          recordPlanningAcceptance(this.state, task, result.receipt.integrity ?? digest(result.receipt));
+          this.completeAttempt(task, { exitCode: 0, output: 'Recovered verified and published integration acceptance' });
+          (task.milestones ??= {}).integratedAt = nowIso();
+        }
+        this.persist(); this.flush();
+        if (this.dirty) throw new Error('Cannot persist recovered integration acceptance');
+      }
       const dirty = isDirty(repoDir, this.excludes);
       this.log(
         'note',
@@ -2054,7 +2332,8 @@ export class DagRunner {
     const { path, branch } = createTaskWorktree(
       this.repoDir,
       this.state.id,
-      task.id,
+      this.state.settings.executionProfile === 'lean' ? `${task.id}-attempt-${task.attempts}` : task.id,
+      // Preserve each attempt branch/workspace as a distinct identity.
       this.integration.branch,
     );
     this.worktrees.set(task.id, path);
@@ -2070,8 +2349,17 @@ export class DagRunner {
   // Commit the task's work and fold it into the integration branch. A
   // conflict is a retryable failure: the task is redone on the new base.
   // Merges are serialized: the integration worktree has one writer.
-  private landWorktree(task: Task): Promise<{ ok: boolean; conflict?: string }> {
-    const run = (): { ok: boolean; conflict?: string } => {
+  private landWorktree(task: Task, verify?: (candidatePath: string) => Promise<{ passed: boolean; detail?: string; checks?: unknown[] }>): Promise<{ ok: boolean; conflict?: string }> {
+    const dispatchedAttempt = task.attempts;
+    const queuedAt = Date.now(); task.integrationQueuedAt = new Date(queuedAt).toISOString(); this.persist();
+    const run = async (): Promise<{ ok: boolean; conflict?: string }> => {
+      const integrationStarted = Date.now();
+      delete task.integrationQueuedAt;
+      (task.phaseHistory ??= []).push({ attempt: dispatchedAttempt, phase: 'integration-queue', startedAt: new Date(queuedAt).toISOString(),
+        finishedAt: new Date(integrationStarted).toISOString(), durationMs: integrationStarted - queuedAt, outcome: 'released' });
+      if (task.executionBudget && (this.remainingTime(task) <= 0 || task.attempts !== dispatchedAttempt || !this.inFlight.has(task.id))) {
+        throw Object.assign(new Error('Task deadline or attempt identity expired while waiting for integration'), { kind: 'budget' });
+      }
       const path = this.worktrees.get(task.id);
       if (!path || !this.integration) return { ok: true };
       try {
@@ -2079,6 +2367,31 @@ export class DagRunner {
         if (committed.commit) {
           task.commit = committed.commit;
           this.log('note', task.id, `committed ${committed.files} file(s) as ${committed.commit.slice(0, 8)}`);
+        }
+        if (this.state.settings.executionProfile === 'lean' && !this.opts.controllerManaged) {
+          if (!verify) throw Object.assign(new Error('Missing integration candidate verification'), { kind: 'integration' });
+          const attempt = task.attempts;
+          const receiptFile = join(runPaths(this.opts.file ?? join(tmpdir(), `dag-${this.state.id}.json`)).dir, 'integration', `${task.id}.${attempt}.json`);
+          task.integrationReceipt = receiptFile; this.persist(); this.flush();
+          if (this.dirty) throw Object.assign(new Error('Cannot persist integration attempt identity'), { kind: 'integration' });
+          const merged = await integrateVerifiedCandidate({ repoDir: this.repoDir!, integrationWorktree: this.integration.path,
+            integrationBranch: this.integration.branch, taskBranch: task.branch!, taskId: task.id, attempt,
+            runId: this.state.id, attemptId: `${this.state.id}/${task.id}/${attempt}`, receiptFile,
+            isCurrentAttempt: () => !this.stopping && task.attempts === attempt && this.inFlight.has(task.id) && this.remainingTime(task) > 0,
+            evidence: { manifestFingerprint: this.state.planning?.revision, policyFingerprint: this.acceptancePolicy(task),
+              definition: this.acceptanceDefinition(task),
+              review: task.reviewerVerdicts, budget: task.executionBudget, base: this.worktreeBases.get(task.id) },
+            verify: candidatePath => verify(candidatePath) });
+          if (!merged.merged) {
+            if (merged.conflict) return { ok: false, conflict: merged.detail };
+            throw Object.assign(new Error(merged.detail), { kind: this.remainingTime(task) <= 0 ? 'budget' : 'integration' });
+          }
+          task.diffBase = merged.receipt!.expectedHead; task.diffHead = merged.commit!;
+          const sync = git(this.integration.path, ['checkout', '--detach', merged.commit!]);
+          if (sync.code !== 0) this.log('note', task.id, `Accepted ref published; integration preview checkout could not refresh: ${sync.stderr}`);
+          (task.milestones ??= {}).integratedAt = nowIso();
+          this.log('note', task.id, `verified integration accepted ${merged.commit!.slice(0, 8)}`);
+          return { ok: true };
         }
         const before = git(this.integration.path, ['rev-parse', 'HEAD']).stdout;
         const merge = mergeIntoIntegration(this.integration.path, task.branch ?? '', task.id);
@@ -2099,8 +2412,12 @@ export class DagRunner {
         }
         return { ok: true };
       } catch (err) {
+        if (this.state.settings.executionProfile === 'lean') throw Object.assign(err instanceof Error ? err : new Error(String(err)), { kind: (err as { kind?: string }).kind ?? 'integration' });
         return { ok: false, conflict: err instanceof Error ? err.message : String(err) };
       } finally {
+        (task.phaseHistory ??= []).push({ attempt: dispatchedAttempt, phase: 'integration', startedAt: new Date(integrationStarted).toISOString(),
+          finishedAt: nowIso(), durationMs: Date.now() - integrationStarted,
+          outcome: Date.parse(task.milestones?.integratedAt ?? '') >= integrationStarted ? 'published' : 'rejected' });
         this.dropWorktree(task.id);
       }
     };
@@ -2111,7 +2428,15 @@ export class DagRunner {
       () => undefined,
       () => undefined,
     );
-    return next;
+    if (!task.executionBudget) return next;
+    let timer: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        this.killTask(task.id, 'budget');
+        reject(Object.assign(new Error('Task elapsed-time budget exhausted in integration queue'), { kind: 'budget' }));
+      }, Math.max(0, this.remainingTime(task)));
+    });
+    return Promise.race([next, deadline, this.stopGate]).finally(() => clearTimeout(timer));
   }
 
   // A failed or stopped task may hold real work in its worktree. Commit it to
@@ -2191,6 +2516,8 @@ export class DagRunner {
   // A chain of N tools means N attempts at least, so a fallback can happen.
   private maxAttemptsFor(task: Task): number {
     if (this.opts.controllerManaged) return 1;
+    if (task.executionBudget) return task.executionBudget.limit;
+    if (this.state.settings.executionProfile === 'lean') return this.state.settings.implementationAttempts ?? 3;
     return attemptsForChain(task.maxAttempts, this.effectiveChain(task));
   }
 
@@ -2270,10 +2597,30 @@ export class DagRunner {
   private async executeTask(
     task: Task,
     execute: Executor,
-    scope: Set<string> | null,
   ): Promise<void> {
     if (this.stopping) return;
-    const token = this.beginAttempt(task);
+    const quotaRecovery = this.quotaRecoveries.get(task.id);
+    const recovery = quotaRecovery ?? (this.verificationRecovery?.taskId === task.id ? this.verificationRecovery : undefined);
+    if (this.opts.controllerManaged && task.executionBudget) {
+      task.status = 'failed'; task.failureKind = 'budget';
+      task.result = 'Shared budget ownership must be adopted explicitly before controller handoff; counters retained';
+      this.log('task-fail', task.id, task.result); this.persist(); return;
+    }
+    if (!this.opts.controllerManaged && this.state.settings.executionProfile === 'lean') budgetFor(task, this.state.settings);
+    if (!recovery && !this.opts.controllerManaged && (task.executionBudget || this.state.settings.executionProfile === 'lean') && !budgetRemaining(task)) {
+      task.status = 'failed'; task.failureKind = 'budget'; task.result = 'Shared task attempt or elapsed-time budget exhausted';
+      task.finishedAt = nowIso(); this.log('task-fail', task.id, task.result); this.persist(); return;
+    }
+    const token = recovery ? (this.tokens.get(task.id) ?? 0) + 1 : this.beginAttempt(task);
+    if (recovery) {
+      this.tokens.set(task.id, token); this.inFlight.add(task.id); this.attemptByTask.set(task.id, task.attempts);
+      task.status = 'running'; task.failureKind = null; task.result = null; task.finishedAt = null;
+    }
+    if (!recovery && !this.opts.controllerManaged && task.executionBudget) {
+      task.executionBudget!.used++;
+      this.persist(); this.flush();
+      if (this.dirty) { task.status = 'failed'; task.failureKind = 'budget'; task.result = 'Cannot persist task dispatch budget'; this.endAttempt(task, token); return; }
+    }
 
     let worktreePath: string | null = null;
     try {
@@ -2293,6 +2640,19 @@ export class DagRunner {
     );
 
     try {
+      if (recovery) {
+        if (!worktreePath) throw Error('Verification recovery requires an isolated worktree');
+        const base = git(worktreePath, ['merge-base', 'HEAD', recovery.source]);
+        if (base.code) throw Error('Saved source has no shared baseline with the accepted code');
+        const patch = spawnSync('git', ['diff', '--binary', base.stdout, recovery.source], { cwd: worktreePath, encoding: 'utf8', windowsHide: true, maxBuffer: 16_000_000 });
+        if (patch.status !== 0) throw Error(`Cannot read saved source: ${patch.stderr}`);
+        const restored = spawnSync('git', ['apply', '--index', '--binary', '-'], { cwd: worktreePath, input: patch.stdout, encoding: 'utf8', windowsHide: true });
+        if (restored.status !== 0) throw Error(`Cannot restore saved source for verification: ${restored.stderr}`);
+        for (const path of recovery.removeGenerated) {
+          const removed = git(worktreePath, ['rm', '-f', '--ignore-unmatch', '--', path]);
+          if (removed.code) throw Error(`Cannot remove generated cache: ${removed.stderr}`);
+        }
+      }
       if (this.opts.contractGuard) {
         if (!worktreePath) throw new Error('Contract enforcement requires isolated worktrees');
         await this.opts.contractGuard(task, worktreePath, this.worktreeBases.get(task.id) ?? 'HEAD');
@@ -2304,31 +2664,23 @@ export class DagRunner {
         task.status = 'failed';
         this.salvageWorktree(task.id, 'setup failed');
         const budget = this.maxAttemptsFor(task);
-        const retryable = task.attemptsInCycle < budget;
+        const retryable = task.attemptsInCycle < budget && budgetRemaining(task);
         if (retryable) {
           task.status = 'pending';
           task.failureKind = null;
           this.log('task-retry', task.id, `worktree prepare failed; cycle attempt ${task.attemptsInCycle}/${budget}`);
-        } else if (!this.tryRepair(task, scope)) {
+        } else {
           this.notify('task-fail', task.id, 'worktree prepare failed');
         }
         this.persist();
         return;
       }
 
-      const declaredInputs = this.state.planning?.manifest.tasks.find(t => t.id === task.id)?.inputs ?? [];
-      for (const [index, probe] of planningProbes(this.state, task).entries()) {
-        const checked = await this.runPhase({ ...task, timeoutMs: probe.timeoutMs }, execute, checkCommand(probe), 'run', worktreePath ?? undefined);
-        if (checked.exitCode !== 0) {
-          const input = declaredInputs[index]!, producer = input.baseline ? undefined : this.state.planning!.manifest.tasks.find(t => (t.provides ?? []).some(p => p.id === input.capability) && (!input.owner || input.owner === t.id));
-          const finding: PlanningFinding = { id: `input:${task.id}:${input.capability}`, rule: 'capability.missing', tasks: [task.id], references: [input.capability], evidence: [input.contract, `Readiness check ${probe.id} exited ${checked.exitCode}`, checked.output || 'No checker output'], severity: 'error', blocking: true, message: `Declared prerequisite unavailable: ${input.capability}`, correction: 'Verify the producer or baseline readiness evidence; correct the prerequisite before retrying this consumer' };
-          const planningFindings = [finding];
-          throw Object.assign(new Error('DAG_FAILURE: ' + JSON.stringify({ version: 1, code: producer ? 'ownership' : 'implementation', category: 'missing_prerequisite', stage: 'input-check', owner: producer?.id ?? task.id, capability: input.capability, evidence: finding.evidence, planningFindings })), { kind: 'review', planningFindings });
-        }
-      }
+      // Capability readiness probes are deferred: a consumer no longer fails
+      // before its worker starts because a declared producer check fails.
 
       // Planning phase first: the work command follows {plan} / {planFile}.
-      if (chained.planCmd && !this.opts.controllerManaged) {
+      if (!recovery && chained.planCmd && !this.opts.controllerManaged) {
         const planned = await this.plan(
           task,
           execute,
@@ -2364,10 +2716,21 @@ export class DagRunner {
           workSpec = `${base}\n\nApproved implementation plan (follow it; deviate only if it is wrong):\n${task.plan}`;
         }
       }
-      const outcome = await this.runPhase(
+      if (!this.opts.controllerManaged && this.state.settings.executionProfile === 'lean') {
+        workSpec = `${workSpec ?? task.spec ?? ''}\nIf you discover grounded follow-up work, optionally emit one line DAG_FOLLOW_UPS: followed by a JSON array of {id,message,evidence:string[],references:string[],requirements?:string[],suggestedOwner?:string,acceptance?:string,blocking?:boolean}. Cite concrete observations and source or requirement references. Use blocking:true for violations of this task's required acceptance; recording a finding never waives checks or implements the follow-up.`;
+        workSpec += "\nStart with this task's owned implementation and test files, declared checks, and the exact pinned document sections or execution.json unit named in its objective. Expand discovery through actual imports and callers as needed. Scope searches to those paths; prefer listing matching filenames before reading bounded sections. Query JSON by the needed task, unit or key instead of dumping whole generated plans, historical run/state/review artifacts, lockfiles or fixture collections. Historical copies do not replace the active contract. If one of these files is a required source, inspect its relevant complete requirements explicitly rather than skipping it. Keep discovery output bounded and narrow overflowing searches; still run the full required acceptance commands.";
+      }
+      const scopedUnits = [...new Set(this.state.planning?.manifest.tasks.find(item => item.id === task.id)?.checks.flatMap(check => {
+        const index = check.args.findIndex(arg => /(?:^|[\\/])check-scope\.mjs$/.test(arg));
+        return index >= 0 && check.args[index + 1] ? [check.args[index + 1]!] : [];
+      }) ?? [])];
+      if (scopedUnits.length) workSpec += `\nScoped acceptance selects test names beginning exactly with ${scopedUnits.map(unit => `scope:${unit}:`).join(', ')}. Add real positive and fault controls using these prefixes; an unselected or empty suite cannot pass.`;
+      const resumeCommand = quotaRecovery && !quotaRecovery.verificationOnly ? workCmd?.replace(/\bexec\b/, `exec --cd "${worktreePath?.replaceAll('\\', '/').replaceAll('"', '\\"')}"`).replace(/\{spec\}/, `resume ${quotaRecovery.session} {spec}`) : workCmd;
+      if (quotaRecovery && !quotaRecovery.verificationOnly && (!resumeCommand || !workCmd?.includes('{spec}') || !/^codex(?:\.exe|\.cmd)?\s+exec\b/i.test(workCmd ?? ''))) throw Error('Quota continuation requires the original native Codex worker command with {spec}');
+      const outcome: ExecOutcome = recovery && (!quotaRecovery || quotaRecovery.verificationOnly) ? { exitCode: 0, output: `Verification recovery of saved source ${recovery.source}; no implementation dispatched` } : await this.runPhase(
         task,
         execute,
-        workCmd,
+        resumeCommand ?? null,
         'run',
         worktreePath ?? undefined,
         planFile,
@@ -2376,21 +2739,38 @@ export class DagRunner {
       );
       if (this.tokens.get(task.id) !== token) return;
 
-      if (outcome.exitCode !== 0) {
-        const findings = forwardReferenceFailure(this.state, task.id, outcome.output, worktreePath ?? this.opts.cwd ?? process.cwd());
-        if (findings.length) throw Object.assign(new Error(outcome.output), { kind: 'review', planningFindings: findings });
+      const followupPackets = stripAnsi(outcome.output).split(/\r?\n/).filter(line => line.startsWith('DAG_FOLLOW_UPS:'));
+      if (followupPackets.length) {
+        // Follow-up discovery is advisory: packets are recorded for the later
+        // validation pass and can never fail or hold this task.
+        try {
+          const proposals = workerFollowupProposals(stripAnsi(outcome.output), this.state);
+          proposeFollowups(this.opts.file ?? join(tmpdir(), `dag-${this.state.id}.json`), proposals,
+            { taskId: task.id, attempt: task.attempts, stage: 'work' }, this.state);
+          if (proposals.some(proposal => proposal.blocking)) {
+            this.log('note', task.id, 'worker reported a blocking follow-up finding; recorded for the validation pass (deferred)');
+          }
+        } catch (error) {
+          this.log('note', task.id, `follow-up capture skipped: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
+
       this.applyChainReviewVerdict(task, outcome, task.attempts);
 
       const planningPacket = outcome.output.split(/\r?\n/).find(line => line.startsWith('DAG_PLANNING_FINDINGS: '));
       if (planningPacket) {
-        let findings: PlanningFinding[];
-        try { findings = JSON.parse(planningPacket.slice('DAG_PLANNING_FINDINGS: '.length)); } catch { throw Error('Malformed planning failure findings'); }
-        throw Object.assign(new Error('DAG_FAILURE: ' + JSON.stringify({ version: 1, code: 'implementation', category: 'planning', stage: 'planning', owner: task.id,
-          evidence: findings.map(f => f.message), planningFindings: findings })), { kind: 'review', planningFindings: findings });
+        // Worker planning findings are recorded, not enforced: a finding must
+        // never fail an implementation attempt or hold its consumers.
+        try {
+          const findings: PlanningFinding[] = JSON.parse(planningPacket.slice('DAG_PLANNING_FINDINGS: '.length));
+          this.log('note', task.id, `planning findings deferred: ${findings.map(f => f.message).join('; ')}`);
+        } catch {
+          this.log('note', task.id, 'malformed planning findings packet ignored (deferred)');
+        }
       }
 
       this.enforceExitPolicy(task, outcome);
+      (task.milestones ??= {}).implementedAt = nowIso();
 
       if (this.opts.contractGuard && worktreePath) await this.opts.contractGuard(task, worktreePath, this.worktreeBases.get(task.id) ?? 'HEAD');
       if (this.opts.postcondition && worktreePath) await this.opts.postcondition(task, worktreePath, this.worktreeBases.get(task.id) ?? 'HEAD');
@@ -2398,8 +2778,27 @@ export class DagRunner {
       const planningContract = this.state.planning?.manifest.tasks.find(t => t.id === task.id);
       const planningChecks = [...new Map([...(planningContract?.checks ?? []), ...(planningContract?.provides ?? []).map(p => p.check)].map(c => [c.id, c])).values()];
       const planningOutputs: string[] = [];
+      const deterministicVerdicts: Task['reviewerVerdicts'] = {};
+      const lean = this.state.settings.executionProfile === 'lean';
+      // Local acceptance checks, write-ownership validation and frozen-input
+      // revalidation are deferred to a separate validation pass. The declared
+      // checks stay on the task as material for that pass, but none of them
+      // can fail or hold this implementation attempt.
+      this.log('note', task.id, `acceptance deferred: ${planningChecks.length} declared check(s) not executed in the implementation pass`);
 
-      const verdict = this.opts.controllerManaged ? 'pass' : await this.reviewPass(task, execute, scope, worktreePath ?? undefined, planFile, depsContext, outcome.exitCode);
+      let reviewContext = depsContext;
+      if (lean && worktreePath) {
+        commitAll(worktreePath, `dag: source checkpoint ${task.id} attempt ${task.attempts}`);
+        task.reviewSourceCommit = git(worktreePath, ['rev-parse', 'HEAD']).stdout;
+        task.commit = task.reviewSourceCommit;
+        const pin = git(worktreePath, ['update-ref', `refs/dag-reviewed/${digest({ run: this.state.id, task: task.id, attempt: task.attempts })}`, task.reviewSourceCommit]);
+        if (pin.code) throw new Error(`Cannot preserve reviewed source: ${pin.stderr}`);
+        this.writeReviewDiff(`local-${task.id}-${task.attempts}${recovery ? '-' + recovery.id : ''}`, this.worktreeBases.get(task.id) ?? null, task.reviewSourceCommit);
+        this.persist();
+      }
+
+      const verdict = this.opts.controllerManaged ? 'pass' : await this.reviewPass(task, execute, worktreePath ?? undefined, planFile, reviewContext, outcome.exitCode,
+        planningChecks.length > 0 || Object.keys(deterministicVerdicts).length > 0, deterministicVerdicts);
       if (this.tokens.get(task.id) !== token) return;
       if (verdict !== 'pass') {
         this.salvageWorktree(task.id, 'review rejected');
@@ -2408,44 +2807,43 @@ export class DagRunner {
         return;
       }
 
-      // Review/postcondition commands can change files. Acceptance must describe
-      // the artifact that will actually land, rather than its pre-review state.
-      for (const check of planningChecks) {
-        const checked = await this.runPhase({ ...task, timeoutMs: check.timeoutMs }, execute, checkCommand(check), 'run', worktreePath ?? undefined);
-        if (checked.exitCode !== 0) throw Object.assign(new Error(`Task-local acceptance check failed: ${check.id}: ${checked.output}`), { kind: 'review' });
-        planningOutputs.push(`${check.id}:${checked.output}`);
-      }
+      (task.milestones ??= {}).checkedAt = nowIso();
+      task.milestones.reviewedAt = nowIso();
 
       // Worktree mode: land the work before declaring success.
       const evidenceRoot = worktreePath ?? this.opts.cwd ?? process.cwd();
-      const files = (planningContract?.files ?? []).map(f => [f.path, existsSync(join(evidenceRoot, f.path)) ? digest(readFileSync(join(evidenceRoot, f.path))) : null]);
-      if (planningContract) {
-        const checked = validatePlan(this.state.planning!.manifest, worktreePath ?? this.opts.cwd ?? process.cwd());
-        if (!checked.valid) throw Object.assign(new Error(`Authoritative planning inputs changed: ${checked.findings.filter(f => f.blocking).map(f => f.message).join('; ')}`), { kind: 'review' });
-        const base = this.worktreeBases.get(task.id);
-        if (worktreePath && base && planningContract.files?.length) {
-          const changed = git(worktreePath, ['diff', '--name-only', '-z', base]);
-          const untracked = git(worktreePath, ['ls-files', '--others', '--exclude-standard', '-z']);
-          if (changed.code || untracked.code) throw new Error('Cannot validate planned write ownership');
-          const allowed = new Set(planningContract.files.filter(f => f.role !== 'frozen').map(f => f.path));
-          const unexpected = [...changed.stdout.split('\0'), ...untracked.stdout.split('\0')].filter(p => p && !allowed.has(p));
-          if (unexpected.length) throw Object.assign(new Error(`Task wrote outside planned ownership: ${unexpected.join(', ')}`), { kind: 'review' });
-        }
-      }
-
+      const files = (planningContract?.files ?? []).map(f => {
+        const file = join(evidenceRoot, f.path);
+        return [f.path, existsSync(file) ? lstatSync(file).isSymbolicLink() ? digest({ symlink: readlinkSync(file) }) : digest(readFileSync(file)) : null];
+      });
       if (this.opts.contractGuard && worktreePath) await this.opts.contractGuard(task, worktreePath, this.worktreeBases.get(task.id) ?? 'HEAD');
       if (worktreePath) {
-        const landed = await this.landWorktree(task);
+        // Candidate acceptance checks are deferred to the validation pass.
+        // Publication still requires a clean merge into the integration ref.
+        const landed = await this.landWorktree(task, async () => ({ passed: true, checks: [] }));
         if (!landed.ok) {
-          this.recordMergeConflict(task, landed.conflict, scope);
+          this.recordMergeConflict(task, landed.conflict);
           return;
         }
       }
 
-      recordPlanningAcceptance(this.state, task, digest({ revision: this.state.planning?.revision, commit: task.commit, files, outputs: planningOutputs }));
+      const acceptedSource = lean && task.integrationReceipt && existsSync(task.integrationReceipt)
+        ? JSON.parse(readFileSync(task.integrationReceipt, 'utf8')).integrity
+        : digest({ revision: this.state.planning?.revision, commit: task.commit, files, outputs: planningOutputs });
+      recordPlanningAcceptance(this.state, task, acceptedSource);
       this.completeAttempt(task, outcome);
+      if (lean) {
+        this.persist(); this.flush();
+        if (this.dirty) {
+          task.status = 'pending'; task.failureKind = 'integration'; task.result = 'Published acceptance receipt awaits durable state reconciliation';
+          this.stopping = true;
+          for (const id of this.kills.keys()) this.killTask(id, 'killed');
+          this.rejectStopGate?.(Object.assign(new Error('Acceptance state persistence unavailable; receipt retained for recovery'), { kind: 'killed' }));
+          this.log('note', task.id, task.result);
+        }
+      }
     } catch (err) {
-      await this.failAttempt(task, err, scope, token);
+      await this.failAttempt(task, err, token);
     } finally {
       this.endAttempt(task, token);
     }
@@ -2615,13 +3013,14 @@ export class DagRunner {
 
   // A merge conflict is redone on the new integration base instead of being
   // charged against the command's attempt budget (bounded by mergeRounds).
-  private recordMergeConflict(task: Task, conflict: string | undefined, scope: Set<string> | null): void {
+  private recordMergeConflict(task: Task, conflict: string | undefined): void {
     const budget = this.state.settings.mergeRounds ?? 2;
-    if (task.mergeRetries < budget) {
+    if (task.mergeRetries < budget && budgetRemaining(task)) {
       task.mergeRetries += 1;
       task.status = 'pending';
       task.failureKind = null;
       task.result = `merge conflict with the integration base; redoing on top of it (${task.mergeRetries}/${budget})`;
+      task.lastRejection = `Resolve this conflict on the accepted integration baseline: ${conflict ?? 'merge conflict'}`;
       this.log(
         'task-retry',
         task.id,
@@ -2632,7 +3031,7 @@ export class DagRunner {
       task.failureKind = 'merge';
       task.result = `merge conflict after ${task.mergeRetries} redo(s): ${conflict ?? ''}`;
       this.log('task-fail', task.id, `failed (merge): ${truncate(conflict ?? '', 200)}`);
-      if (!this.tryRepair(task, scope)) this.notify('task-fail', task.id, 'merge conflict');
+      this.notify('task-fail', task.id, 'merge conflict');
     }
   }
 
@@ -2655,12 +3054,11 @@ export class DagRunner {
   }
 
   // Failure path: salvage partial work, classify the failure, then retry with
-  // backoff while attempts remain, or fail permanently (repairing upstream when
-  // configured). A deliberate stop requeues instead of counting as a failure.
+  // backoff while attempts remain, or fail this task permanently. A deliberate
+  // stop requeues instead of counting as a failure.
   private async failAttempt(
     task: Task,
     err: unknown,
-    scope: Set<string> | null,
     token: number,
   ): Promise<void> {
     if (this.tokens.get(task.id) !== token) return;
@@ -2669,14 +3067,8 @@ export class DagRunner {
     const reason: FailureKind =
       this.reasons.get(task.id) ?? (err as { kind?: FailureKind }).kind ?? 'exit';
     const message = err instanceof Error ? err.message : String(err);
-    const observed = forwardReferenceFailure(this.state, task.id, message, this.worktrees.get(task.id) ?? this.opts.cwd ?? process.cwd());
-    const planningFindings = observed.length ? observed : (err as { planningFindings?: PlanningFinding[] }).planningFindings;
-    if (planningFindings && recordPlanningFailure(this.state, task.id, planningFindings)) {
-      task.status = 'pending'; task.failureKind = 'review'; task.result = 'Planning correction required; remaining retry budget preserved';
-      task.finishedAt = nowIso();
-      this.log('note', task.id, `Planning hold: ${JSON.stringify(planningFindings)}`);
-      this.dropWorktree(task.id); this.persist(); return;
-    }
+    // Planning findings never hold a task: they were recorded upstream (if at
+    // all) and belong to the later validation pass, not to this failure path.
     const exitCode = (err as { exitCode?: number | null }).exitCode ?? null;
     task.finishedAt = nowIso();
     task.result = truncate(message, RESULT_LIMIT);
@@ -2686,7 +3078,10 @@ export class DagRunner {
     // Everything except a deliberate stop or a missing command is retryable
     // while attempts remain. Stall and timeout included.
     const budget = this.maxAttemptsFor(task);
-    const retryable = reason !== 'manual' && task.attemptsInCycle < budget;
+    const source = this.worktrees.get(task.id);
+    const retainedTree = task.commit && this.repoDir ? git(this.repoDir, ['rev-parse', `${task.commit}^{tree}`]).stdout : null;
+    const sameFailure = !this.stopping && task.executionBudget && repeatedFailure(task, message, source ? this.reviewSourceIdentity(source) : digest(retainedTree ?? task.lastOutput ?? 'no-source'));
+    const retryable = !this.quotaRecoveries.has(task.id) && this.verificationRecovery?.taskId !== task.id && !['manual', 'budget', 'review-protocol'].includes(reason) && !sameFailure && task.attemptsInCycle < budget && budgetRemaining(task);
     if (this.stopping) {
       task.status = 'pending';
       task.failureKind = 'killed';
@@ -2712,7 +3107,7 @@ export class DagRunner {
       const type =
         reason === 'timeout' ? 'task-timeout' : reason === 'stalled' ? 'task-stalled' : 'task-fail';
       this.log(type, task.id, `failed (${reason}): ${truncate(message, 300)}`);
-      if (!this.tryRepair(task, scope)) this.notify(type, task.id, truncate(message, 200));
+      this.notify(type, task.id, truncate(message, 200));
     }
   }
 

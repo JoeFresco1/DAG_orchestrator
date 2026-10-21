@@ -217,7 +217,7 @@ async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult
     const manual = candidates.filter(
       (id) => !runnable(id) && (run.tasks[id].status === 'pending' || run.tasks[id].status === 'ready'),
     );
-    const scope = candidates.filter(runnable);
+    const scope = run.settings.executionProfile === 'flow3' ? candidates : candidates.filter(runnable);
     if (scope.length === 0) {
       lock();
       return {
@@ -234,7 +234,7 @@ async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult
     rt.releaseLock = lock;
     rt.jobStartedAt = new Date().toISOString();
     rt.activeScope = scope;
-    if (manual.length > 0) {
+    if (manual.length > 0 && run.settings.executionProfile !== 'flow3') {
       logEvent(run, 'note', null, `skipped ${manual.length} manual task(s) without cmd: ${manual.join(', ')}`);
     }
     // A runner that cannot even set up (no git repo for isolation, bad graph)
@@ -799,6 +799,8 @@ export function startServer(opts: ServeOptions): void {
         'finalReview',
         'finalReviewRounds',
         'finalReviewCmd',
+        'flow3',
+        'executionProfile',
         'failOnNonZeroExit',
         'notifyCmd',
         'maxAttempts',

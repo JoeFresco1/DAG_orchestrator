@@ -10,6 +10,7 @@ import {
   removeProject,
 } from '../registry.js';
 import { emit, flag, taskTimingFlags } from '../cli-args.js';
+import { executionProfilePatch } from '../execution-policy.js';
 
 // `init` creates the run file with an objective, optionally seeding the run's
 // retry budget from the same timing flags `add` accepts.
@@ -17,8 +18,13 @@ export function initCmd(argv: string[]): void {
   const file = flag(argv, 'file') ?? 'dag.run.json';
   const objective = flag(argv, 'objective') ?? 'untitled dag';
   const run = newRun(objective);
+  const profile = flag(argv, 'profile');
+  Object.assign(run.settings, executionProfilePatch(profile));
   const s = taskTimingFlags(argv);
-  if (s.maxAttempts !== undefined) run.settings.maxAttempts = s.maxAttempts;
+  if (s.maxAttempts !== undefined) {
+    run.settings.maxAttempts = s.maxAttempts;
+    run.settings.implementationAttempts = s.maxAttempts;
+  }
   saveRun(run, file);
   emit(argv, { runId: run.id, file }, () => `${run.id}\nSaved to ${file}`);
 }

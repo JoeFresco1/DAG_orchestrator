@@ -16,7 +16,7 @@ export function taskFailure(task) {
     const packet = marker(task.result || '', 'DAG_FAILURE');
     if (packet)
         return failure(packet);
-    const code = ['killed', 'manual'].includes(task.failureKind) ? 'user_stop' : ['spawn', 'timeout', 'stalled', 'setup', 'worktree', 'interrupted'].includes(task.failureKind) ? 'environment' : task.failureKind === 'review' ? 'implementation' : 'unknown';
+    const code = task.failureKind === 'budget' ? 'budget' : task.failureKind === 'review-protocol' ? 'contract' : ['killed', 'manual'].includes(task.failureKind) ? 'user_stop' : ['spawn', 'timeout', 'stalled', 'setup', 'worktree', 'interrupted'].includes(task.failureKind) ? 'environment' : ['review', 'integration'].includes(task.failureKind) ? 'implementation' : 'unknown';
     return failure({ version: 1, code, stage: task.failureKind || 'work', owner: task.id, evidence: [task.result || 'No structured outcome supplied'], legacy: true });
 }
 export function fingerprint(f, revision) { return hash({ code: f.code, stage: f.stage, owner: f.owner || null, test: f.test || null, requirement: f.requirement || null, revision }); }

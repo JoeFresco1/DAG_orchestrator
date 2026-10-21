@@ -43,6 +43,8 @@ export interface FinalReviewVerdict {
   round: number;
 }
 
+import { validateFlowSettings } from './flow3/contracts.js';
+
 // Statuses from which a task will not run again without an explicit retry.
 export type TerminalStatus = 'completed' | 'failed' | 'skipped';
 
@@ -60,6 +62,9 @@ export type FailureKind =
   | 'manual'
   | 'interrupted'
   | 'review'
+  | 'review-protocol'
+  | 'budget'
+  | 'integration'
   | 'merge'
   | 'worktree'
   | 'setup'
@@ -118,6 +123,15 @@ export interface ApprovalGate {
 }
 
 export interface Task {
+  /** Flow 3.0's turn-one brief and single deterministic acceptance command. */
+  node?: import('./flow3/contracts.js').NodeBrief;
+  nodeState?: import('./flow3/contracts.js').NodeState;
+  executionBudget?: import('./execution-budget.js').ExecutionBudget;
+  integrationReceipt?: string;
+  integrationQueuedAt?: string;
+  reviewSourceCommit?: string;
+  phaseHistory?: Array<{ attempt: number; phase: string; startedAt: string; finishedAt: string; durationMs: number; outcome: string }>;
+  milestones?: { implementedAt?: string; checkedAt?: string; reviewedAt?: string; integratedAt?: string };
   id: string;
   title: string;
   // Self-contained instructions: inputs, outputs, acceptance criteria.
@@ -176,6 +190,7 @@ export interface Task {
   plan: string | null;
   // Per-reviewer outcomes for the last review pass, keyed by reviewer name.
   reviewerVerdicts: Record<string, ReviewerVerdict>;
+  reviewProtocolAttempts?: Record<string, number>;
   // Why the previous attempt was rejected, fed back to the redo via {lastRejection}.
   lastRejection: string | null;
   // Per-task override for the worktree prepare command.
@@ -262,6 +277,12 @@ export function validateSettingsPatch(patch: Record<string, unknown>): SettingsP
   num('reviewRounds', 0, 50);
   num('repairRounds', 0, 50);
   oneOf('worktree', ['none', 'task']);
+  oneOf('executionProfile', ['legacy', 'lean', 'flow3']);
+  oneOf('reviewVerdict', ['marker', 'exit-code', 'structured']);
+  num('mergeRounds', 0, 50);
+  num('taskDeadlineMs', 1, 86_400_000);
+  num('implementationAttempts', 1, 50);
+  num('infrastructureRetries', 0, 2);
   oneOf('finalReview', ['off', 'per-task', 'run']);
   oneOf('silenceAction', ['warn', 'kill']);
   oneOf('onDepFailure', ['block', 'skip']);
@@ -279,6 +300,9 @@ export function validateSettingsPatch(patch: Record<string, unknown>): SettingsP
   text('notifyCmd', 4000);
   text('finalReviewCmd', 8000);
   text('worktreePrepareCmd', 4000);
+  if (patch.flow3 !== undefined) {
+    problems.push(...validateFlowSettings(patch.flow3));
+  }
   // harnessChain is an array of candidates, validated by parseHarnessChain.
   return problems;
 }
@@ -289,6 +313,12 @@ export function describeSettingsProblems(problems: SettingsProblem[]): string {
 }
 
 export interface RunSettings {
+  flow3?: import('./flow3/contracts.js').FlowSettings;
+  taskDeadlineMs?: number;
+  implementationAttempts?: number;
+  infrastructureRetries?: number;
+  /** Named policy preset; absent in older saved runs means legacy. */
+  executionProfile?: 'legacy' | 'lean' | 'flow3';
   // Workers a single runner may run at once, and the hard per-task wall clock.
   concurrency: number;
   timeoutMs: number;
@@ -296,7 +326,7 @@ export interface RunSettings {
   // How a reviewer's verdict is read. 'marker' requires a machine-readable
   // VERDICT: PASS / VERDICT: FAIL: reason line (agent harnesses exit 0
   // either way); 'exit-code' trusts the exit status alone (shell reviewers).
-  reviewVerdict: 'marker' | 'exit-code';
+  reviewVerdict: 'marker' | 'exit-code' | 'structured';
   // What a quiet task means. Agents legitimately go minutes without output
   // (buffered tool calls: pytest, mypy, long model turns), so the default is
   // to warn and let the hard timeout bound the task, not to kill on silence.
@@ -371,6 +401,9 @@ export const DEFAULT_SETTINGS: RunSettings = {
 };
 
 export interface Run {
+  flowState?: import('./flow3/contracts.js').FlowState;
+  reviewCircuits?: import('./review-protocol.js').AdapterCircuits;
+  executionPolicy?: import('./execution-policy.js').ExecutionPolicySnapshot;
   planning?: import('./planning/contracts.js').CompiledPlanning;
   planningState?: import('./planning/contracts.js').PlanningState;
   storageVersion: number;
@@ -404,6 +437,7 @@ export const ATTEMPT_LOG_CAP_DEFAULT = 1024 * 1024;
 // Task fields stored in the definition file. Everything here is authored, not
 // observed, so it changes only when a user edits the task.
 export const DEFINITION_FIELDS = [
+  'node',
   'id',
   'title',
   'spec',
@@ -430,6 +464,10 @@ export const DEFINITION_FIELDS = [
 // Task fields stored in the state sidecar. These change constantly as a run
 // progresses, which is exactly why they live apart from the definition.
 export const DYNAMIC_FIELDS = [
+  'nodeState',
+  'executionBudget', 'integrationReceipt', 'phaseHistory', 'milestones',
+  'integrationQueuedAt',
+  'reviewSourceCommit',
   'status',
   'result',
   'attempts',
@@ -450,6 +488,7 @@ export const DYNAMIC_FIELDS = [
   'mergeRetries',
   'plan',
   'reviewerVerdicts',
+  'reviewProtocolAttempts',
   'lastRejection',
   'harness',
   'diffBase',

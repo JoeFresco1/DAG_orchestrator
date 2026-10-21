@@ -21,7 +21,7 @@ function finding(task: string, owners: string[], file: string, evidence: string[
 
 /** Only literal argv paths and static JS/TS imports are authoritative here.
  * Dynamic loaders, globs and package scripts need explicit check.files. */
-export function lintAcceptance(plan: PlanningManifest, deps: Record<string, { owner: string }[]>, read?: (file: string) => Buffer): PlanningFinding[] {
+export function lintAcceptance(plan: PlanningManifest, deps: Record<string, { owner: string }[]>, read?: (file: string) => Buffer, importTasks?: ReadonlySet<string>): PlanningFinding[] {
   const results: PlanningFinding[] = [];
   const owned = new Set(plan.tasks.flatMap(t => (t.files ?? []).map(f => f.path)));
   const known = (file: string) => owned.has(file) || plan.sources.some(s => s.path === file);
@@ -42,6 +42,8 @@ export function lintAcceptance(plan: PlanningManifest, deps: Record<string, { ow
       // cannot be masked by stale bytes left in the current checkout.
       if (!owners.some(id => available.has(id)) && !pinned) results.push(finding(task.id, owners, file, trail, owners.length ? 'acceptance.future' : 'acceptance.input'));
       if (bytes === undefined) { if (read && owners.some(id => available.has(id))) warn(`Planned acceptance source ${file} is not available for import inspection yet`); return; }
+      // Accepted historical scopes keep their explicit references; imports added by later shared-file owners belong to the active scope.
+      if (importTasks && !importTasks.has(task.id)) return;
       if (!/\.[cm]?[jt]sx?$/.test(file)) { if (file.endsWith('.py')) warn(`Python imports in ${file} require explicit check.files`); return; }
       const source = bytes.toString('utf8');
       if (/\b(?:import|require)\s*\(\s*[^'"\s]/.test(source)) warn(`Dynamic module loader in ${file}`);

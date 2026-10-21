@@ -586,7 +586,7 @@ describe('reviewer agents and integration repair', () => {
     assert.equal(workRuns, 1, 'work was not redone for an infrastructure failure');
   });
 
-  it('an integration node requeues its upstream when it fails with repairRounds', async () => {
+  it('an integration failure preserves accepted upstream work despite historical repairRounds', async () => {
     const run = newRun('integration');
     const a = addTask(run, { title: 'part-a', spec: '' });
     const b = addTask(run, { title: 'part-b', spec: '', deps: [a.id] });
@@ -606,10 +606,16 @@ describe('reviewer agents and integration repair', () => {
       },
     });
     await runner.start();
-    assert.equal(integrationRuns, 2, 'integration was retried after repair');
-    assert.equal(run.tasks[integration.id].status, 'completed');
-    assert.equal(run.tasks[integration.id].repairs, 1);
-    assert.ok(run.events.some((e) => e.type === 'task-repair'));
+    assert.equal(integrationRuns, 1, 'failure does not create an upstream repair cycle');
+    assert.equal(run.tasks[integration.id].status, 'failed');
+    assert.equal(run.tasks[integration.id].failureKind, 'exit');
+    assert.equal(run.tasks[integration.id].repairs, 0);
+    for (const upstream of [a, b]) {
+      assert.equal(upstream.status, 'completed');
+      assert.equal(upstream.attempts, 1, 'accepted upstream executes once');
+      assert.equal(upstream.result, 'ok', 'accepted evidence is retained');
+    }
+    assert.ok(!run.events.some((e) => e.type === 'task-repair'));
   });
 
   it('heartbeats keep a quiet worker alive', async () => {
@@ -1198,7 +1204,7 @@ describe('reviewer agents and integration repair', () => {
     await runner.start();
     // The old behaviour was a silent pass. Unreviewed work must not merge.
     assert.equal(run.tasks[a.id].status, 'failed');
-    assert.equal(run.tasks[a.id].failureKind, 'review');
+    assert.equal(run.tasks[a.id].failureKind, 'review-protocol');
     assert.match(run.tasks[a.id].result ?? '', /no machine-readable verdict/);
     assert.ok(run.events.some((e) => /produced no VERDICT line/.test(e.message)));
   });
@@ -1259,7 +1265,7 @@ describe('reviewer agents and integration repair', () => {
     }
   });
 
-  it('prepares the worktree once before the phases, and fails as setup when it breaks', async () => {
+  it('prepares the worktree once before the phases, and continues when preparation breaks', async () => {
     const repo = gitRepo();
     const file = join(repo, 'dag.run.json');
     try {
@@ -1285,7 +1291,7 @@ describe('reviewer agents and integration repair', () => {
       assert.deepEqual(order, ['provision', 'work'], 'prepare runs before the work phase');
       assert.equal(run.tasks[a.id].status, 'completed');
 
-      // A failing prepare fails the task as setup, and the work never runs.
+      // A failing prepare is non-blocking: the task still runs and lands.
       const run2 = newRun('prepare-fail');
       const b = addTask(run2, { title: 'bad env', spec: '', cmd: 'work' });
       run2.settings.worktree = 'task';
@@ -1304,10 +1310,8 @@ describe('reviewer agents and integration repair', () => {
         },
       });
       await runner2.start();
-      assert.deepEqual(order2, ['provision'], 'work never ran without an environment');
-      assert.equal(run2.tasks[b.id].status, 'failed');
-      assert.equal(run2.tasks[b.id].failureKind, 'setup');
-      assert.match(run2.tasks[b.id].result ?? '', /uv sync failed/);
+      assert.deepEqual(order2, ['provision', 'work'], 'work still ran after a prepare failure');
+      assert.equal(run2.tasks[b.id].status, 'completed');
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

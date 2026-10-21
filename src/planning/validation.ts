@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { resolve, relative, isAbsolute } from 'node:path';
+import { resolve, relative, isAbsolute, dirname, basename } from 'node:path';
+import { validatePinnedBaseline } from './import-baseline.js';
 import { digest, validatePlanningManifest, type PlanningManifest, type PlanningFinding, type PlanningReport, type PlanningInterface } from './contracts.js';
 import { lintAcceptance } from './acceptance-lint.js';
 import { lintSizing } from './sizing.js';
@@ -16,7 +17,7 @@ export function planningFile(root: string, file: string): string {
 export function compatible(wanted: PlanningInterface | undefined, actual: PlanningInterface | undefined): boolean {
   return !wanted || !!actual && wanted.id === actual.id && wanted.version === actual.version && (!wanted.digest || wanted.digest === actual.digest);
 }
-export function validatePlan(value: unknown, root?: string): PlanningReport {
+export function validatePlan(value: unknown, root?: string, context?: { acceptanceImportTasks: ReadonlySet<string> }): PlanningReport {
   const findings: PlanningFinding[] = [];
   const add = (rule: string, tasks: string[], references: string[], message: string, correction: string, evidence = references, warning = false): void => {
     findings.push({ id: digest({ rule, tasks, references, message }).slice(0, 24), rule, tasks, references, evidence,
@@ -41,6 +42,7 @@ export function validatePlan(value: unknown, root?: string): PlanningReport {
     catch (e) { add('input.unavailable', owner, [path], String(e), 'Use an input within the repository'); }
   };
   plan.sources.forEach(s => checkSource(s.path, s.sha256, []));
+  if (root) validatePinnedBaseline(plan, root, (rule, refs, message) => add(rule, [], refs, message, 'Restore the exact shared baseline and pinned sources'));
   // Decomposition size is a structural rule: it is checked before relationships
   // so an oversized brief is split before anyone reasons about its ownership.
   lintSizing(plan, add);
@@ -80,16 +82,27 @@ export function validatePlan(value: unknown, root?: string): PlanningReport {
       if (!dependencies[task.id]!.some(d => d.owner === producer.id)) dependencies[task.id]!.push({ owner: producer.id, reason: `Requires capability ${input.capability}`, evidence: [input.contract, promise.contract] });
     }
   }
-  const ancestors = new Map<string, Set<string>>(), visiting = new Set<string>();
+  const ancestors = new Map<string, Set<string>>(), visiting = new Set<string>(), path: string[] = [];
   const walk = (id: string): Set<string> => {
-    if (visiting.has(id)) { add('dependency.cycle', [id], [id], 'Execution dependency cycle', 'Correct the producer or ordering relationship'); return new Set(); }
+    if (visiting.has(id)) {
+      const cycle = [...path.slice(path.indexOf(id)), id];
+      const evidence = cycle.slice(0, -1).map((from, index) => {
+        const to = cycle[index + 1]!;
+        const edge = dependencies[from]!.find(d => d.owner === to)!;
+        return `${from} -> ${to}: ${edge.reason || '(missing reason)'}; evidence: ${JSON.stringify(edge.evidence)}`;
+      });
+      add('dependency.cycle', cycle.slice(0, -1), cycle,
+        `${cycle.length === 2 ? 'Self-dependency' : 'Execution dependency'} cycle: ${cycle.join(' -> ')}`,
+        'Correct the producer or ordering relationship on one of the reported edges', evidence);
+      return new Set();
+    }
     if (ancestors.has(id)) return ancestors.get(id)!;
-    visiting.add(id); const set = new Set<string>();
+    visiting.add(id); path.push(id); const set = new Set<string>();
     for (const d of dependencies[id] ?? []) { set.add(d.owner); if (tasks.has(d.owner)) walk(d.owner).forEach(a => set.add(a)); }
-    visiting.delete(id); ancestors.set(id, set); return set;
+    path.pop(); visiting.delete(id); ancestors.set(id, set); return set;
   };
   plan.tasks.forEach(t => walk(t.id));
-  findings.push(...lintAcceptance(plan, dependencies, root ? file => readFileSync(planningFile(root, file)) : undefined));
+  findings.push(...lintAcceptance(plan, dependencies, root ? file => readFileSync(planningFile(root, file)) : undefined, context?.acceptanceImportTasks));
   for (const r of plan.requirements) for (const id of r.acceptance) {
     const c = criteria.get(id);
     if (!c || c.requirement !== r.id) add('coverage.missing', [], [r.id, id], 'Original criterion lacks a matching registry entry', 'Restore the unchanged criterion with a verification owner');
@@ -117,20 +130,36 @@ export function validatePlan(value: unknown, root?: string): PlanningReport {
     for (const f of first.files ?? []) for (const g of b.files ?? []) if (f.path === g.path && f.role !== g.role) add('ownership.role', [first.id, b.id], [f.path], 'Shared file has conflicting roles', 'Agree on the file role');
     for (const i of first.interfaces ?? []) for (const j of b.interfaces ?? []) if (i.id === j.id && (!compatible(i, j) || !compatible(j, i))) add('interface.conflict', [first.id, b.id], [i.id], 'Tasks assume incompatible shared interfaces', 'Pin one agreed interface', [JSON.stringify(i), JSON.stringify(j)]);
   }
-  const risk = plan.requirements.some(r => plan.tasks.filter(t => t.requirements.includes(r.id)).length > 1) || plan.criteria.some(c => c.stage !== 'local' || c.contributors.length > 1) || plan.tasks.some(t => (t.inputs?.length ?? 0) > 0 || (t.interfaces?.length ?? 0) > 0 || (t.files ?? []).filter(f => f.role === 'implementation' || f.role === 'generated').length > 1);
+  // Ordinary decomposition, capability inputs, and related output files are
+  // structurally validated above. They do not imply an architectural risk.
+  // Authors mark exceptional semantic decisions with mode: 'required'.
   const mode = plan.semanticReview?.mode ?? 'auto';
   return { version: 1, revision: digest(plan), valid: !findings.some(f => f.blocking), findings, dependencies,
-    semanticRequired: mode === 'required' || mode === 'auto' && risk };
+    semanticRequired: mode === 'required' };
 }
 
 /** Mutual exclusion is deliberately separate from execution dependencies. */
-export function admitPlanningTask(plan: PlanningManifest, id: string, active: Iterable<string>): boolean {
+export function admitPlanningTask(plan: PlanningManifest, id: string, active: Iterable<string>, root?: string): boolean {
   const task = plan.tasks.find(t => t.id === id); if (!task) return true;
-  const writes = new Set((task.files ?? []).filter(f => f.role !== 'frozen').map(f => f.path));
+  const identity = (file: string): string => {
+    let target = resolve(root ?? process.cwd(), file.replace(/\\/g, '/'));
+    if (root) {
+      let existing = target; const suffix: string[] = [];
+      while (!existsSync(existing) && dirname(existing) !== existing) { suffix.unshift(basename(existing)); existing = dirname(existing); }
+      if (existsSync(existing)) target = resolve(realpathSync(existing), ...suffix);
+      const rel = relative(realpathSync(root), target);
+      if (isAbsolute(rel) || rel === '..' || rel.startsWith('../') || rel.startsWith('..\\')) throw Error('Planning ownership escapes repository');
+    }
+    const normalized = target.replace(/\\/g, '/').replace(/\/$/, '');
+    return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  };
+  const writes = (task.files ?? []).filter(f => f.role !== 'frozen').map(f => identity(f.path));
   const used: Record<string, number> = {};
   for (const otherId of active) {
     const other = plan.tasks.find(t => t.id === otherId); if (!other) continue;
-    if ((other.files ?? []).some(f => f.role !== 'frozen' && writes.has(f.path))) return false;
+    if ((other.files ?? []).some(f => f.role !== 'frozen' && writes.some(path => {
+      const otherPath = identity(f.path); return path === otherPath || path.startsWith(`${otherPath}/`) || otherPath.startsWith(`${path}/`);
+    }))) return false;
     for (const [name, count] of Object.entries(other.resources ?? {})) used[name] = (used[name] ?? 0) + count;
   }
   return Object.entries(task.resources ?? {}).every(([name, count]) => (used[name] ?? 0) + count <= (plan.capacities?.[name] ?? 0));

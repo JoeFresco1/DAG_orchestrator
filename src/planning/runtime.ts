@@ -20,7 +20,7 @@ export function planningRefusal(run: Run, root: string, sidecar?: string): strin
       const journal = JSON.parse(readFileSync(join(sidecar, 'planning-amendment.json'), 'utf8'));
       if (journal.stage !== 'committed' || journal.revision !== run.planning.revision) return 'Interrupted planning amendment; resume dag plan amend before execution';
     }
-    const report = validatePlan(run.planning.manifest, root);
+    const report = validatePlan(run.planning.manifest, root, { acceptanceImportTasks: new Set(Object.values(run.tasks).filter(task => task.status !== 'completed').map(task => task.id)) });
     if (!report.valid) return `Planning validation failed: ${report.findings.filter(f => f.blocking).map(f => `${f.rule}: ${f.message}`).join('; ')}`;
     if (report.revision !== run.planning.revision || run.planningState?.revision !== report.revision) return 'Invalid persisted planning revision/checkpoint';
     const state = run.planningState;
@@ -57,7 +57,7 @@ export function planningRefusal(run: Run, root: string, sidecar?: string): strin
     return null;
   } catch (e) { return `Invalid persisted planning contract: ${String(e)}`; }
 }
-export function planningAdmitted(run: Run, id: string, active: Iterable<string>): boolean {
+export function planningAdmitted(run: Run, id: string, active: Iterable<string>, root?: string): boolean {
   if (!run.planning) return true;
   const holds = run.planningState?.holds ?? {};
   const seen = new Set<string>();
@@ -66,7 +66,7 @@ export function planningAdmitted(run: Run, id: string, active: Iterable<string>)
     if (seen.has(key)) return false; seen.add(key);
     return run.tasks[key]?.deps.some(held) ?? false;
   };
-  return !held(id) && admitPlanningTask(run.planning.manifest, id, active);
+  return !held(id) && admitPlanningTask(run.planning.manifest, id, active, root);
 }
 export function planningProbes(run: Run, task: Task): PlanningCheck[] {
   const plan = run.planning?.manifest;

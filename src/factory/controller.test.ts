@@ -152,7 +152,10 @@ test('runs and resumes a complete factory cycle through DagRunner with requireme
   execFileSync('git', ['restore', '--', 'src/auth.ts'], { cwd: root });
 
   const unresolved = await resumeFactory(runFile, { executor, cwd: root });
-  assert.equal(unresolved.state.stage, 'remediation_verification');
+  assert.equal(unresolved.state.stage, 'remediation_verification', JSON.stringify({
+    status: unresolved.state.status, error: unresolved.state.lastError,
+    failed: Object.values(loadRun(runFile).tasks).filter(task => task.status === 'failed').map(task => ({ title: task.title, result: task.result })),
+  }));
   assert.equal(unresolved.state.status, 'waiting');
   assert.match(unresolved.state.lastError ?? '', /remains unresolved/);
   const retryRun = loadRun(runFile);

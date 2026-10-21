@@ -106,13 +106,13 @@ test('related output files share one concern; independent outputs still block co
     { path: 'runtime.test.ts', role: 'test' });
   assert.deepEqual(outputConcerns(task), ['Callable runtime']);
   assert.equal(validatePlan(p).valid, true);
-  // Even a standalone grouped output needs semantic review under the default policy.
+  // Related files alone do not require exceptional semantic review.
   const standalone = structuredClone(p);
   standalone.tasks = [standalone.tasks[0]!]; standalone.tasks[0]!.requirements = [];
   standalone.criteria = standalone.criteria.filter(c => c.owner === task.id).map(c => ({ ...c, requirement: undefined }));
   standalone.requirements = []; standalone.semanticReview = { mode: 'auto' };
   assert.equal(validatePlan(standalone).valid, true);
-  assert.equal(validatePlan(standalone).semanticRequired, true);
+  assert.equal(validatePlan(standalone).semanticRequired, false);
   task.files!.push({ path: 'cache.ts', role: 'generated', concern: 'Cache storage' });
   const finding = validatePlan(p).findings.find(f => f.rule === 'scope.concerns')!;
   assert.deepEqual(finding.references, ['runtime.ts', 'runtime-helper.ts', 'cache.ts']);
@@ -158,14 +158,14 @@ test('splitting a 2600-character fourteen-criterion unit retains every original 
   assert.deepEqual(split.tasks.flatMap(t => t.acceptance), ids);
 });
 
-test('CLI validation and compilation reject oversized tasks without creating a run', t => {
+test('legacy CLI validation and compilation reject oversized tasks without creating a run', t => {
   const dir = mkdtempSync(join(tmpdir(), 'dag-sizing-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
   const p = fixture(); oversize(p, 2600);
   const planFile = join(dir, 'plan.json'), runFile = join(dir, 'run.json');
   writeFileSync(planFile, JSON.stringify(p));
   const cli = fileURLToPath(new URL('../cli.js', import.meta.url));
   for (const action of ['validate', 'compile']) {
-    const result = spawnSync(process.execPath, [cli, 'plan', action, '--plan', planFile, '--file', runFile, '--json'], { encoding: 'utf8', windowsHide: true });
+    const result = spawnSync(process.execPath, [cli, 'plan', action, '--profile', 'lean', '--plan', planFile, '--file', runFile, '--json'], { encoding: 'utf8', windowsHide: true });
     assert.equal(result.status, 1, result.stderr);
     assert.ok(JSON.parse(result.stdout).findings.some((f: { rule: string }) => f.rule === 'scope.oversized'));
     assert.equal(existsSync(runFile), false);

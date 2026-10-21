@@ -3,6 +3,48 @@
 
 # DAG Orchestrator
 
+## Current ordinary execution: Software DAG Flow 3.0
+
+The user's Flow 3.0 replaces the historical ordinary execution instructions below.
+See `docs/flow3.md` and the supplied design in `docs/dag-flow3.0.md`.
+
+- Prefer many small nodes. Every node has `id`, `goal`, `depends_on`, `touches`,
+  `creates`, `relies_on`, and one fast deterministic `verify` command.
+- Author version 3 JSON with `title`, `nodes`, an optional common `cmd`, and
+  `settings` for checkpoints, repairs, conflicts, and phase timeouts.
+- `dag plan validate --plan flow.json --json` checks IDs, dependencies and cycles
+  and adds unambiguous missing producer edges. Size findings are advisory.
+- `dag plan compile --plan flow.json` writes a fresh run; `dag run` executes it.
+  `dag init` and `dag new-run` also default to the `flow3` profile.
+- Configure build/typecheck in `waveChecks` and integration/tests/spec commands
+  in `finalChecks`, or use detected npm scripts. Missing checkpoint configuration
+  is reported at validation time after work, never as successful acceptance.
+- No per-node planning, semantic review, frozen-source revalidation or shared
+  setup/coding deadline. One bounded advisory review runs alongside dispatch when
+  an agent command is available; it cannot gate a worker.
+- Pool slots keep warm dependencies. Straight chains reuse their worktree and
+  Codex/OpenCode/Claude conversation. File overlap serializes units.
+- A concrete implementation failure gets one retry preserving saved edits.
+  Eligible verifier failures get one in-place repair by default, with a separate
+  deadline. Quota/setup/unknown failures are held; failure blocks descendants.
+- Verified candidates survive merge failure. Resolve only conflict marker blocks;
+  never rerun implementation because landing conflicted.
+- Wave checks and final checks produce targeted fix nodes from actual errors.
+  At most two repair rounds are available across the whole run.
+- Repairs enforce owned files and protect tests/contracts/check configuration.
+  No-change repairs and repeated identical failures stop. `verify_requires`
+  adds safe producer edges; `checkPrerequisites` defers composed checks until
+  named producers complete. Deferred checks never count as passing acceptance.
+- Each phase has a separate timeout and an idle watchdog. Log both boundaries.
+- Keep existing saved runs stopped when editing their definitions. Never reset
+  attempts or acceptance by hand. `dag retry` preserves a merge candidate;
+  editing the node definition clears it.
+
+## Historical APIs and controller reference
+
+The remaining sections document `lean`/legacy profiles and factory controllers.
+Their planning/reviewer/deadline rules do not apply to Flow 3.0 runs.
+
 Global CLI: `dag`. If it is missing, install it from this repository:
 `pnpm install && pnpm build && npm link` (or run `node dist/cli.js …`).
 

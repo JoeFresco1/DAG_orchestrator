@@ -1186,7 +1186,7 @@ function compileImplementationTasks(
     const compiled = compilePlan(goal.planning);
     for (const input of Object.values(compiled.tasks)) {
       const task = ensureTask(run, input.id, { title: input.title, spec: input.spec, deps: input.deps, cmd: input.cmd,
-        reviewCmd: input.reviewCmd, reviewRounds: input.reviewRounds,
+        reviewCmd: input.reviewCmd, reviewRounds: run.tasks[input.id]?.reviewRounds ?? input.reviewRounds,
         maxAttempts: input.maxAttempts });
       state.tasks.implementation[task.id] = task.id;
       ensureExecutionEntity(graph, task, 'implementation_task');

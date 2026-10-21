@@ -16,19 +16,23 @@
 
 ---
 
-DAG Orchestrator is a local-first runner for coding agents. Give it small,
-verifiable tasks; it handles dependency order, parallelism, retries, isolated
-git worktrees, reviewer verdicts, and a live browser view.
+DAG Orchestrator runs small coding tasks in dependency order. New ordinary runs
+use [Software DAG Flow 3.0](docs/flow3.md): deterministic graph admission, a warm
+worker pool, one fast verification command per node, build/typecheck checkpoints,
+and a full integration pass with at most two repair rounds. Failed nodes block
+their descendants while independent branches continue. Merge conflicts preserve
+verified source and go to a resolver that can edit only conflict marker blocks.
 
-For prerequisite and acceptance validation before workers start, use the
-[versioned planning contract](docs/planning-contract.md) with `dag plan validate`,
-`review`, and `compile`. Existing DAGs keep their behavior until explicitly upgraded.
+Compile a version 3 node plan with `dag plan compile --plan flow.json`, then
+`dag run`. Nodes declare `id`, `goal`, `depends_on`, `touches`, `creates`,
+`relies_on`, and `verify`. Work commands can come from the plan, each node, or
+a configured harness chain. Straight chains share a worktree and conversation
+where the harness supports sessions. There is no per-node planning or LLM review.
 
-New spec decomposition uses a default budget of 800 characters of authored
-task prose, at most two acceptance criteria, and one independently verifiable
-output concern. Validation blocks oversized units before compilation; the
-planner must split them while preserving requirements and dependencies.
-Related files can share one concern. There is no maximum task count.
+Existing saved execution profiles remain readable and retain their behavior.
+Use `dag settings --profile flow3 --flow-config flow-settings.json` to upgrade a
+stopped run explicitly. Version 2 plans can also compile into the new execution
+path while retaining their original requirement registry.
 
 There is no database, hosted control plane, or always-on daemon. A run is a
 plain JSON file in your repository, with logs and state beside it.
@@ -38,8 +42,8 @@ plain JSON file in your repository, with logs and state beside it.
 | | Capability | What it gives you |
 |---|---|---|
 | ⚡ | **Dependency-aware parallelism** | Independent tasks run together; dependent tasks wait for real prerequisites. |
-| 🌿 | **One worktree per task** | Agents edit in isolation and successful work lands on a dedicated integration branch. |
-| ✅ | **Verification that gates progress** | Commands or reviewer agents must pass before a task completes. Missing verdicts fail closed. |
+| 🌿 | **Reusable isolated workers** | Warm worktrees accept ready nodes and land successful work on a dedicated integration branch. |
+| ✅ | **Fast local verification** | A deterministic node check gates completion; larger checks run at checkpoints. |
 | 🔁 | **Retries, repair, and fallback** | Retry failed subtrees, repair upstream work, or hand an attempt to another agent CLI. |
 | 🔍 | **Review after the build** | Audit a completed DAG or an existing repository, read verified findings, then decide whether to run repairs. |
 | 👁️ | **A live local viewer** | Watch the graph, queue, logs, attempts, plans, and verdicts from one browser tab. |
@@ -72,25 +76,32 @@ dag init --objective "Ship the import pipeline"
 dag settings --worktree task --concurrency 3
 
 dag add \
+  --id parser \
   --title "Parse input records" \
-  --spec "Inputs: docs/format.md. Outputs: src/parser.ts and tests. Acceptance: pnpm test parser."
+  --goal "Implement src/parser.ts and its focused tests from docs/format.md." \
+  --touches src/parser.ts,src/parser.test.ts --creates src/parser.ts,parse \
+  --verify "pnpm test parser"
 
 dag add \
+  --id api \
   --title "Expose the import API" \
-  --spec "Use the parser to implement the import endpoint. Acceptance: pnpm test api." \
-  --deps task_ab12cd34  # replace with the ID printed by the first `dag add`
+  --goal "Use parse() to implement the import endpoint and its tests." \
+  --touches src/api.ts,src/api.test.ts --relies-on parse \
+  --verify "pnpm test api" --deps parser
 ```
 
-Tasks without a command are manual. Point them at an installed agent harness
-to make the run automatic:
+Point the nodes at an installed agent harness before running:
 
 ```bash
 dag harness list
-dag set --all --harness codex --with-review
+dag set --all --harness codex
 ```
 
 Swap `codex` for `opencode`, `claude`, `cursor-agent`, or `gemini`. The harness
-supplies the non-interactive work, planning, and—when requested—review commands.
+supplies the non-interactive work command. Flow 3.0 uses the node's deterministic
+`verify` instead of per-node planning and agent reviews. Build/typecheck/test
+scripts are detected from `package.json`; configure other checkpoint commands
+with `dag settings --flow-config flow-settings.json` as shown in [the guide](docs/flow3.md).
 
 ### 3. Run and watch
 
@@ -107,27 +118,27 @@ fits naturally into scripts and CI.
 
 ```mermaid
 flowchart LR
-  A[Task becomes ready] --> P{Plan configured?}
-  P -->|yes| B[Plan]
-  P -->|no| C[Work]
-  B --> C
-  C --> R{Review configured?}
-  R -->|yes| D[Review]
-  R -->|no| E[Land]
-  D -->|pass| E
-  D -->|reject| F[Retry with feedback]
-  F --> B
-  E --> G[Merge into dag/run-id]
+  A[Ready node] --> B[Warm worker session]
+  B --> C[Work]
+  C --> D{Fast verify passes?}
+  D -->|No; retry remains| C
+  D -->|No; exhausted| F[Fail node; block descendants]
+  D -->|Yes| E[Land or resolve conflict markers]
+  E --> G[Complete node; unlock dependents]
+  G --> H[Wave build and typecheck]
+  H --> I[Final integration checks]
+  I -->|Actual errors; max 2 rounds| J[Targeted fix nodes]
+  J --> A
 ```
 
-Every task moves through `plan → work → review → land`:
+Every Flow 3.0 node moves through `work → verify → land`:
 
-- **Plan** is optional, but binding. If planning fails, work never starts.
 - **Work** can be any non-interactive command—not only an AI agent.
-- **Review** can be a test command or an agent that emits `VERDICT: PASS` or
-  `VERDICT: FAIL: reason`.
-- **Land** commits and merges only verified work into `dag/<runId>` when
-  worktree isolation is enabled. Your current checkout remains untouched.
+- **Verify** is one fast deterministic command with its own timeout.
+- **Land** merges the verified commit into `dag/<runId>`. Conflicts go to a
+  marker-only resolver and never rerun good implementation.
+- **Checkpoints** run bigger checks on integration and create bounded fixes
+  from actual errors. Each phase has its own clock and idle watchdog.
 
 The runner refills concurrency slots as soon as tasks finish. Downstream work
 starts only after its dependencies have completed and landed.
@@ -141,20 +152,21 @@ dag settings --worktree task --concurrency 4
 dag run
 ```
 
-Each task receives its own git worktree. DAG Orchestrator snapshots the current
+Each worker slot receives a reusable git worktree. DAG Orchestrator snapshots the current
 working tree—including uncommitted and untracked files—as the baseline, so
 agents see your real starting point without editing your checkout.
 
 Successful tasks merge into `dag/<runId>`. Failed or stopped tasks keep their
-recoverable work on a `dag-task/...` branch. Merge conflicts trigger a bounded
-redo on the new base instead of silently combining incompatible edits.
+recoverable work on node/candidate branches. A straight chain stays in the same
+worktree and supported harness conversation; a merge conflict preserves the
+verified candidate for resolution or a later landing retry.
 
 > [!NOTE]
-> Worktrees do not contain ignored dependencies such as `node_modules` or
-> `.venv`. Configure preparation when tasks need them:
+> Flow 3.0 shares existing ignored dependency caches and prepares each pool slot
+> once. Configure preparation when dependencies are not already warm:
 > `dag settings --worktree-prepare "pnpm install --frozen-lockfile"`.
 
-### Reviewer gates
+### Historical reviewer gates (lean/legacy profiles)
 
 Attach a deterministic check or an agent reviewer to any task:
 
@@ -235,7 +247,7 @@ dag review \
 If the integration check fails, DAG Orchestrator can requeue the upstream work
 and then rerun the integration node.
 
-### Chain reviews
+### Historical chain reviews (lean/legacy profiles)
 
 Review a wave, a dependency cone, or an entire large run as normal DAG nodes:
 
@@ -250,7 +262,7 @@ Before each chain review starts, the runner creates a manifest and one diff per
 covered task in `dag.run.d/reviews/chain-<taskId>/`. Reviewers work from actual
 results, verdicts, commits, and diffs—not from task descriptions alone.
 
-### End-of-run review
+### Historical end-of-run review (lean/legacy profiles)
 
 ```bash
 dag settings --final-review per-task --final-review-rounds 1

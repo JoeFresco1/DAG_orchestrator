@@ -12,6 +12,7 @@ import { spawnSync } from 'node:child_process';
 import {
   appendFileSync,
   closeSync,
+  copyFileSync,
   existsSync,
   fsyncSync,
   mkdirSync,
@@ -30,6 +31,7 @@ import { dirname, join, resolve } from 'node:path';
 import { assertNoCycle, isTerminal, topoSort, transitiveBlocked } from './graph.js';
 import type { Reviewer } from './review-policy.js';
 import type { HarnessCandidate } from './harness-chain.js';
+import { budgetFor, renewExecutionDeadline } from './execution-budget.js';
 import {
   DEFAULT_SETTINGS,
   DEFINITION_FIELDS,
@@ -517,6 +519,9 @@ function stateOf(run: Run): Record<string, unknown> {
     rev: run.rev,
     eventSeq: run.eventSeq,
     planningState: run.planningState,
+    executionPolicy: run.executionPolicy,
+    reviewCircuits: run.reviewCircuits,
+    flowState: run.flowState,
     tasks,
   };
 }
@@ -565,6 +570,9 @@ interface StoredDefinition {
 }
 
 interface StoredState {
+  flowState?: Run['flowState'];
+  reviewCircuits?: Run['reviewCircuits'];
+  executionPolicy?: Run['executionPolicy'];
   planningState?: Run['planningState'];
   updatedAt?: string;
   rev?: number;
@@ -575,6 +583,8 @@ interface StoredState {
 function normalizeTask(raw: Partial<Task>, run: Run, index: number): Task {
   const now = run.createdAt;
   return {
+    node: raw.node,
+    nodeState: raw.nodeState,
     id: raw.id ?? `task_${randomUUID().slice(0, 8)}`,
     title: raw.title ?? '(untitled)',
     spec: raw.spec ?? '',
@@ -621,6 +631,13 @@ function normalizeTask(raw: Partial<Task>, run: Run, index: number): Task {
     coverage: raw.coverage ?? null,
     reviewers: Array.isArray(raw.reviewers) ? raw.reviewers : [],
     reviewerVerdicts: raw.reviewerVerdicts ?? {},
+    reviewProtocolAttempts: raw.reviewProtocolAttempts,
+    executionBudget: raw.executionBudget,
+    integrationReceipt: raw.integrationReceipt,
+    integrationQueuedAt: raw.integrationQueuedAt,
+    reviewSourceCommit: raw.reviewSourceCommit,
+    phaseHistory: raw.phaseHistory,
+    milestones: raw.milestones,
     lastRejection: raw.lastRejection ?? null,
     model: raw.model ?? null,
     variant: raw.variant ?? null,
@@ -655,6 +672,9 @@ export function loadRun(file: string): Run {
   run.eventSeq = state?.eventSeq ?? def.eventSeq ?? 0;
   run.planning = def.planning;
   run.planningState = state?.planningState;
+  run.executionPolicy = state?.executionPolicy;
+  run.reviewCircuits = state?.reviewCircuits;
+  run.flowState = state?.flowState;
 
   let index = 0;
   for (const [id, raw] of Object.entries(def.tasks ?? {})) {
@@ -708,6 +728,72 @@ export function loadRun(file: string): Run {
   // rewrites the definition (and rotates its .bak) even for state-only changes.
   lastDefinitionJson.set(paths.file, JSON.stringify(definitionOf(run), null, 2));
   lastStateJson.set(paths.file, stateContent(run));
+  return run;
+}
+
+/** Restore a damaged execution sidecar from a validated matching checkpoint.
+ * The definition remains authoritative for authored fields; checkpoint and
+ * evidence-derived task fields only restore execution state. */
+export function restoreRunCheckpoint(
+  file: string,
+  checkpoint: Run,
+  taskOverrides: Record<string, Partial<Task>> = {},
+  eventSeq = checkpoint.eventSeq,
+): Run {
+  const paths = runPaths(file);
+  const def = readJsonWithBackup<StoredDefinition>(paths.file);
+  if (!def || !def.id || def.id !== checkpoint.id) throw new Error('Checkpoint run id does not match the run definition');
+  const currentState = readJsonWithBackup<StoredState>(paths.state);
+  if (currentState?.tasks && Object.keys(def.tasks ?? {}).every(id => currentState.tasks?.[id])) {
+    throw new Error('Execution state is readable; refusing checkpoint restoration');
+  }
+  const definitionIds = Object.keys(def.tasks ?? {}).sort();
+  const checkpointIds = Object.keys(checkpoint.tasks ?? {}).sort();
+  if (definitionIds.length === 0 || JSON.stringify(definitionIds) !== JSON.stringify(checkpointIds)) {
+    throw new Error('Checkpoint task set does not match the run definition');
+  }
+  for (const id of Object.keys(taskOverrides)) {
+    if (!def.tasks?.[id]) throw new Error(`Recovery evidence references unknown task ${id}`);
+  }
+
+  const run = newRun(def.objective ?? checkpoint.objective ?? 'untitled dag');
+  run.id = def.id;
+  run.createdAt = def.createdAt ?? checkpoint.createdAt ?? run.createdAt;
+  run.settings = { ...DEFAULT_SETTINGS, ...(def.settings ?? {}) };
+  run.updatedAt = new Date().toISOString();
+  run.rev = Math.max(checkpoint.rev ?? 0, 0);
+  run.eventSeq = Math.max(eventSeq, checkpoint.eventSeq ?? 0);
+  run.planning = def.planning;
+  run.planningState = checkpoint.planningState;
+  run.executionPolicy = checkpoint.executionPolicy;
+  run.reviewCircuits = checkpoint.reviewCircuits;
+  run.flowState = checkpoint.flowState;
+  run.events = Array.isArray(checkpoint.events) ? checkpoint.events.slice(-EVENT_RING_LIMIT) : [];
+
+  let index = 0;
+  for (const id of definitionIds) {
+    const raw = def.tasks![id] as Partial<Task>;
+    const prior = checkpoint.tasks[id];
+    const merged: Partial<Task> = { ...raw, id };
+    for (const field of DYNAMIC_FIELDS) {
+      const value = prior[field];
+      if (value !== undefined) (merged as Record<string, unknown>)[field] = value;
+    }
+    Object.assign(merged, taskOverrides[id] ?? {});
+    run.tasks[id] = normalizeTask(merged, run, index++);
+  }
+
+  mkdirSync(paths.dir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  for (const source of [paths.state, `${paths.state}.bak`]) {
+    if (existsSync(source)) copyFileSync(source, `${source}.corrupt-${stamp}`);
+  }
+  // Keep the authored graph byte-for-byte stable during the state restoration.
+  pathByRun.set(run, paths);
+  lastDefinitionJson.set(paths.file, JSON.stringify(definitionOf(run), null, 2));
+  lastStateJson.delete(paths.file);
+  appendedSeqByRun.set(run, run.eventSeq);
+  saveRun(run, file);
   return run;
 }
 
@@ -781,6 +867,7 @@ export function touch(run: Run): void {
 // Caller-supplied fields for a new task. Dynamic/state fields are initialized
 // by addTask, not accepted here.
 export interface AddTaskInput {
+  node?: Task['node'];
   /** Optional stable ID for idempotent, persisted workflow compilers. */
   id?: string;
   title: string;
@@ -810,10 +897,11 @@ export function addTask(run: Run, input: AddTaskInput): Task {
     if (!run.tasks[d]) throw new Error(`unknown dep ${d}`);
   }
   const id = input.id ?? `task_${randomUUID().slice(0, 8)}`;
-  if (!/^task_[A-Za-z0-9._-]+$/.test(id)) throw new Error(`invalid task id: ${id}`);
+  if (!(input.node ? /^[A-Za-z0-9][A-Za-z0-9._-]*$/ : /^task_[A-Za-z0-9._-]+$/).test(id)) throw new Error(`invalid task id: ${id}`);
   if (run.tasks[id]) throw new Error(`task already exists: ${id}`);
   const seq = Object.values(run.tasks).reduce((m, t) => Math.max(m, t.seq ?? 0), 0) + 1;
   const task: Task = {
+    node: input.node,
     id,
     title: input.title,
     spec: input.spec,
@@ -872,6 +960,7 @@ export function addTask(run: Run, input: AddTaskInput): Task {
 // Partial update for an existing task. Only defined keys are applied, so
 // `undefined` means "leave unchanged" while `null` means "clear".
 export interface EditTaskInput {
+  node?: Task['node'];
   title?: string;
   spec?: string;
   deps?: string[];
@@ -901,6 +990,7 @@ export function editTask(run: Run, id: string, patch: EditTaskInput): Task {
   if (!task) throw new Error(`unknown task ${id}`);
   assertPlanningPatch(run, patch);
   const prev = { ...task, deps: [...task.deps] };
+  if (patch.node !== undefined) task.node = patch.node;
   if (patch.title !== undefined) task.title = patch.title;
   if (patch.spec !== undefined) task.spec = patch.spec;
   if (patch.cmd !== undefined) task.cmd = patch.cmd;
@@ -925,6 +1015,7 @@ export function editTask(run: Run, id: string, patch: EditTaskInput): Task {
     }
     task.deps = [...patch.deps];
   }
+  if (patch.node !== undefined || patch.spec !== undefined || patch.cmd !== undefined || patch.deps !== undefined || patch.harnessChain !== undefined) task.nodeState = undefined;
   try {
     assertNoCycle(run);
   } catch (err) {
@@ -955,6 +1046,8 @@ export function retryTask(run: Run, id: string, cascade = false): string[] {
   if (task.status === 'running') throw new Error(`task ${id} is running; stop the run first`);
   const touched: string[] = [];
   const requeue = (t: Task): void => {
+    // Landing failures resume verified source; other retries redo implementation.
+    if (!['merge', 'integration', 'interrupted', 'killed'].includes(t.failureKind ?? '')) t.nodeState = undefined;
     t.status = 'pending';
     t.result = null;
     t.failureKind = null;
@@ -994,6 +1087,24 @@ export function retryTask(run: Run, id: string, cascade = false): string[] {
   logEvent(run, 'edit', id, cascade ? `retry (cascade): ${touched.join(', ')}` : 'retry');
   touch(run);
   return touched;
+}
+
+/** Extend one stopped task's deadline by the configured window, with an audit reason. */
+export function renewTaskExecutionBudget(run: Run, id: string, reason: string, now = Date.now(), additionalAttempts = 0): void {
+  const task = run.tasks[id];
+  if (!task) throw new Error(`unknown task ${id}`);
+  const pendingFailure = task.status === 'pending' && (task.failureKind === 'killed' || task.failureKind === 'budget' || task.failureKind === 'interrupted');
+  if (task.status === 'running' || (task.status !== 'failed' && !pendingFailure)) {
+    throw new Error(`task ${id} must be stopped after a failed attempt or quota interruption`);
+  }
+  if (!reason.trim()) throw new Error('budget renewal requires an explicit --reason');
+  // Restored pre-ledger tasks may not yet have a durable budget. Initialize
+  // from their lifetime attempt count before renewing so recovery never grants
+  // an implicit fresh allowance.
+  budgetFor(task, run.settings, now);
+  const { previous, next, previousLimit, nextLimit } = renewExecutionDeadline(task, run.settings, now, additionalAttempts);
+  logEvent(run, 'edit', id, `execution deadline renewed ${previous} -> ${next}; attempt limit ${previousLimit} -> ${nextLimit}: ${reason.trim()}`);
+  touch(run);
 }
 
 function isDescendant(run: Run, candidate: string, ancestor: string, seen: Set<string>): boolean {

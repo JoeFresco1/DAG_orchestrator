@@ -1,14 +1,18 @@
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { addTask, newRun, type AddTaskInput } from '../store.js';
+import { addTask, atomicWriteJson, newRun, runPaths, type AddTaskInput } from '../store.js';
 import type { Run, Task } from '../types.js';
-import { digest, type PlanningManifest, type PlanningTask, type PlanningCheck, type CompiledPlanning } from './contracts.js';
+import { digest, validatePlanningCheck, type PlanningManifest, type PlanningTask, type PlanningCheck, type CompiledPlanning } from './contracts.js';
 import { validatePlan } from './validation.js';
 
-/** Encode check argv rather than placing it in a shell or token template. */
-export function checkCommand(check: PlanningCheck): string {
+/** Keep check payloads out of command lines; retain files for persisted/resumed commands. */
+export function checkCommand(check: PlanningCheck, payloadDir = join(runPaths(process.env.DAG_FILE || join(process.cwd(), 'dag.run.json')).dir, 'checks')): string {
+  validatePlanningCheck(check);
   const script = join(dirname(fileURLToPath(import.meta.url)), 'check-command.js');
-  return `"${process.execPath}" "${script}" ${Buffer.from(JSON.stringify(check)).toString('base64')}`;
+  const payloadFile = resolve(payloadDir, `${digest(check)}.json`);
+  atomicWriteJson(payloadFile, check);
+  const quote = (value: string) => `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
+  return `${quote(process.execPath)} ${quote(script)} --file ${quote(payloadFile)}`;
 }
 export function renderPlanningTask(plan: PlanningManifest, task: PlanningTask): string {
   const local = plan.criteria.filter(c => c.owner === task.id);
@@ -37,7 +41,7 @@ export function planningDefinition(task: Task): string {
 export function plannedTaskInput(plan: PlanningManifest, task: PlanningTask, deps: string[]): AddTaskInput {
   return { id: task.id, title: task.title, spec: renderPlanningTask(plan, task), deps,
     cmd: task.cmd ?? `"${process.execPath}" -e "process.exit(0)"`, reviewCmd: task.reviewCmd ?? null,
-    reviewRounds: task.reviewCmd ? 1 : 0, ...(task.maxAttempts !== undefined ? { maxAttempts: task.maxAttempts } : {}) };
+    reviewRounds: 0, ...(task.maxAttempts !== undefined ? { maxAttempts: task.maxAttempts } : {}) };
 }
 /** Pure compilation: never edits a persisted run or launches a worker. */
 export function compilePlan(plan: PlanningManifest): Run {

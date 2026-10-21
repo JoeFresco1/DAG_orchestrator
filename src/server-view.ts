@@ -75,6 +75,7 @@ export function definitionPayload(run: Run): Record<string, unknown> {
     createdAt: run.createdAt,
     settings: run.settings,
     tasks: Object.values(run.tasks).map((t) => ({
+      node: t.node,
       id: t.id,
       title: t.title,
       deps: t.deps,
@@ -117,6 +118,7 @@ export function summaryPayload(run: Run): Record<string, unknown> {
     updatedAt: run.updatedAt,
     counts,
     total: tasks.length,
+    flow3: run.flowState,
     tasks,
   };
 }

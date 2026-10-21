@@ -10,7 +10,7 @@
 // without worktree isolation) the reviewer RUNS: a gate we cannot measure must
 // not silently open.
 
-export type ReviewerVerdictMode = 'marker' | 'exit-code';
+export type ReviewerVerdictMode = 'marker' | 'exit-code' | 'structured';
 
 export interface Reviewer {
   name: string;

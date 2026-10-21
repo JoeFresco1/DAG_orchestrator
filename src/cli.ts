@@ -8,8 +8,14 @@ const HELP = `DAG Orchestrator
 usage: dag <cmd> [flags]
 
   plan validate|review|compile --plan plan.json [--file F] [--json]
+                               version 3: small nodes, deterministic edge repair, pooled workers
   plan amend --plan plan.json --file F --reason R
   plan proposal --file F
+  followups list [--file F] [--json]
+  followups add --input findings.json [--task ID] [--attempt N] [--stage S]
+      [--source S]             record proposals without changing tasks or acceptance
+  followups triage --id ID --disposition blocker|existing-task|follow-up|dismissed
+      --reason R [--owner TASK] [--acceptance CHECK] [--duplicate-of ID]
 
   reliable preflight|run|resume|status|audit --config F
                                bounded recovery with ownership and structured review
@@ -34,7 +40,7 @@ usage: dag <cmd> [flags]
   schedule list | schedule rm <job> | schedule clear
   scheduler [--poll SEC] [--once] [--drain] [--watch] [--open]
                                run scheduled jobs one at a time
-  init --objective "..."        new run file
+  init --objective "..."        new run using the current execution policy
   factory start --goal goal.json [--file F]
                                compile and run a structured software-factory cycle
   factory review [--goal goal.json] [--file F] [--source-run F]
@@ -45,15 +51,17 @@ usage: dag <cmd> [flags]
   factory resume|status [--file F]
                                continue or inspect the persisted factory cycle
   add --title T --spec S [--deps a,b] [--cmd "..."] [--retries N]
+      [--id ID] --goal G --touches a.ts,b.ts --creates C --relies-on I --verify "fast command"
       [--timeout SEC] [--silence SEC] [--plan-cmd "..." | --no-plan] [--review-cmd "..."]
-                                plan runs by default for agent commands; --no-plan opts out
+                                Flow 3.0 runs work + verify; historical profiles retain phases
       [--review-rounds N] [--repair-rounds N]
   edit --id ID [--title T] [--spec S] [--deps a,b | --clear-deps] [--cmd C]
       [--status S] [--retries N] [--timeout SEC] [--silence SEC]
       [--plan-cmd C | --no-plan] [--review-cmd C] [--review-rounds N] [--repair-rounds N]
   rm --id ID                   delete node, strip it from others' deps
   list [--status S] [--limit N] | status | ready | blocked
-  retry --id ID [--cascade]    requeue failed task (cascade: its failed subtree)
+  retry --id ID [--cascade] [--renew-budget --reason R [--additional-attempts N]]
+                               requeue; explicit budget renewal extends time, retaining attempt count
   retry-failed [--cascade]     requeue every failed task
   diagnose --id ID [--after 3] [--cwd F] [--dry-run]
       [--model gpt-6-luna] [--reasoning xhigh] [--timeout 300]
@@ -65,7 +73,7 @@ usage: dag <cmd> [flags]
   show --id ID                 full task detail incl. review/verdict/logs
   reviewer list --id ID        reviewers attached to a task
   reviewer add --id ID --name N --cmd "..." [--when always|on-reject|diff-lines>N|diff-touches:glob]
-      [--verdict marker|exit-code]   each reviewer emits its own verdict
+      [--verdict marker|exit-code|structured] each reviewer emits its own verdict
   reviewer rm --id ID --name N
   set-cmd [--all | --only a,b | --match REGEX] --cmd "harness ... {spec}"
   harness [list|show --name N]  agent CLI presets (opencode, claude, codex, …)
@@ -82,6 +90,8 @@ usage: dag <cmd> [flags]
       [--silence SEC]
                                bulk edit harness / planner / reviewer / repair
   resume                       requeue tasks interrupted by a crash/restart
+  recover-checkpoint --file F --checkpoint JOURNAL [--events F] [--receipts DIR]
+                               restore a damaged sidecar from a matching checkpoint and verified history
   skip-blocked                 mark blocked/gated tasks skipped so the run converges
   kill-orphans                 kill process trees left behind by a crash
   heartbeat --id ID            keep-alive for workers that don't stream stdout
@@ -95,11 +105,13 @@ usage: dag <cmd> [flags]
   chain-review --of a,b | --wave N | --from ID | --all [--batch N] [--cmd C]
                                review tasks that review the work of other tasks
   settings [--concurrency N] [--retries N] [--timeout SEC] [--silence SEC]
+      [--profile flow3|lean] [--flow-config flow-settings.json] [--effective]
       [--max-hours H] [--on-dep-failure block|skip] [--gates wait|skip]
       [--notify "command"] [--worktree none|task] [--plan auto|off]
   gate --id ID --question Q | approve --id ID | reject --id ID
   dot                          graphviz chart
   run --file F [--concurrency N] [--only a,b] [--retries N] [--timeout SEC]
+      [--profile flow3|lean]    explicitly upgrade a stopped historical run
       [--silence SEC] [--max-hours H] [--on-dep-failure block|skip]
       [--gates wait|skip] [--worktree none|task] [--kill-orphans] [--dry-run]
       [--force]

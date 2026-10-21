@@ -282,8 +282,8 @@ export function reviewerCmd(argv: string[]): void {
     const invalid = parseWhen(when).invalid;
     if (invalid) throw new Error(`unknown --when clause "${invalid}"`);
     const verdict = flag(argv, 'verdict');
-    if (verdict !== undefined && verdict !== 'marker' && verdict !== 'exit-code') {
-      throw new Error(`--verdict must be marker|exit-code (got ${verdict})`);
+    if (verdict !== undefined && verdict !== 'marker' && verdict !== 'exit-code' && verdict !== 'structured') {
+      throw new Error(`--verdict must be marker|exit-code|structured (got ${verdict})`);
     }
     const task = run.tasks[id];
     if (!task) throw new Error(`unknown task ${id}`);
@@ -292,7 +292,7 @@ export function reviewerCmd(argv: string[]): void {
       name,
       cmd: cmdText,
       when,
-      ...(verdict ? { verdict: verdict as 'marker' | 'exit-code' } : {}),
+      ...(verdict ? { verdict: verdict as 'marker' | 'exit-code' | 'structured' } : {}),
       ...(flag(argv, 'why') ? { why: flag(argv, 'why') } : {}),
     });
     task.reviewers = list;

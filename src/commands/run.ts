@@ -1,6 +1,9 @@
 // Run-lifecycle commands: execute the graph, recover after a crash, retry or
 // skip work, apply run-wide settings, and the end-of-run review.
 import { DagRunner, type RunnerOptions } from '../runner.js';
+import { createHash } from 'node:crypto';
+import { readFileSync, readdirSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import {
   killOrphans,
   loadRun,
@@ -8,6 +11,8 @@ import {
   recoverInterrupted,
   retryFailed,
   retryTask,
+  renewTaskExecutionBudget,
+  restoreRunCheckpoint,
   saveRun,
   setSettings,
   skipBlocked,
@@ -15,10 +20,12 @@ import {
 } from '../store.js';
 import { evaluateConvergence, summarize } from '../graph.js';
 import { parseHarnessChain } from '../harness-chain.js';
+import { executionProfilePatch } from '../execution-policy.js';
 import {
   countFlag,
   emit,
   flag,
+  flagRequired,
   guard,
   has,
   numberFlag,
@@ -33,6 +40,8 @@ import {
   MAX_CONCURRENCY,
   describeSettingsProblems,
   validateSettingsPatch,
+  type Run,
+  type Task,
 } from '../types.js';
 
 // Builds a runner whose events stream live to the terminal: JSON mode routes
@@ -58,6 +67,19 @@ function buildRunner(
   });
 }
 
+function sharedBudgetFlags(argv: string[]): Partial<ReturnType<typeof loadRun>['settings']> {
+  const patch: Partial<ReturnType<typeof loadRun>['settings']> = {};
+  const attempts = countFlag(argv, 'implementation-attempts', 1);
+  const infrastructure = countFlag(argv, 'infrastructure-retries', 0);
+  const deadline = flag(argv, 'task-deadline');
+  if (attempts !== undefined) patch.implementationAttempts = attempts;
+  if (infrastructure !== undefined) patch.infrastructureRetries = infrastructure;
+  if (deadline !== undefined) patch.taskDeadlineMs = secondsToMs(deadline) ?? undefined;
+  const problems = validateSettingsPatch(patch);
+  if (problems.length) throw new Error(describeSettingsProblems(problems));
+  return patch;
+}
+
 // `run` executes the graph to convergence. It resolves the scope from --only,
 // skips manual tasks (no cmd, no chain), optionally kills orphaned process
 // trees from a previous crash, then reports the final summary. A non-zero exit
@@ -66,6 +88,20 @@ export async function runCmd(argv: string[]): Promise<void> {
   const file = flag(argv, 'file') ?? 'dag.run.json';
   guard(file, argv);
   const run = loadRun(file);
+  let extras: Partial<RunnerOptions> = {};
+  const reliability = flag(argv, 'reliability-config');
+  if (reliability) {
+    // Validate controller ownership before allowing its historical execution policy.
+    // @ts-expect-error Packaged JavaScript adapter supplies the runner hooks.
+    const adapter = await import('../../scripts/reliability/engine-adapter.mjs');
+    extras = await adapter.runnerHooks(reliability, run, file);
+  }
+  const profile = flag(argv, 'profile');
+  if (profile !== undefined) Object.assign(run.settings, executionProfilePatch(profile));
+  if (!extras.controllerManaged && run.settings.executionProfile !== 'lean' && run.settings.executionProfile !== 'flow3') {
+    throw new Error('This saved run uses the retired execution policy. Upgrade the stopped run with --profile lean and an explicit --implementation-attempts limit; historical attempts remain counted.');
+  }
+  Object.assign(run.settings, sharedBudgetFlags(argv));
   const requested = countFlag(argv, 'concurrency', 1) ?? run.settings.concurrency;
   if (requested > MAX_CONCURRENCY) throw new Error(`--concurrency max is ${MAX_CONCURRENCY}`);
   const concurrency = Math.max(1, requested);
@@ -122,7 +158,7 @@ export async function runCmd(argv: string[]): Promise<void> {
       !runnable(id) &&
       (run.tasks[id].status === 'pending' || run.tasks[id].status === 'ready'),
   );
-  const scope = candidates.filter((id) => runnable(id));
+  const scope = run.settings.executionProfile === 'flow3' ? candidates : candidates.filter((id) => runnable(id));
   if (scope.length === 0) {
     console.log(
       manual.length > 0
@@ -133,7 +169,7 @@ export async function runCmd(argv: string[]): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  if (manual.length > 0) {
+  if (manual.length > 0 && run.settings.executionProfile !== 'flow3') {
     console.log(`skipping ${manual.length} manual task(s) without cmd: ${manual.join(', ')}`);
   }
   if (has(argv, 'kill-orphans')) {
@@ -145,13 +181,6 @@ export async function runCmd(argv: string[]): Promise<void> {
     if (n > 0) console.log(`killed ${n} orphan process(es)`);
   }
 
-  let extras: Partial<RunnerOptions> = {};
-  const reliability = flag(argv, 'reliability-config');
-  if (reliability) {
-    // @ts-expect-error Packaged JavaScript adapter supplies the runner hooks.
-    const adapter = await import('../../scripts/reliability/engine-adapter.mjs');
-    extras = await adapter.runnerHooks(reliability, run, file);
-  }
   const runner = buildRunner(run, file, argv, 12, extras);
   const onSignal = (): void => {
     console.log('\nstopping (signal received)…');
@@ -159,7 +188,8 @@ export async function runCmd(argv: string[]): Promise<void> {
   };
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
-  await runner.start(new Set(scope));
+  try { await runner.start(new Set(scope)); }
+  finally { process.off('SIGINT', onSignal); process.off('SIGTERM', onSignal); }
   saveRun(run, file);
   const summary = runner.result;
   emit(
@@ -174,6 +204,7 @@ export async function runCmd(argv: string[]): Promise<void> {
       budgetReached: summary?.budgetReached ?? false,
       interrupted: summary?.interrupted ?? { requeued: [], orphanPids: [] },
       finalReview: summary?.finalReview ?? null,
+      flow3: summary?.flow3 ?? null,
     },
     () => summarize(run),
   );
@@ -196,6 +227,7 @@ export async function runCmd(argv: string[]): Promise<void> {
   if (summary.stopped || summary.budgetReached || summary.failed.length > 0 || summary.unfinished.length > 0) {
     process.exitCode = 1;
   }
+  if (summary.flow3 && !summary.flow3.passed) process.exitCode = 1;
 }
 
 // `resume` requeues tasks that were interrupted by a crash/restart, and
@@ -227,6 +259,101 @@ export function resumeCmd(argv: string[]): void {
     });
   }
   if (!wantsJson(argv)) console.log(summarize(run));
+}
+
+// Recover a damaged sidecar from a full persisted checkpoint and the
+// append-only evidence written after it. This is intentionally conservative:
+// completed tasks require both a terminal event and an integrity-checked
+// published integration receipt. Active tasks are restored as running so the
+// normal kill-orphans/resume path handles them.
+export function recoverCheckpointCmd(argv: string[]): void {
+  const file = flag(argv, 'file') ?? 'dag.run.json';
+  guard(file, argv);
+  const checkpointFile = resolve(flagRequired(argv, 'checkpoint'));
+  const eventsFile = resolve(flag(argv, 'events') ?? join(dirname(file), `${file.split(/[\\/]/).pop()}.d`, 'events.jsonl'));
+  const receiptsDir = resolve(flag(argv, 'receipts') ?? join(dirname(file), `${file.split(/[\\/]/).pop()}.d`, 'integration'));
+  const journal = JSON.parse(readFileSync(checkpointFile, 'utf8')) as { stage?: string; previousRun?: Run };
+  const checkpoint = journal.previousRun;
+  if (journal.stage !== 'committed' || !checkpoint?.id || !checkpoint.tasks) {
+    throw new Error('Checkpoint source must be a committed planning-amendment journal with previousRun');
+  }
+  const events = readFileSync(eventsFile, 'utf8').split(/\r?\n/).filter(Boolean)
+    .map((line) => JSON.parse(line) as { seq: number; ts: string; type: string; taskId: string | null; message: string });
+  const after = events.filter((event) => event.seq > checkpoint.eventSeq).sort((a, b) => a.seq - b.seq);
+  for (let i = 0; i < after.length; i++) {
+    if (after[i].seq !== checkpoint.eventSeq + i + 1) throw new Error('Event log does not provide a contiguous history after the checkpoint');
+  }
+  const receipts = readdirSync(receiptsDir).filter((name) => name.endsWith('.json')).flatMap((name) => {
+    try {
+      const receipt = JSON.parse(readFileSync(join(receiptsDir, name), 'utf8')) as Record<string, unknown>;
+      const { stage, integrity, ...accepted } = receipt;
+      const expected = createHash('sha256').update(JSON.stringify(accepted)).digest('hex');
+      if (stage !== 'published' || integrity !== expected || receipt.runId !== checkpoint.id ||
+          !receipt.verification || (receipt.verification as { passed?: boolean }).passed !== true) return [];
+      return [{ path: join(receiptsDir, name), receipt }];
+    } catch { return []; }
+  });
+  const overrides: Record<string, Partial<Task>> = {};
+  const ids = [...new Set(after.map((event) => event.taskId).filter((id): id is string => Boolean(id)))];
+  for (const id of ids) {
+    const history = after.filter((event) => event.taskId === id);
+    const starts = history.filter((event) => event.type === 'task-start');
+    const lifecycle = history.filter((event) => ['task-start', 'task-done', 'task-fail', 'task-killed', 'task-interrupted'].includes(event.type));
+    const latest = lifecycle.at(-1);
+    if (!latest) continue;
+    const attemptNumbers = starts.map((event) => Number(event.message.match(/attempt (\d+)/)?.[1] ?? 0));
+    const attempts = Math.max(checkpoint.tasks[id]?.attempts ?? 0, ...attemptNumbers);
+    const latestStart = starts.at(-1);
+    const cycle = latestStart?.message.match(/cycle (\d+)\/(\d+)/);
+    const previousBudget = checkpoint.tasks[id]?.executionBudget as Task['executionBudget'] | undefined;
+    let renewedDeadline: string | undefined;
+    let renewedLimit: number | undefined;
+    for (const event of history.filter((entry) => entry.type === 'edit')) {
+      const renewed = event.message.match(/execution deadline renewed .*? -> (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)/);
+      if (renewed) renewedDeadline = renewed[1];
+      const limit = event.message.match(/attempt limit \d+ -> (\d+)/);
+      if (limit) renewedLimit = Number(limit[1]);
+    }
+    const firstDispatchAt = starts[0]?.ts ?? previousBudget?.firstDispatchAt ?? new Date().toISOString();
+    const defaultDeadline = new Date(Date.parse(firstDispatchAt) + (checkpoint.settings.taskDeadlineMs ?? 2_700_000)).toISOString();
+    const executionBudget: Task['executionBudget'] = previousBudget ? { ...previousBudget } : {
+      version: 1, firstDispatchAt, deadlineAt: renewedDeadline ?? defaultDeadline,
+      limit: renewedLimit ?? checkpoint.settings.implementationAttempts ?? 3, used: attempts, infrastructureRetries: {},
+    };
+    if (executionBudget) {
+      if (renewedDeadline) executionBudget.deadlineAt = renewedDeadline;
+      if (renewedLimit !== undefined) executionBudget.limit = renewedLimit;
+      executionBudget.used = Math.max(executionBudget.used, attempts);
+    }
+    const common: Partial<Task> = {
+      attempts,
+      attemptsInCycle: cycle ? Number(cycle[1]) : checkpoint.tasks[id]?.attemptsInCycle,
+      ...(executionBudget ? { executionBudget } : {}),
+      pid: null,
+    };
+    if (latest.type === 'task-done') {
+      const receiptEntry = receipts.find(({ receipt }) => receipt.taskId === id && receipt.attempt === attempts);
+      if (!receiptEntry) throw new Error(`Cannot restore completed task ${id}: no matching verified published integration receipt`);
+      const receipt = receiptEntry.receipt as { sourceCommit: string; candidateCommit: string; attempt: number };
+      overrides[id] = { ...common, status: 'completed', startedAt: latestStart?.ts ?? null, finishedAt: latest.ts,
+        exitCode: 0, failureKind: null, result: latest.message, commit: receipt.sourceCommit,
+        integrationReceipt: resolve(receiptEntry.path) };
+    } else if (latest.type === 'task-start') {
+      overrides[id] = { ...common, status: 'running', startedAt: latest.ts, finishedAt: null, exitCode: null, failureKind: null };
+    } else if (latest.type === 'task-fail') {
+      overrides[id] = { ...common, status: 'failed', finishedAt: latest.ts, exitCode: null,
+        failureKind: latest.message.includes('(budget)') ? 'budget' : null, result: latest.message };
+    } else {
+      overrides[id] = { ...common, status: 'pending', startedAt: null, finishedAt: null, pid: null };
+    }
+  }
+  const run = restoreRunCheckpoint(file, checkpoint, overrides, events.at(-1)?.seq ?? checkpoint.eventSeq);
+  const report = { runId: run.id, checkpointSeq: checkpoint.eventSeq, restoredThroughSeq: run.eventSeq,
+    restoredTasks: Object.keys(overrides).length,
+    counts: Object.values(run.tasks).reduce<Record<string, number>>((counts, task) => {
+      counts[task.status] = (counts[task.status] ?? 0) + 1; return counts;
+    }, {}) };
+  emit(argv, report, () => `restored ${report.restoredTasks} task states from verified checkpoint and event history`);
 }
 
 // `skip-blocked` marks blocked/gated tasks skipped so a run whose dependencies
@@ -267,6 +394,8 @@ export function retryCmd(argv: string[]): void {
   const run = loadRun(file);
   const id = flag(argv, 'id');
   if (!id) throw new Error('--id is required (or use retry-failed)');
+  if (has(argv, 'additional-attempts') && !has(argv, 'renew-budget')) throw new Error('--additional-attempts requires --renew-budget and --reason');
+  if (has(argv, 'renew-budget')) renewTaskExecutionBudget(run, id, flagRequired(argv, 'reason'), Date.now(), numberFlag(argv, 'additional-attempts') ?? 0);
   const touched = retryTask(run, id, has(argv, 'cascade'));
   saveRun(run, file);
   emit(argv, { requeued: touched }, () => `requeued: ${touched.join(', ')}`);
@@ -290,9 +419,22 @@ export function retryFailedCmd(argv: string[]): void {
 // stored so a typo cannot silently change the execution model.
 export function settingsCmd(argv: string[]): void {
   const file = flag(argv, 'file') ?? 'dag.run.json';
+  if (has(argv, 'effective')) {
+    const run = loadRun(file);
+    console.log(JSON.stringify({ settings: run.settings, lastExecution: run.executionPolicy ?? null }, null, 2));
+    return;
+  }
+  // Inspection is read-only and remains available while another process runs.
+  if (argv.every((value, index) => value === '--json' || value === '--file' || argv[index - 1] === '--file')) {
+    console.log(JSON.stringify(loadRun(file).settings, null, 2));
+    return;
+  }
   guard(file, argv);
   const run = loadRun(file);
   const patch: Parameters<typeof setSettings>[1] = {};
+  const profile = flag(argv, 'profile');
+  if (profile !== undefined) Object.assign(patch, executionProfilePatch(profile));
+  Object.assign(patch, sharedBudgetFlags(argv));
   const concurrency = countFlag(argv, 'concurrency', 1);
   if (concurrency !== undefined) {
     if (concurrency > MAX_CONCURRENCY) {
@@ -326,6 +468,8 @@ export function settingsCmd(argv: string[]): void {
   }
   const prepare = flag(argv, 'worktree-prepare');
   if (prepare !== undefined) patch.worktreePrepareCmd = prepare;
+  const flowConfig = flag(argv, 'flow-config');
+  if (flowConfig !== undefined) patch.flow3 = JSON.parse(readFileSync(flowConfig, 'utf8'));
   const chain = flag(argv, 'harness-chain');
   if (chain !== undefined) patch.harnessChain = chain ? parseHarnessChain(chain) : [];
   if (has(argv, 'fail-on-exit')) patch.failOnNonZeroExit = true;
@@ -340,6 +484,8 @@ export function settingsCmd(argv: string[]): void {
   }
   const finalReviewRounds = countFlag(argv, 'final-review-rounds', 0);
   if (finalReviewRounds !== undefined) patch.finalReviewRounds = finalReviewRounds;
+  const mergeRounds = countFlag(argv, 'merge-rounds', 0);
+  if (mergeRounds !== undefined) patch.mergeRounds = mergeRounds;
   if (has(argv, 'final-review-cmd')) {
     patch.finalReviewCmd = flag(argv, 'final-review-cmd') ?? null;
   }

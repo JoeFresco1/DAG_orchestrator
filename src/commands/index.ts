@@ -33,6 +33,7 @@ import {
   finalReviewCmd,
   killOrphansCmd,
   resumeCmd,
+  recoverCheckpointCmd,
   retryCmd,
   retryFailedCmd,
   runCmd,
@@ -48,10 +49,12 @@ import { neutralRunCmd } from './neutral.js';
 import { diagnoseCmd } from './diagnostics.js';
 import { reliableCmd } from './reliability.js';
 import { planningCmd } from './planning.js';
+import { followupsCmd } from './followups.js';
 
 /** Maps `dag <name>` to its handler; aliases share one handler on purpose. */
 export const COMMANDS: Record<string, CommandHandler> = {
   plan: planningCmd,
+  followups: followupsCmd,
   reliable: reliableCmd,
   // Viewer / server
   serve: serveCmd,
@@ -71,6 +74,7 @@ export const COMMANDS: Record<string, CommandHandler> = {
   'neutral-run': neutralRunCmd,
   run: runCmd,
   resume: resumeCmd,
+  'recover-checkpoint': recoverCheckpointCmd,
   'skip-blocked': skipBlockedCmd,
   'kill-orphans': killOrphansCmd,
   settings: settingsCmd,

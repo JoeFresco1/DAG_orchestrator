@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { loadRun, runPaths, saveRun } from './store.js';
 import { newRun } from './store.js';
 import type { Run } from './types.js';
+import { executionProfilePatch } from './execution-policy.js';
 
 // Runs are first-class: the active run lives at the project root and archived
 // runs live beside it, so history travels with the repository.
@@ -174,6 +175,7 @@ export function startNewRun(projectDir: string, objective: string): { run: Run; 
     }
   }
   const run = newRun(objective);
+  Object.assign(run.settings, executionProfilePatch());
   saveRun(run, active);
   return { run, archivedTo };
 }

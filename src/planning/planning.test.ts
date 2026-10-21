@@ -8,11 +8,41 @@ import { DagRunner } from '../runner.js';
 import { atomicWriteJson, editTask, setTasks, removeTask, loadRun, runPaths, saveRun } from '../store.js';
 import { startFactory, normalizeFactoryGoal, upgradeFactoryGoal, type StructuredFactoryGoalV2 } from '../factory/controller.js';
 import { digest, type PlanningManifest, type PlanningCheck, type PlanningFinding } from './contracts.js';
-import { compilePlan, renderPlanningTask, checkCommand } from './compile.js';
+import { compilePlan, renderPlanningTask } from './compile.js';
 import { validatePlan, admitPlanningTask } from './validation.js';
 import { missingPlanningAcceptance, planningRefusal, recordPlanningFailure, recordPlanningAcceptance } from './runtime.js';
 import { reviewPlan, validatePlanningReview, reviewCorrectionCycle } from './review.js';
 import { amendPlan, migratePlan } from './amend.js';
+
+// Fixture reviewers consume the declared context-file argv, just like the real
+// review transport; task.spec is a worker handover and may contain instructions.
+function planningReviewContext(command: string | undefined): { contextFile: string; context: any } {
+  const payload = command?.match(/--file ("(?:[^"\\]|\\.)*")$/)?.[1];
+  assert.ok(payload, 'Planning review must use its durable check-command payload');
+  const check = JSON.parse(readFileSync(JSON.parse(payload), 'utf8')) as PlanningCheck;
+  assert.equal(check.program, 'fixture');
+  const contextFile = check.args[0]!;
+  const context = JSON.parse(readFileSync(contextFile, 'utf8'));
+  assert.equal(context.revision, digest(context.plan));
+  return { contextFile, context };
+}
+
+test('planning protocol recovers review alone and consumes designated artifact over transcript', async t => {
+  const dir = root(t), plan = fixture();
+  plan.semanticReview = { mode: 'required', command: { program: 'fixture', args: ['{contextFile}', '{reviewOutputFile}'], timeoutMs: 1000 } };
+  let calls = 0;
+  const result = await reviewPlan(plan, dir, async (_task, _ctx, command) => {
+    calls++;
+    const { contextFile, context } = planningReviewContext(command);
+    const state = JSON.parse(readFileSync(join(runPaths(join(dir, 'dag.run.json')).dir, 'reviews', 'planning-protocol.json'), 'utf8'));
+    assert.equal(state.dispatches[context.contextDigest], calls);
+    if (calls === 1) return { exitCode: 0, output: 'DAG_PLAN_REVIEW: {"verdict":"pass","findings":[]}' };
+    assert.match(context.protocolFeedback, /JSON/);
+    writeFileSync(join(contextFile, '..', 'final-review.txt'), '{"verdict":"pass","findings":[]}');
+    return { exitCode: 0, output: 'DAG_PLAN_REVIEW: {"verdict":"fail","findings":[]}' };
+  });
+  assert.equal(calls, 2); assert.equal(result.verdict, 'pass'); assert.equal(result.reviewer, 'fixture');
+});
 
 test('explicit legacy migration preserves accepted objects and attempt history without fabricating check receipts', t => {
   const dir = root(t), plan = fixture(), run = compilePlan(plan);
@@ -123,7 +153,7 @@ test('write/resource exclusion never invents semantic ordering or serializes dis
   assert.equal(admitPlanningTask(p, 'task_cli', ['task_runtime']), false);
 });
 
-test('real runner accepts foundation before downstream and rejects missing final behavior', async t => {
+test('real runner accepts foundation before downstream and defers final acceptance checks', async t => {
   const dir = root(t), p = fixture();
   p.tasks[0]!.cmd = `"${process.execPath}" -e "require('fs').writeFileSync('runtime.txt','ready')"`;
   p.tasks[0]!.checks = [check('runtime', "if(!require('fs').existsSync('runtime.txt'))process.exit(1)")];
@@ -132,16 +162,19 @@ test('real runner accepts foundation before downstream and rejects missing final
   p.tasks[1]!.checks = [check('cli', "if(!require('fs').existsSync('cli.txt'))process.exit(1)")];
   const run = compilePlan(p); run.settings.maxAttempts = 1;
   const runner = new DagRunner(run, { cwd: dir }); await runner.start();
-  assert.equal(run.tasks.task_runtime.status, 'completed'); assert.equal(run.tasks.task_cli.status, 'failed');
-  assert.deepEqual(missingPlanningAcceptance(run), ['cli-works']); assert.ok(runner.result!.failed.length || runner.result!.unfinished.length);
+  assert.equal(run.tasks.task_runtime.status, 'completed'); assert.equal(run.tasks.task_cli.status, 'completed');
+  assert.deepEqual(missingPlanningAcceptance(run), []);
   assert.equal(run.planningState!.evidence['runtime-ready']!.checks[0], 'runtime');
+  assert.ok(run.events.some(e => /acceptance deferred/.test(e.message)));
 });
 
-test('direct runner refuses invalid plans and changed compiled definitions before worker dispatch', async t => {
+test('direct runner defers invalid plans and changed compiled definitions instead of blocking dispatch', async t => {
   const dir = root(t), run = compilePlan(fixture()); let calls = 0;
   run.tasks.task_cli.deps = [];
   const runner = new DagRunner(run, { cwd: dir, executor: async () => { calls++; return { exitCode: 0, output: '' }; } });
-  await runner.start(); assert.equal(calls, 0); assert.match(runner.result!.planningError!, /changed|dependencies/);
+  await runner.start(); assert.equal(calls, 2);
+  assert.ok(run.events.some(e => /planning validation deferred/.test(e.message) && /changed|dependencies/.test(e.message)));
+  assert.equal(run.tasks.task_runtime.status, 'completed'); assert.equal(run.tasks.task_cli.status, 'completed');
   const file = join(dir, 'dag.run.json'); saveRun(run, file); const loaded = loadRun(file);
   assert.equal(loaded.planning?.revision, run.planning?.revision); assert.match(planningRefusal(loaded, dir)!, /changed/);
   loaded.planningState = undefined; assert.match(planningRefusal(loaded, dir)!, /checkpoint/);
@@ -156,13 +189,16 @@ test('factory v2 compiles actual acceptance ownership and cannot advance past mi
   assert.equal(loadRun(file).tasks.task_runtime.status, 'completed'); assert.equal(result.state.stage, 'implementation');
   const graph = JSON.parse(readFileSync(join(runPaths(file).factory, 'graph-model-v1.json'), 'utf8'));
   assert.equal(graph.links.filter((l: { type: string }) => l.type === 'verified_by').length, 2);
+  const retained = loadRun(file); editTask(retained, 'task_runtime', { reviewRounds: 1 }); saveRun(retained, file);
+  await startFactory(goal, file, { cwd: dir, executor: async task => ({ output: 'checked', exitCode: task.id === 'task_cli' ? 1 : 0 }) });
+  assert.equal(loadRun(file).tasks.task_runtime.reviewRounds, 1);
 });
 
 test('semantic review requires grounded findings, source identity and risk-based approval', async t => {
-  const dir = root(t), p = fixture(); p.semanticReview = { mode: 'auto', command: { program: 'fixture', args: ['{contextFile}'], timeoutMs: 1000 } };
+  const dir = root(t), p = fixture(); p.semanticReview = { mode: 'required', command: { program: 'fixture', args: ['{contextFile}'], timeoutMs: 1000 } };
   assert.equal(validatePlan(p).semanticRequired, true);
-  const receipt = await reviewPlan(p, dir, async task => {
-    const { contextDigest } = JSON.parse(readFileSync(JSON.parse(task.spec).contextFile, 'utf8'));
+  const receipt = await reviewPlan(p, dir, async (_task, _ctx, command) => {
+    const { context: { contextDigest } } = planningReviewContext(command);
     return { exitCode: 0, output: `DAG_PLAN_REVIEW: ${JSON.stringify({ version: 1, revision: digest(p), contextDigest, reviewer: 'independent-fixture', verdict: 'pass', findings: [] })}` };
   });
   assert.equal(receipt.verdict, 'pass');
@@ -178,22 +214,58 @@ test('semantic review requires grounded findings, source identity and risk-based
 test('semantic correction cycle is bounded and revalidates corrected plans', async t => {
   const dir = root(t), p = fixture(); p.semanticReview = { mode: 'required', command: { program: 'fixture', args: ['{contextFile}'], timeoutMs: 1000 } };
   let corrections = 0;
-  const result = await reviewCorrectionCycle(p, dir, async plan => { corrections++; return plan; }, async task => {
-    const context = JSON.parse(readFileSync(JSON.parse(task.spec).contextFile, 'utf8'));
+  const result = await reviewCorrectionCycle(p, dir, async plan => { corrections++; plan.tasks[1]!.reviewBoundary += '; corrected boundary'; return plan; }, async (_task, _ctx, command) => {
+    const { context } = planningReviewContext(command);
     const f: PlanningFinding = { id: 'scope', rule: 'scope.ambiguous', tasks: ['task_cli'], references: ['cli-works'], evidence: ['CLI repair responsibility is not bounded'], severity: 'error', blocking: true, message: 'Bound repair ownership', correction: 'Move implementation obligations upstream' };
     return { exitCode: 0, output: `DAG_PLAN_REVIEW: ${JSON.stringify({ version: 1, revision: digest(context.plan), contextDigest: context.contextDigest, reviewer: 'fixture', verdict: 'fail', findings: [f] })}` };
   });
-  assert.equal(corrections, 2); assert.equal(result.reviews.length, 3);
+  assert.equal(corrections, 1); assert.equal(result.reviews.length, 2);
+  assert.deepEqual(result.plan.criteria, p.criteria);
 });
 
-test('matching evidence-backed planning defects hold consumers and preserve remaining attempts', async t => {
-  const dir = root(t), p = fixture(); p.tasks[0]!.maxAttempts = 5;
+test('planning review does not repeat an unchanged correction or treat missing evidence as approval', async t => {
+  const dir = root(t), p = fixture(); p.semanticReview = { mode: 'required', command: { program: 'fixture', args: ['{contextFile}'], timeoutMs: 1000 } };
+  let calls = 0, corrections = 0;
+  const finding: PlanningFinding = { id: 'interface', rule: 'interface.incompatible', tasks: ['task_cli'], references: ['cli-works'], evidence: ['CLI expects a different runtime version'], severity: 'error', blocking: true, message: 'Incompatible interface', correction: 'Align the declared runtime version' };
+  await assert.rejects(reviewCorrectionCycle(p, dir, async plan => { corrections++; return plan; }, async (_task, _ctx, command) => {
+    calls++; const { context } = planningReviewContext(command);
+    return { exitCode: 0, output: `DAG_PLAN_REVIEW: ${JSON.stringify({ version: 1, revision: digest(p), contextDigest: context.contextDigest, reviewer: 'fixture', verdict: 'fail', findings: [finding] })}` };
+  }), /unchanged/);
+  assert.equal(calls, 1); assert.equal(corrections, 1);
+  corrections = 0;
+  const result = await reviewCorrectionCycle(p, dir, async plan => { corrections++; return plan; }, async (_task, _ctx, command) => {
+    const { context } = planningReviewContext(command);
+    assert.match(context.instructions.join('\n'), /Block only concrete execution problems/);
+    assert.match(context.instructions.join('\n'), /nonblocking integration follow-ups/);
+    return { exitCode: 0, output: `DAG_PLAN_REVIEW: ${JSON.stringify({ version: 1, revision: digest(p), contextDigest: context.contextDigest, reviewer: 'fixture', verdict: 'inconclusive', findings: [] })}` };
+  });
+  assert.equal(corrections, 0); assert.equal(result.reviews.length, 1); assert.equal(result.reviews[0]!.verdict, 'inconclusive');
+});
+
+test('canonical task review has no automatic redo even when implementation retry budget remains', async t => {
+  const dir = root(t), p = fixture(); p.tasks[0]!.reviewCmd = 'review-runtime'; p.tasks[0]!.maxAttempts = 5;
+  const run = compilePlan(p); let workers = 0, reviews = 0;
+  assert.equal(run.tasks.task_runtime.reviewRounds, 0);
+  const runner = new DagRunner(run, { cwd: dir, executor: async (_task, _ctx, cmd) => {
+    if (cmd === 'worker-runtime') workers++;
+    if (cmd === 'review-runtime') { reviews++; return { exitCode: 0, output: 'VERDICT: FAIL: missing assigned runtime behavior' }; }
+    return { exitCode: 0, output: 'verified' };
+  } });
+  await runner.start(new Set(['task_runtime']));
+  assert.equal(workers, 1); assert.equal(reviews, 1); assert.equal(run.tasks.task_runtime.status, 'failed');
+  assert.equal(run.tasks.task_runtime.maxAttempts, 5); assert.equal(run.tasks.task_runtime.repairs, 0);
+});
+
+test('planning findings never hold consumers; worker exits retry within the attempt budget', async t => {
+  const dir = root(t), p = fixture(); p.tasks[0]!.maxAttempts = 2;
   const f: PlanningFinding = { id: 'scope', rule: 'scope.ambiguous', tasks: ['task_runtime'], references: ['runtime-ready'], evidence: ['Reproduced missing boundary'], severity: 'error', blocking: true, message: 'Unachievable boundary', correction: 'Amend boundary' };
   const run = compilePlan(p); let calls = 0;
   const runner = new DagRunner(run, { cwd: dir, executor: async () => { calls++; return { exitCode: 1, output: `DAG_PLANNING_FINDINGS: ${JSON.stringify([f])}` }; } });
   await runner.start(); assert.equal(calls, 2); assert.equal(run.tasks.task_runtime.attemptsInCycle, 2);
-  assert.equal(run.tasks.task_runtime.maxAttempts, 5); assert.ok(run.planningState!.holds.task_runtime);
+  assert.equal(run.tasks.task_runtime.maxAttempts, 2); assert.deepEqual(run.planningState!.holds, {});
+  assert.equal(run.tasks.task_runtime.status, 'failed');
   assert.equal(run.tasks.task_cli.attempts, 0); assert.ok(runner.result!.failed.length || runner.result!.unfinished.length);
+  assert.ok(run.events.some(e => /planning findings deferred/.test(e.message)));
   assert.equal(recordPlanningFailure(run, 'task_cli', [{ ...f, evidence: [] }]), false);
 });
 
@@ -244,35 +316,52 @@ test('amendment cannot drop original criteria and recovers torn persisted defini
   assert.equal(planningRefusal(loadRun(file), dir, runPaths(file).dir), null);
 });
 
-test('reviewer findings also hold repeated planning failures without draining the worker budget', async t => {
+test('reviewer planning findings are advisory and never drain the worker budget', async t => {
   const dir = root(t), p = fixture(); p.tasks[0]!.reviewCmd = 'review-fixture'; p.tasks[0]!.maxAttempts = 5;
   const f: PlanningFinding = { id: 'scope', rule: 'scope.ambiguous', tasks: ['task_runtime'], references: ['runtime-ready'], evidence: ['A local check demands downstream behavior'], severity: 'error', blocking: true, message: 'Unachievable local boundary', correction: 'Move downstream acceptance' };
   const run = compilePlan(p);
   await new DagRunner(run, { cwd: dir, executor: async (_task, _ctx, cmd) => ({ exitCode: 0, output: cmd === 'review-fixture' ? `DAG_PLANNING_FINDINGS: ${JSON.stringify([f])}` : 'implemented' }) }).start();
-  assert.equal(run.tasks.task_runtime.attemptsInCycle, 2);
-  assert.ok(run.planningState!.holds.task_runtime);
+  assert.equal(run.tasks.task_runtime.attemptsInCycle, 1);
+  assert.deepEqual(run.planningState!.holds, {});
+  assert.equal(run.tasks.task_runtime.status, 'failed');
+  assert.equal(run.tasks.task_runtime.failureKind, 'review');
+  assert.ok(run.events.some(e => /reviewer planning findings deferred/.test(e.message)));
 });
 
-test('workers cannot change pinned specifications to pass their own acceptance', async t => {
+test('worker edits to pinned specifications are deferred; the validation pass rejects the drift', async t => {
   const dir = root(t), p = fixture(); writeFileSync(join(dir, 'SPEC.md'), 'Original requirement');
   p.sources = [{ path: 'SPEC.md', sha256: digest('Original requirement') }];
   const run = compilePlan(p); run.tasks.task_runtime.maxAttempts = 1;
   await new DagRunner(run, { cwd: dir, executor: async () => { writeFileSync(join(dir, 'SPEC.md'), 'Weakened'); return { exitCode: 0, output: 'success' }; } }).start();
-  assert.equal(run.tasks.task_runtime.status, 'failed'); assert.match(run.tasks.task_runtime.result!, /inputs changed/);
-  assert.deepEqual(missingPlanningAcceptance(run), ['runtime-ready', 'cli-works']);
+  assert.equal(run.tasks.task_runtime.status, 'completed');
+  assert.match(planningRefusal(run, dir)!, /input\.unavailable|changed/i);
+  assert.deepEqual(missingPlanningAcceptance(run), []);
 });
 
-test('task acceptance checks verify the final artifact after review commands run', async t => {
+test('declared acceptance checks are deferred; review verdict still gates completion', async t => {
   const dir = root(t), p = fixture(); p.tasks[0]!.reviewCmd = 'review-fixture'; p.tasks[0]!.maxAttempts = 1;
   const run = compilePlan(p); let artifact = 'valid';
-  const local = checkCommand(p.tasks[0]!.checks[0]!);
   await new DagRunner(run, { cwd: dir, executor: async (_task, _ctx, cmd) => {
     if (cmd === 'review-fixture') { artifact = 'broken'; return { exitCode: 0, output: 'VERDICT: PASS' }; }
-    return { exitCode: cmd === local && artifact === 'broken' ? 1 : 0, output: artifact };
+    return { exitCode: 0, output: artifact };
   } }).start();
-  assert.equal(run.tasks.task_runtime.status, 'failed');
+  assert.equal(run.tasks.task_runtime.status, 'completed');
+  assert.equal(run.planningState!.evidence['runtime-ready']!.checks[0], 'runtime');
+  assert.ok(run.events.some(e => /acceptance deferred: \d+ declared check/.test(e.message)));
+});
+
+test('lean local checks fail before spending reviewer invocations', async t => {
+  const dir = root(t), p = fixture();
+  p.tasks[0]!.reviewCmd = 'review-fixture'; p.tasks[0]!.maxAttempts = 1;
+  const run = compilePlan(p); run.settings.executionProfile = 'lean';
+  const identity = `${digest(p.tasks[0]!.checks[0]!)}.json`;
+  let reviews = 0;
+  await new DagRunner(run, { cwd: dir, executor: async (_task, _ctx, cmd) => {
+    if (cmd === 'review-fixture') reviews++;
+    return { exitCode: cmd?.includes(identity) ? 1 : 0, output: 'check failure' };
+  } }).start();
+  assert.equal(reviews, 0); assert.equal(run.tasks.task_runtime.status, 'failed');
   assert.equal(run.planningState!.evidence['runtime-ready'], undefined);
-  assert.match(run.tasks.task_runtime.result!, /Task-local acceptance check failed/);
 });
 
 test('factory v2 retains the existing full certification workflow and generated phase authority', async t => {
@@ -285,8 +374,8 @@ test('factory v2 retains the existing full certification workflow and generated 
   }
   for (const args of [['init'], ['config', 'user.name', 'Planning Test'], ['config', 'user.email', 'test@example.invalid'], ['add', '.'], ['commit', '-m', 'source']]) execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
   p.semanticReview = { mode: 'auto', command: { program: 'fixture', args: ['{contextFile}'], timeoutMs: 1000 } };
-  const planningReview = await reviewPlan(p, dir, async task => {
-    const context = JSON.parse(readFileSync(JSON.parse(task.spec).contextFile, 'utf8'));
+  const planningReview = await reviewPlan(p, dir, async (_task, _ctx, command) => {
+    const { context } = planningReviewContext(command);
     return { exitCode: 0, output: `DAG_PLAN_REVIEW: ${JSON.stringify({ version: 1, revision: digest(p), contextDigest: context.contextDigest, reviewer: 'independent-test-review', verdict: 'pass', findings: [] })}` };
   });
   const goal: StructuredFactoryGoalV2 = { schemaVersion: 2, goal: { id: 'certified-plan', title: 'Feature', description: 'Feature behavior' }, planning: p,
@@ -395,16 +484,17 @@ test('skipping a required final verifier cannot certify a managed run, while sco
   assert.deepEqual(missingPlanningAcceptance(local), ['cli-works']);
 });
 
-test('observed missing prerequisite holds the consumer before spending further worker attempts', async t => {
+test('capability probes are deferred; the consumer dispatches without holds', async t => {
   const dir = root(t), p = fixture(), probe = check('actual-runtime', 'process.exit(1)');
   p.tasks[1]!.inputs![0]!.check = probe; p.tasks[1]!.maxAttempts = 5;
   const run = compilePlan(p); let consumerCalls = 0;
   const runner = new DagRunner(run, { cwd: dir, executor: async (_task, _ctx, cmd) => {
     if (cmd === 'worker-cli') consumerCalls++;
-    return { exitCode: cmd === checkCommand(probe) ? 1 : 0, output: cmd === checkCommand(probe) ? 'Production runtime is not callable' : 'verified' };
+    const isProbe = cmd?.includes(`${digest(probe)}.json`);
+    return { exitCode: isProbe ? 1 : 0, output: isProbe ? 'Production runtime is not callable' : 'verified' };
   } });
-  await runner.start(); assert.equal(consumerCalls, 0);
-  assert.ok(run.planningState!.holds.task_cli);
-  assert.equal(run.tasks.task_cli.attemptsInCycle, 2); assert.equal(run.tasks.task_cli.maxAttempts, 5);
-  assert.equal(run.planningState!.holds.task_cli![0]!.references[0], 'runtime');
+  await runner.start(); assert.equal(consumerCalls, 1);
+  assert.deepEqual(run.planningState!.holds, {});
+  assert.equal(run.tasks.task_cli.status, 'completed');
+  assert.equal(run.tasks.task_cli.maxAttempts, 5);
 });

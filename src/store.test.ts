@@ -346,10 +346,10 @@ describe('hardening', () => {
     }
   });
 });
-// Repair invalidates already-completed descendants, and an approval must be
-// re-earned whenever the underlying output changes.
+// Failed consumers preserve accepted dependencies; an explicitly retried task
+// must still earn a fresh approval when its own output changes.
 describe('stale work and approvals', () => {
-  it('redoes completed descendants when an upstream task is repaired', async () => {
+  it('a rejected consumer preserves completed ancestors and sibling evidence', async () => {
     const run = newRun('invalidate');
     const a = addTask(run, { title: 'a', spec: '', cmd: 'work-a' });
     const b = addTask(run, { title: 'b', spec: '', cmd: 'work-b', deps: [a.id] });
@@ -372,13 +372,17 @@ describe('stale work and approvals', () => {
       },
     });
     await runner.start();
-    assert.equal(run.tasks[c.id].status, 'completed');
-    // A was redone by the repair, so B's earlier completion is void: it was
-    // verified against an upstream output that no longer exists.
-    assert.equal(run.tasks[a.id].attempts, 2, 'upstream redone');
-    assert.equal(run.tasks[b.id].attempts, 2, 'stale descendant redone');
-    assert.equal(run.tasks[c.id].attempts, 2, 'the repaired task redone');
-    assert.ok(run.events.some((e) => /inputs changed: 1 completed downstream/.test(e.message ?? '')));
+    assert.equal(run.tasks[c.id].status, 'failed');
+    assert.equal(run.tasks[c.id].failureKind, 'review');
+    assert.equal(run.tasks[c.id].attempts, 1, 'no separate upstream repair retry');
+    assert.equal(run.tasks[c.id].repairs, 0);
+    for (const accepted of [a, b]) {
+      assert.equal(accepted.status, 'completed');
+      assert.equal(accepted.attempts, 1);
+      assert.equal(accepted.result, 'ok');
+    }
+    assert.equal(cReviews, 1);
+    assert.ok(!run.events.some((e) => e.type === 'task-repair'));
   });
 
   it('a retry must earn a fresh approval', async () => {

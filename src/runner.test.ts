@@ -221,7 +221,7 @@ describe('watchdog and failures', () => {
     const runner = new DagRunner(run, { executor: shellExecutor() });
     await runner.start();
     assert.equal(run.tasks[a.id].status, 'failed');
-    assert.equal(run.tasks[a.id].failureKind, 'review');
+    assert.equal(run.tasks[a.id].failureKind, 'review-protocol');
   });
 
   it('applies the exit policy the same way for real and mocked executors', async () => {
