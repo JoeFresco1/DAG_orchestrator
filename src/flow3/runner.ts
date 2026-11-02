@@ -1,18 +1,20 @@
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, symlinkSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { addTask, acquireLock, attemptLogPath, atomicWriteJson, heartbeatPath, lockHeldBy, logEvent, recoverInterrupted, runPaths } from '../store.js';
 import { commitAll, createTaskWorktree, ensureIntegrationWorktree, git, isGitRepo, removeWorktree, snapshotExcludes } from '../git-worktree.js';
 import { depsMet, describeDeps, gateBlocks } from '../graph.js';
 import { planAttempt } from '../harness-chain.js';
-import { inferHarnessForCmd } from '../harnesses.js';
+import { findHarness, inferHarnessForCmd } from '../harnesses.js';
 import { captureExecutionPolicy } from '../execution-policy.js';
 import { checkCommand } from '../planning/compile.js';
 import { recordPlanningAcceptance } from '../planning/runtime.js';
 import { describeSettingsProblems, validateSettingsPatch, type DagEvent, type FailureKind, type Run, type Task } from '../types.js';
-import type { ExecContext, ExecOutcome, Executor, RunnerOptions, RunSummary } from '../runner.js';
+import { parseVerdict, stripAnsi, type ExecContext, type ExecOutcome, type Executor, type RunnerOptions, type RunSummary } from '../runner.js';
 import type { WorkerSession } from '../agent-session.js';
-import { PHASE_TIMEOUTS, type Candidate, type Checkpoint, type FlowSettings, type Phase } from './contracts.js';
+import { PHASE_TIMEOUTS, type Candidate, type Checkpoint, type FlowSettings, type Phase, type RepairContext, type RepairIntent } from './contracts.js';
+import { acceptanceIdentity, completionScope, evidenceFailure, evidenceArtifacts } from './lifecycle.js';
 import { chainWaves, checkGraph, overlaps, promptFor } from './graph.js';
 import { checkScriptCommands, commandMentionsPath, protectedRepairPath, repairDecision } from './repair.js';
 
@@ -24,6 +26,7 @@ interface Worker {
   tainted: boolean;
   session: WorkerSession;
 }
+type CheckOutcome = ExecOutcome & { evidenceRef?: string; artifacts?: Record<string, string> };
 type Options = RunnerOptions & { executor: Executor };
 const now = () => new Date().toISOString();
 const tail = (text: string, max = 4000) => text.slice(-max);
@@ -52,6 +55,8 @@ export class FlowRunner {
   private repo: string;
   private settings: FlowSettings;
   private scope = new Set<string>();
+  private finalCheckpointId?: string;
+  private explicitSelection = false;
   private budgetReached = false;
   private deadline = 0;
   private logBytes = new Map<string, number>();
@@ -68,9 +73,11 @@ export class FlowRunner {
     this.isRunning = true; this.isStopping = false; this.budgetReached = false;
     this.workers = []; this.integrationPrepared = false; this.integrationTainted = false;
     this.settings = this.state.settings.flow3 ?? {};
-    this.result = null;
+    this.result = null; this.finalCheckpointId = undefined;
     this.issues = [];
-    this.scope = new Set(scope ?? Object.keys(this.state.tasks));
+    this.explicitSelection = scope !== null;
+    const saved = this.state.flowState?.completion;
+    this.scope = new Set(scope ?? (saved?.mode === 'scoped' ? [...saved.required, ...saved.optional.filter(id => !saved.excluded.includes(id))] : this.settings.completion?.mode === 'scoped' ? [...this.settings.completion.required, ...this.settings.completion.optional] : Object.keys(this.state.tasks)));
     this.running = this.run();
     return this.running;
   }
@@ -113,7 +120,21 @@ export class FlowRunner {
       }
       this.state.flowState ??= { version: 3, repairRound: 0, checkpoints: [], issues: [] };
       this.state.flowState.issues = [];
+      this.state.flowState.implementationComplete = false;
+      this.state.flowState.acceptanceStatus = 'pending';
+      this.state.flowState.productComplete = false;
+      const previousReview = this.state.flowState.review;
+      if (previousReview?.status === 'pending' && previousReview.output) (this.state.flowState.reviewHistory ??= []).push({ ...previousReview, status: 'error', output: previousReview.output + '\nInterrupted before a conclusive review result' });
+      this.state.flowState.review = { identity: '', status: this.state.settings.finalReview === 'off' ? 'off' : 'pending' };
+      for (const check of this.state.flowState.checkpoints) if (check.outcome === 'running') {
+        check.outcome = 'interrupted'; check.passed = false;
+        check.results.push({ command: 'checkpoint interruption', passed: false, outcome: 'interrupted', output: 'Previous check execution ended without a conclusive checkpoint result' });
+      }
       this.adaptPlanningNodes();
+      this.state.flowState.completion = completionScope(this.state, this.scope, this.explicitSelection);
+      // A persisted required producer participates in the same scheduler, even after a scoped resume.
+      for (const id of this.state.flowState.completion.required) this.scope.add(id);
+      this.resumeRepairIntents();
       const graph = checkGraph(this.state);
       for (const warning of graph.warnings) this.event('note', null, warning);
       if (!graph.valid) throw Error(`Graph check failed: ${graph.errors.join('; ')}`);
@@ -123,9 +144,12 @@ export class FlowRunner {
       if (!isGitRepo(this.repo)) throw Error('Flow 3.0 requires a Git repository for its worker pool and integration branch');
       this.integration = ensureIntegrationWorktree(this.repo, this.state.id, undefined, file ? snapshotExcludes(file, this.repo) : undefined);
       this.warmCaches(this.integration.path);
+      this.state.flowState.integrationBase ??= git(this.integration.path, ['rev-parse', 'HEAD']).stdout;
       this.state.executionPolicy = captureExecutionPolicy(this.state);
-      this.deadline = (this.opts.maxWallClockMs ?? this.state.settings.maxWallClockMs) > 0
-        ? Date.now() + (this.opts.maxWallClockMs ?? this.state.settings.maxWallClockMs) : 0;
+      const wall = this.opts.maxWallClockMs ?? this.state.settings.maxWallClockMs;
+      if (!this.state.flowState.deadlineAt && wall > 0) this.state.flowState.deadlineAt = Date.now() + wall;
+      this.state.flowState.deadlineAt ??= 0;
+      this.deadline = this.state.flowState.deadlineAt;
       this.event('run-start', null, `Flow 3.0; integration ${this.integration.branch}; ${this.scope.size} nodes`);
       this.save();
       // One advisory call runs alongside dispatch. Slow/failed review cannot gate startup.
@@ -133,7 +157,8 @@ export class FlowRunner {
       for (;;) {
         await this.schedule();
         if (this.stopped()) break;
-        const unfinished = [...this.scope].filter(id => this.state.tasks[id].status !== 'completed');
+        const unfinished = [...new Set([...this.required(), ...[...this.scope].filter(id => checkpointRepair(this.state.tasks[id]))])].filter(id => this.state.tasks[id]?.status !== 'completed');
+        this.state.flowState.implementationComplete = !unfinished.length;
         // Missing producers are a scheduling outcome, not a product test failure.
         // A final checkpoint can only evaluate the complete selected graph.
         if (unfinished.length) {
@@ -141,12 +166,20 @@ export class FlowRunner {
           break;
         }
         const final = await this.checkpoint('final', [...this.scope]);
-        if (final.passed) break;
+        const producers = final.results.flatMap(r => r.decision?.action === 'defer' ? r.decision.requires ?? [] : []);
+        if (producers.some(id => !this.scope.has(id) || !this.required().includes(id))) {
+          const visited = new Set<string>();
+          const reopen = (id: string) => { if (visited.has(id)) return; visited.add(id); this.scope.add(id); if (!this.required().includes(id)) this.required().push(id); for (const dep of [...this.state.tasks[id].deps, ...(this.state.tasks[id].node?.verify_requires ?? [])]) reopen(dep); };
+          for (const id of producers) reopen(id);
+          this.state.flowState.completion!.optional = this.state.flowState.completion!.optional.filter(id => !this.required().includes(id));
+          this.state.flowState.completion!.excluded = this.state.flowState.completion!.excluded.filter(id => !this.required().includes(id));
+          this.state.flowState.implementationComplete = false; this.save(); continue;
+        }
+        if (final.passed) { await this.finalReview(final); break; }
         if (!this.canRepair()) break;
         const errors = final.results.filter(r => !r.passed);
         if (!errors.length) break;
         if (errors.length && (!this.repairCommand() || !this.repairable(final))) break;
-        this.state.flowState.repairRound++;
         if (errors.length) this.addFix(final);
         this.save();
       }
@@ -168,15 +201,26 @@ export class FlowRunner {
       this.integration = undefined;
       const tasks = [...this.scope].map(id => this.state.tasks[id]).filter(Boolean);
       const flow = this.state.flowState;
-      const last = flow?.checkpoints.filter(c => c.kind === 'final').at(-1);
-      const passed = !!last?.passed && !this.issues.length && !flow?.issues.length && tasks.every(t => t.status === 'completed') && !this.stopped();
+      const last = flow?.checkpoints.find(c => c.id === this.finalCheckpointId);
+      const implementationComplete = this.required().every(id => this.state.tasks[id]?.status === 'completed') && tasks.filter(checkpointRepair).every(t => t.status === 'completed');
+      const accepted = !!last?.passed && implementationComplete && !this.issues.length && !flow?.issues.length && !this.stopped();
+      const reviewStatus = this.state.settings.finalReview === 'off' ? 'off' : last?.identity?.digest && flow?.review?.identity === last.identity.digest ? flow.review.status : 'pending';
+      const passed = accepted && (reviewStatus === 'off' || reviewStatus === 'pass');
+      if (flow && (owns || !file)) {
+        flow.implementationComplete = implementationComplete;
+        flow.acceptanceStatus = accepted ? 'passed' : last ? 'failed' : 'pending';
+        flow.productComplete = passed && flow.completion?.mode === 'whole-product';
+        flow.mergeStatus = 'integration-only';
+      }
       this.result = {
         scope: [...this.scope], completed: tasks.filter(t => t.status === 'completed').map(t => t.id),
         failed: tasks.filter(t => t.status === 'failed').map(t => t.id),
         skipped: tasks.filter(t => t.status === 'skipped').map(t => t.id),
         unfinished: tasks.filter(t => !['completed', 'failed', 'skipped'].includes(t.status)).map(t => t.id),
-        stopped: this.isStopping, budgetReached: this.budgetReached, interrupted: this.recovery, finalReview: null,
-        flow3: { passed, repairRounds: flow?.repairRound ?? 0, issues: [...new Set([...this.issues, ...(flow?.issues ?? []),
+        stopped: this.isStopping, budgetReached: this.budgetReached, interrupted: this.recovery, finalReview: flow?.review && reviewStatus !== 'off' && reviewStatus !== 'pending' ? {
+          mode: this.state.settings.finalReview, verdict: reviewStatus, reason: flow.review.output ?? '',
+          reviewed: this.state.settings.finalReview === 'per-task' ? (flow.review.results ?? []).map(r => r.task) : flow.review.results?.length ? tasks.filter(t => t.status === 'completed').map(t => t.id) : [], failed: this.state.settings.finalReview === 'per-task' ? (flow.review.results ?? []).filter(r => r.verdict !== 'pass').map(r => r.task) : flow.review.status === 'pass' ? [] : flow.review.results?.length ? tasks.map(t => t.id) : [], requeued: [] } : null,
+        flow3: { passed, implementationComplete, acceptanceStatus: flow?.acceptanceStatus ?? 'pending', reviewStatus, mergeStatus: 'integration-only', productComplete: flow?.productComplete ?? false, completion: flow?.completion, repairRounds: flow?.repairRound ?? 0, issues: [...new Set([...this.issues, ...(flow?.issues ?? []),
           ...tasks.filter(t => t.status !== 'completed').map(t => `${t.id}: ${t.result ?? (t.deps.some(id => this.state.tasks[id]?.status !== 'completed') ? 'blocked by incomplete dependencies' : gateBlocks(t) ? 'awaiting approval' : t.status)}`),
           ...(last?.results.filter(r => !r.passed).map(r => `${r.command}: ${r.output}`) ?? [])])] },
       };
@@ -231,6 +275,15 @@ export class FlowRunner {
   }
 
   private async schedule(): Promise<void> {
+    // Resume a charged checkpoint repair before releasing another downstream wave.
+    for (const id of this.scope) {
+      const task = this.state.tasks[id];
+      if (checkpointRepair(task) && ['pending', 'ready'].includes(task.status) && depsMet(task, this.state.tasks) && !gateBlocks(task)) {
+        if (this.stopped()) return;
+        await this.runChain([id]);
+        if (task.status !== 'completed') return;
+      }
+    }
     const concurrency = Math.min(64, Math.max(1, this.opts.concurrency ?? this.state.settings.concurrency));
     for (const wave of chainWaves(this.state, this.scope)) {
       if (this.stopped()) return;
@@ -261,7 +314,6 @@ export class FlowRunner {
       if (wave.flat().some(id => !previouslyDone.has(id) && this.state.tasks[id].status === 'completed') && !this.stopped()) {
         let check = await this.checkpoint('wave', wave.flat());
         while (!check.passed && this.canRepair() && this.repairCommand() && this.repairable(check) && !this.stopped()) {
-          this.state.flowState!.repairRound++;
           const fix = this.addFix(check);
           await this.runChain([fix.id]);
           if (fix.status !== 'completed') break;
@@ -292,8 +344,15 @@ export class FlowRunner {
     const attemptLimit = Math.min(2, Math.max(1, task.maxAttempts));
     try {
       const saved = task.nodeState?.candidate;
+      const priorRepair = task.nodeState?.repairContext;
+      if (!checkpointRepair(task) && !saved && !task.nodeState?.repairBaseline && priorRepair && task.nodeState?.decision?.action === 'hold' &&
+        priorRepair.identity?.requirements === this.identity(this.integration!.path, [task.node!.verify]).requirements) {
+        throw failure('Repair is held; retry cannot switch to implementation to replenish its exhausted or rejected allowance', 'budget');
+      }
+      if ((checkpointRepair(task) || task.nodeState?.repairBaseline) && task.attempts > 0 && !saved) return await this.recoverRepair(task, worker);
       if (saved) {
         if (saved.definition !== definition(task)) throw failure('Saved verified candidate belongs to a changed node; edit/retry must clear its candidate explicitly', 'integration');
+        if (task.nodeState?.repairContext) this.assertRepairAuthority(task);
         task.status = 'running'; this.save();
         await this.land(task, saved);
         return this.complete(task);
@@ -303,7 +362,7 @@ export class FlowRunner {
         task.status = 'running'; task.attempts++; task.attemptsInCycle++;
         task.startedAt = now(); task.finishedAt = null; task.failureKind = null; task.result = null;
         task.nodeState = { ...task.nodeState, worker: worker.path };
-        delete task.nodeState.decision;
+        if (!checkpointRepair(task)) delete task.nodeState.decision;
         this.event('task-start', task.id, `Attempt ${task.attemptsInCycle}/${attemptLimit}; warm worker ${worker.path}`); this.save();
         try {
           if (!worker.prepared) {
@@ -325,6 +384,9 @@ export class FlowRunner {
             : await this.phase(workTask, 'work', cmd, worker.path, worker, task);
           (task.milestones ??= {}).implementedAt = now();
           await this.verifyNode(task, worker, cmd);
+          if (checkpointRepair(task)) for (const command of this.verificationCommands(task).filter(command => command !== task.node!.verify)) {
+            await this.phase(task, 'verify', command, worker.path, worker);
+          }
           task.milestones.checkedAt = now();
           commitAll(worker.path, `dag: ${task.id} attempt ${task.attempts}`, this.settings.cachePaths ?? ['node_modules', '.venv']);
           const commit = git(worker.path, ['rev-parse', 'HEAD']).stdout;
@@ -372,13 +434,71 @@ export class FlowRunner {
       return false;
     } finally { this.active.delete(task.id); this.save(); }
   }
+  /** Resume verification of saved repair edits without another coding dispatch or allowance. */
+  private async recoverRepair(task: Task, worker: Worker): Promise<boolean> {
+    const saved = task.nodeState, baseline = saved?.repairBaseline, path = saved?.worker;
+    if (!baseline || !path || !existsSync(path) || this.recovery.orphanPids.length) throw failure('Checkpoint repair allowance exhausted; saved repair needs inspection and retry cannot replenish its dispatch', 'budget');
+    if (git(path, ['rev-parse', 'HEAD']).stdout !== baseline.head) throw failure('Repair recovery held: saved Git history changed', 'integration');
+    const before = new Map(baseline.files), after = snapshot(path);
+    const changed = [...new Set([...before.keys(), ...after.keys()])].filter(file => before.get(file) !== after.get(file));
+    if (!changed.length) throw failure('Repair recovery held: no saved source changes; no additional repair allowance', 'budget');
+    for (const file of changed) if (!task.node!.touches.some(p => overlaps(p, file)) || protectedRepairPath(file) || baseline.protectedPaths.some(p => overlaps(p, file))) throw failure(`Repair recovery policy violation: outside allowed scope or protected source: ${file}`, 'integration');
+    this.assertRepairAuthority(task);
+    const context = saved!.repairContext;
+    if (!context || context.authority !== 'flow3-automatic') throw failure('Repair recovery lacks persisted authority', 'integration');
+    // Preserve a commit object without advancing the saved worker's HEAD: a second
+    // crash during recovery verification must leave the same baseline recoverable.
+    const staged = git(path, ['add', '-A']);
+    if (staged.code) throw failure(`Cannot stage recovered source: ${staged.stderr}`, 'integration');
+    const caches = this.settings.cachePaths ?? ['node_modules', '.venv'];
+    if (caches.length) {
+      const excluded = git(path, ['reset', '--quiet', 'HEAD', '--', ...caches]);
+      if (excluded.code) throw failure(`Cannot exclude recovered caches: ${excluded.stderr}`, 'integration');
+    }
+    const tree = git(path, ['write-tree']);
+    if (tree.code) throw failure(`Cannot preserve recovered tree: ${tree.stderr}`, 'integration');
+    const preserved = git(path, ['-c', 'user.name=DAG Orchestrator', '-c', 'user.email=dag@localhost', 'commit-tree', tree.stdout, '-p', baseline.head, '-m', `dag: preserve interrupted repair ${task.id}`]);
+    if (preserved.code) throw failure(`Cannot preserve recovered source: ${preserved.stderr}`, 'integration');
+    const commit = preserved.stdout;
+    const reset = git(worker.path, ['reset', '--hard', commit]);
+    if (reset.code) throw failure(`Cannot restore recovered source: ${reset.stderr}`, 'integration');
+    task.status = 'running'; this.save();
+    for (const command of this.verificationCommands(task)) {
+      try { await this.phase(task, 'verify', command, worker.path, worker); }
+      catch (error) {
+        saved!.decision = repairDecision(this.state, { command, output: String(error), phase: 'verify' });
+        this.save(); throw error;
+      }
+    }
+    const branch = `dag-node/${this.state.id}-${task.id}-${task.attempts}`;
+    const pinned = git(this.repo, ['branch', '-f', branch, commit]);
+    if (pinned.code) throw failure(`Cannot pin recovered candidate: ${pinned.stderr}`, 'integration');
+    task.branch = branch; task.commit = commit;
+    const candidate: Candidate = { commit, base: baseline.head, attempt: task.attempts, definition: definition(task) };
+    saved!.candidate = candidate; this.save();
+    await this.land(task, candidate);
+    removeWorktree(this.repo, path);
+    return this.complete(task);
+  }
+  private verificationCommands(task: Task): string[] {
+    const context = task.nodeState?.repairContext;
+    return [...new Set([task.node!.verify, ...(context?.verification ?? []).filter(command =>
+      context?.owners.some(id => this.state.tasks[id]?.status === 'completed' && this.state.tasks[id].node?.verify === command))])];
+  }
   private async verifyNode(task: Task, worker: Worker, workCommand: string): Promise<void> {
     for (;;) {
-      try { await this.phase(task, 'verify', task.node!.verify, worker.path, worker); delete task.nodeState!.decision; return; }
+      let failedCommand = task.node!.verify;
+      try {
+        await this.phase(task, 'verify', task.node!.verify, worker.path, worker);
+        if (!checkpointRepair(task)) for (const command of this.verificationCommands(task)) if (command !== task.node!.verify) { failedCommand = command; await this.phase(task, 'verify', command, worker.path, worker); }
+        delete task.nodeState!.decision; return;
+      }
       catch (error) {
         const output = error instanceof Error ? error.message : String(error);
         const state = task.nodeState!;
-        const decision = repairDecision(this.state, { command: task.node!.verify, output, phase: 'verify',
+        const ledger = (this.state.flowState!.nodeRepairs ??= {})[task.id] ??= { used: state.repairAttempts ?? 0, failures: state.repairFailures ?? [], history: [] };
+        state.repairAttempts = ledger.used; state.repairFailures = ledger.failures;
+        const decision = repairDecision(this.state, { command: failedCommand, output, phase: 'verify',
           kind: (error as { kind?: string }).kind, requires: task.node!.verify_requires });
         // A local check cannot be deferred past its own downstream consumer. Admission must wire its producers.
         if (decision.action === 'defer') { decision.action = 'hold'; decision.reason = 'Local verification requires an unfinished producer; declare verify_requires and repair the graph'; }
@@ -389,30 +509,49 @@ export class FlowRunner {
         if (decision.action === 'repair' && (state.repairAttempts ?? 0) >= repairLimit) {
           decision.action = 'hold'; decision.category = 'policy'; decision.reason = `Node repair budget exhausted: ${state.repairAttempts ?? 0}/${repairLimit}`;
         }
-        state.decision = decision; this.save();
+        state.decision = decision;
+        state.latestFailedChecks = [{ command: failedCommand, passed: false, output, decision, evidenceRef: (error as { evidenceRef?: string }).evidenceRef }];
+        (state.diagnosisHistory ??= []).push({ decision: { ...decision }, checks: state.latestFailedChecks, at: now() }); this.save();
         if (this.stopped() || worker.tainted || checkpointRepair(task) || decision.action !== 'repair') {
           this.event('note', task.id, `Node repair held: ${decision.reason}; used ${state.repairAttempts ?? 0} repair rounds`);
           throw error;
         }
-        state.repairAttempts = (state.repairAttempts ?? 0) + 1;
-        (state.repairFailures ??= []).push(decision.fingerprint);
+        state.repairAttempts = ++ledger.used;
+        ledger.failures.push(decision.fingerprint);
+        state.repairContext = this.repairContext(task, decision, state.latestFailedChecks);
+        state.repairContext.command = this.settings.repairCommand ?? workCommand;
+        ledger.history.push(state.repairContext);
         this.event('task-repair', task.id, `In-place repair ${state.repairAttempts}: ${decision.reason}`); this.save();
         await this.guardedRepair(task, worker, this.settings.repairCommand ?? workCommand,
-          `Repair only the concrete failure in the existing implementation. Keep all completed edits.\nNode: ${task.node!.goal}\nFailed check: ${task.node!.verify}\nActual output:\n${tail(output, 6000)}`);
+          `Repair only the concrete failure in the existing implementation. Keep all completed edits.\nNode: ${task.node!.goal}\nFailed check: ${failedCommand}\nActual output:\n${tail(output, 6000)}`);
       }
     }
   }
   private protectedPaths(): string[] {
-    return [...new Set([...(this.settings.repairProtectedPaths ?? []),
+    return [...new Set([...(this.settings.repairProtectedPaths ?? []), ...(this.settings.acceptanceInputs ?? []),
+      ...(this.state.planning?.manifest.sources.map(s => s.path) ?? []),
       ...(this.state.planning?.manifest.tasks.flatMap(t => (t.files ?? []).filter(f => ['frozen', 'test'].includes(f.role)).map(f => f.path)) ?? [])])];
   }
+  private assertRepairAuthority(task: Task): void {
+    const context = task.nodeState?.repairContext;
+    if (!context || context.authority !== 'flow3-automatic' || JSON.stringify(context.scope) !== JSON.stringify(task.node!.touches)) throw failure('Repair policy violation: missing or changed authority/scope', 'integration');
+    const origin = this.state.flowState!.checkpoints.find(c => c.id === context.checkpoint);
+    const current = this.identity(this.integration!.path, origin ? this.commands(origin.kind) : [task.node!.verify]);
+    if (context.identity && ['requirements', 'checks', 'inputs', 'environment'].some(key => current[key as keyof typeof current] !== context.identity![key as keyof typeof current])) throw failure('Repair policy violation: frozen acceptance authority changed', 'integration');
+    const limit = context.charge.pool === 'node' ? this.settings.nodeRepairRounds ?? 1 : this.settings.repairRounds ?? 2;
+    if (context.charge.used > Math.min(limit, context.charge.limit)) throw failure('Repair policy violation: durable allowance exhausted', 'budget');
+  }
   private async guardedRepair(task: Task, worker: Worker, command: string, instruction: string): Promise<ExecOutcome> {
+    this.assertRepairAuthority(task);
+    const context = task.nodeState?.repairContext;
+    if (context?.command !== command) throw Error('Repair policy violation: changed persisted repair command');
     const before = snapshot(worker.path), head = git(worker.path, ['rev-parse', 'HEAD']).stdout;
     const packageFile = join(worker.path, 'package.json');
     const scripts = existsSync(packageFile) ? JSON.parse(readFileSync(packageFile, 'utf8')).scripts ?? {} : {};
     const checks = checkScriptCommands([task.node!.verify, ...this.commands('wave'), ...this.commands('final')], scripts);
     const protectedPaths = [...this.protectedPaths(), ...[...before.keys()].filter(path => /\.(?:[cm]?[jt]sx?|py|sh|ps1|bat|cmd|rb)$/i.test(path) && checks.some(command => commandMentionsPath(command, path)))];
-    const spec = `${instruction}\nAllowed files: ${task.node!.touches.join(', ')}.\nPreserve acceptance tests, assertions, contracts and check configuration. Additional protected paths: ${protectedPaths.join(', ') || '(none)'}. Do not change Git history, dependencies, task scope or verification commands. Do not run broad acceptance suites. Return the repair for the runner to verify.`;
+    const spec = `${instruction}\nCurrent repair context: ${JSON.stringify(task.nodeState?.repairContext)}\nLatest diagnosis: ${JSON.stringify(task.nodeState?.decision ?? task.nodeState?.repairContext?.diagnosis)}\nLatest failed checks: ${JSON.stringify(task.nodeState?.latestFailedChecks ?? task.nodeState?.repairContext?.failedChecks)}\nDiagnosis history: ${JSON.stringify(task.nodeState?.diagnosisHistory ?? [])}\nEarlier evidence: ${JSON.stringify(this.state.flowState?.nodeRepairs?.[task.id]?.history ?? [])}\nAllowed files: ${task.node!.touches.join(', ')}.\nPreserve acceptance tests, assertions, contracts and check configuration. Additional protected paths: ${protectedPaths.join(', ') || '(none)'}. Do not change Git history, dependencies, task scope or verification commands. Do not run broad acceptance suites. Return the repair for the runner to verify.`;
+    task.nodeState!.repairBaseline = { head, files: [...before], protectedPaths }; this.save();
     try {
       const result = await this.phase({ ...task, spec }, 'repair', command, worker.path, worker, task);
       if (git(worker.path, ['rev-parse', 'HEAD']).stdout !== head) throw Error('Repair policy violation: agent changed Git history');
@@ -437,14 +576,16 @@ export class FlowRunner {
     return true;
   }
 
-  private async phase(task: Task, phase: Phase, command: string, cwd: string, worker?: Worker, observed = task): Promise<ExecOutcome> {
+  private async phase(task: Task, phase: Phase, command: string, cwd: string, worker?: Worker, observed = task, tokens: Partial<ExecContext> = {}): Promise<CheckOutcome> {
+    let evidenceRef: string | undefined;
+    const checkedSource = phase === 'verify' ? { head: git(cwd, ['rev-parse', 'HEAD']).stdout, files: hash(JSON.stringify([...snapshot(cwd)])) } : undefined;
     const started = Date.now(); let lastOutput = started, finished = false, settled = false;
     let kill: (() => void) | undefined, rejectPhase: (error: Error) => void = () => {};
     let killed = false;
     const killOnce = () => { if (!killed && kill) { killed = true; try { kill(); } catch { /* already exited */ } } };
     const requestedTimeout = phase === 'work' ? this.opts.timeoutFor?.(observed) ?? observed.timeoutMs ?? this.opts.timeoutMs ?? this.settings.phaseTimeouts?.work ?? this.state.settings.timeoutMs
       : this.settings.phaseTimeouts?.[phase] ?? PHASE_TIMEOUTS[phase];
-    const timeout = requestedTimeout || PHASE_TIMEOUTS[phase];
+    const timeout = Math.min(requestedTimeout || PHASE_TIMEOUTS[phase], this.deadline ? Math.max(1, this.deadline - Date.now()) : Infinity);
     const idle = (observed.silenceMs ?? this.opts.silenceMs ?? this.settings.idleTimeoutMs ?? this.state.settings.silenceMs) || 180_000;
     const abort = (error: Error) => { if (!finished) { finished = true; killOnce(); rejectPhase(error); } };
     const cancel = () => abort(failure('Stopped', 'killed'));
@@ -460,7 +601,7 @@ export class FlowRunner {
       if (Date.now() - lastOutput >= idle) abort(failure(`${phase} stalled for ${idle}ms`, 'stalled'));
     }, Math.max(5, Math.min(1000, idle / 3)));
     const context: ExecContext = {
-      cwd, executionProfile: 'lean', readOnly: phase === 'advisory', session: phase === 'work' ? worker?.session : undefined,
+      ...tokens, cwd, executionProfile: 'lean', readOnly: phase === 'advisory' || phase === 'review', session: phase === 'work' ? worker?.session : undefined,
       env: { DAG_FILE: this.opts.file ? resolve(this.opts.file) : undefined, DAG_RUN: this.state.id, DAG_TASK: observed.id, DAG_PHASE: phase },
       deps: describeDeps(this.state, observed),
       onOutput: chunk => {
@@ -477,9 +618,24 @@ export class FlowRunner {
     try {
       const outcome = await Promise.race([execution, aborted]);
       observed.exitCode = outcome.exitCode;
+      if (['verify', 'checkpoint', 'integration', 'review'].includes(phase) && this.opts.file) {
+        evidenceRef = join(runPaths(this.opts.file).dir, 'flow3', `check-${randomUUID()}.json`);
+        atomicWriteJson(evidenceRef, { task: task.id, phase, command, startedAt: new Date(started).toISOString(),
+          finishedAt: now(), source: checkedSource?.head ?? git(cwd, ['rev-parse', 'HEAD']).stdout,
+          exitCode: outcome.exitCode, output: outcome.output, outputDigest: hash(outcome.output) });
+      }
+      if (checkedSource && (checkedSource.head !== git(cwd, ['rev-parse', 'HEAD']).stdout || checkedSource.files !== hash(JSON.stringify([...snapshot(cwd)])))) throw failure('Frozen source changed during verification');
       if (outcome.exitCode !== 0) throw failure(`${phase} exit ${outcome.exitCode}: ${tail(outcome.output)}`);
-      return outcome;
+      if (['verify', 'checkpoint', 'integration'].includes(phase)) {
+        const packageFile = join(cwd, 'package.json');
+        const scripts = existsSync(packageFile) ? JSON.parse(readFileSync(packageFile, 'utf8')).scripts ?? {} : {};
+        const expanded = checkScriptCommands([command], scripts).join(' ; ');
+        const problem = evidenceFailure(command, outcome, this.settings, cwd, started, expanded);
+        if (problem) throw failure(problem);
+      }
+      return { ...outcome, evidenceRef, artifacts: ['verify', 'checkpoint', 'integration'].includes(phase) ? evidenceArtifacts(command, this.settings, cwd) : undefined };
     } catch (error) {
+      if (evidenceRef) Object.assign(error as object, { evidenceRef });
       status = (error as Error).message; finished = true;
       if (!settled) killOnce();
       if (!settled) {
@@ -579,12 +735,13 @@ export class FlowRunner {
     const detected = (kind === 'wave' ? ['build', 'typecheck'] : ['build', 'typecheck', 'test', 'verify:spec']).filter(name => scripts[name]).map(name => `npm run ${name}`);
     const commands = authored ?? detected;
     return kind === 'wave' ? commands : [...new Set([...this.commands('wave'), ...commands, ...(this.settings.additionalFinalChecks ?? []),
-      ...[...this.scope].filter(id => this.state.tasks[id].status === 'completed').map(id => this.state.tasks[id].node!.verify)])];
+      ...[...this.scope].filter(id => this.state.tasks[id].status === 'completed' && !checkpointRepair(this.state.tasks[id])).map(id => this.state.tasks[id].node!.verify)])];
   }
   private async checkpoint(kind: 'wave' | 'final', nodes: string[]): Promise<Checkpoint> {
     const path = this.integration!.path;
     const checkpoint: Checkpoint = { id: randomUUID(), kind, head: git(path, ['rev-parse', 'HEAD']).stdout, nodes,
-      results: [], passed: true };
+      results: [], passed: false, outcome: 'running' };
+    if (kind === 'final') this.finalCheckpointId = checkpoint.id;
     const task = this.control(`${kind} checkpoint`);
     try {
       if (!this.integrationPrepared && this.state.settings.worktreePrepareCmd) {
@@ -592,33 +749,38 @@ export class FlowRunner {
         this.integrationPrepared = true;
       }
       const commands = this.commands(kind);
+      checkpoint.identity = this.identity(path, commands);
+      this.state.flowState!.checkpoints.push(checkpoint); this.save();
       if (!commands.length) checkpoint.results.push({ command: `${kind}Checks`, passed: false, output: `No ${kind} checks configured or detected; configure flow3.${kind}Checks` });
       if (kind === 'final' && !this.commands('wave').length) checkpoint.results.push({ command: 'waveChecks', passed: false, output: 'Configure build/typecheck wave commands in flow3.waveChecks' });
       if (kind === 'final' && !(this.settings.finalChecks?.length ?? this.detectFinalChecks().length) && !this.settings.additionalFinalChecks?.length) checkpoint.results.push({ command: 'finalChecks', passed: false, output: 'Configure full integration/tests/spec checks in flow3.finalChecks' });
       for (const command of commands) {
-        if (this.stopped()) break;
+        if (this.stopped()) { checkpoint.results.push({ command, passed: false, output: 'Interrupted before execution', outcome: 'interrupted' }); break; }
         const requires = this.settings.checkPrerequisites && Object.hasOwn(this.settings.checkPrerequisites, command) ? this.settings.checkPrerequisites[command] : [];
         if (requires.some(id => this.state.tasks[id]?.status !== 'completed')) {
           const decision = repairDecision(this.state, { command, output: '', phase: kind === 'wave' ? 'checkpoint' : 'integration', requires });
-          checkpoint.results.push({ command, passed: false, output: decision.reason, decision });
+          checkpoint.results.push({ command, passed: false, output: decision.reason, decision, outcome: 'deferred', identity: checkpoint.identity.digest });
           this.event('note', null, `Checkpoint check ${decision.action}: ${decision.reason}`);
           continue;
         }
         try {
           const result = await this.phase(task, kind === 'wave' ? 'checkpoint' : 'integration', command, path);
-          checkpoint.results.push({ command, passed: true, output: tail(result.output) });
+          if (this.identity(path, commands).digest !== checkpoint.identity.digest || this.sourceDirty(path)) throw Error('Frozen acceptance inputs or source changed during checks');
+          checkpoint.results.push({ command, passed: true, output: tail(result.output), outcome: 'passed', identity: checkpoint.identity.digest, evidenceRef: result.evidenceRef, exitCode: result.exitCode, outputDigest: hash(result.output), artifacts: result.artifacts });
         } catch (error) {
           const output = tail((error as Error).message);
           const decision = repairDecision(this.state, { command, output, phase: kind === 'wave' ? 'checkpoint' : 'integration', kind: (error as { kind?: string }).kind, requires });
-          checkpoint.results.push({ command, passed: false, output, decision });
+          checkpoint.results.push({ command, passed: false, output, decision, outcome: /Stopped|killed|interrupt|cancel/i.test(output) ? 'interrupted' : /inconclusive|evidence|0 tests|no tests/i.test(output) ? 'inconclusive' : 'failed', identity: checkpoint.identity.digest, evidenceRef: (error as { evidenceRef?: string }).evidenceRef });
           this.event('note', null, `Checkpoint repair ${decision.action}: ${decision.reason}`);
+          this.save();
+          if (/Frozen acceptance inputs or source changed/.test(output)) break;
         }
       }
       // A checkpoint may generate ignored output, but may not silently alter accepted source.
       const dirty = git(path, ['status', '--porcelain', '--', '.', ...(this.settings.cachePaths ?? ['node_modules', '.venv']).map(cache => `:(exclude)${cache}`)]).stdout;
-      if (dirty) {
+      if (dirty || git(path, ['rev-parse', 'HEAD']).stdout !== checkpoint.head || checkpoint.identity && this.identity(path, commands).digest !== checkpoint.identity.digest) {
         if (this.opts.file) atomicWriteJson(join(runPaths(this.opts.file).dir, 'flow3', `checkpoint-${checkpoint.id}.json`), {
-          head: checkpoint.head, status: dirty, patch: git(path, ['diff', '--binary', 'HEAD']).stdout,
+          head: checkpoint.head, identity: checkpoint.identity, observedIdentity: this.identity(path, commands), status: dirty, patch: git(path, ['diff', '--binary', 'HEAD']).stdout,
         });
         if (!this.integrationTainted) {
           git(path, ['reset', '--hard', checkpoint.head]);
@@ -631,12 +793,20 @@ export class FlowRunner {
       checkpoint.results.push({ command: 'checkpoint environment', passed: false, output,
         decision: repairDecision(this.state, { command: 'checkpoint environment', output, phase: 'setup' }) });
     }
+    if (checkpoint.results.some(r => /(?:inputs or source changed|modified tracked)/i.test(r.output))) for (const result of checkpoint.results) {
+      if (result.passed) { result.passed = false; result.outcome = 'invalidated'; result.output += '\nAcceptance identity mutated'; }
+    }
+    for (const result of checkpoint.results) if (result.passed && result.artifacts && JSON.stringify(result.artifacts) !== JSON.stringify(evidenceArtifacts(result.command, this.settings, path))) {
+      result.passed = false; result.outcome = 'invalidated'; result.output += '\nRequired evidence changed or disappeared after its check';
+      result.decision = repairDecision(this.state, { command: result.command, output: 'missing required evidence: ' + result.output, phase: kind === 'wave' ? 'checkpoint' : 'integration' });
+    }
     checkpoint.passed = checkpoint.results.length > 0 && checkpoint.results.every(r => r.passed) && !this.stopped();
+    checkpoint.outcome = this.stopped() ? 'interrupted' : checkpoint.passed ? 'passed' : 'failed';
     if (kind === 'final' && checkpoint.passed) for (const id of this.scope) {
       const node = this.state.tasks[id];
       if (node.status === 'completed') recordPlanningAcceptance(this.state, node, hash(JSON.stringify(checkpoint)));
     }
-    this.state.flowState!.checkpoints.push(checkpoint);
+    if (!this.state.flowState!.checkpoints.some(c => c.id === checkpoint.id)) this.state.flowState!.checkpoints.push(checkpoint);
     this.event('note', null, `${kind} checkpoint ${checkpoint.passed ? 'pass' : 'fail'} at ${checkpoint.head}`); this.save();
     return checkpoint;
   }
@@ -644,6 +814,8 @@ export class FlowRunner {
   private repairable(check: Checkpoint): boolean {
     const failed = check.results.filter(r => !r.passed);
     if (!failed.length || failed.some(r => r.decision?.action !== 'repair')) return false;
+    // Separate observations are retained. Without shared-cause evidence only one finding is repaired at a time.
+
     if (failed.some(r => this.state.flowState!.repairFailures?.includes(r.decision!.fingerprint))) {
       this.event('note', null, 'Checkpoint repair held: the same failure remained after the previous repair');
       return false;
@@ -672,20 +844,121 @@ export class FlowRunner {
     const selected = planAttempt(this.state.settings.harnessChain, 1)?.harness.cmd;
     return selected ?? Object.values(this.state.tasks).map(task => planAttempt(task.harnessChain, 1)?.harness.cmd ?? inferHarnessForCmd(task.cmd)?.cmd).find(Boolean) ?? undefined;
   }
+  private required(): string[] { return this.state.flowState?.completion?.required ?? [...this.scope]; }
+  private sourceDirty(path: string): string { return git(path, ['status', '--porcelain', '--', '.', ...(this.settings.cachePaths ?? ['node_modules', '.venv']).map(cache => `:(exclude)${cache}`)]).stdout; }
+  private identity(path: string, commands: string[]) {
+    return acceptanceIdentity(this.state, this.state.settings.flow3 ?? this.settings, path, git(path, ['rev-parse', 'HEAD']).stdout, commands);
+  }
+  private repairContext(task: Task, diagnosis: NonNullable<Task['nodeState']>['decision'] & {}, failedChecks: Checkpoint['results'], check?: Checkpoint): RepairContext {
+    const scope = task.node!.touches;
+    const owners = Object.values(this.state.tasks).filter(t => t.status === 'completed' && !checkpointRepair(t) && t.node?.touches.some(p => scope.some(s => overlaps(s, p))));
+    const accepted = Object.values(this.state.tasks).filter(t => t.status === 'completed' && !checkpointRepair(t));
+    for (let index = 0; index < owners.length; index++) for (const consumer of accepted) {
+      if (!owners.includes(consumer) && (consumer.deps.includes(owners[index].id) || consumer.node?.relies_on.some(p => scope.some(s => overlaps(s, p))))) owners.push(consumer);
+    }
+    return { authority: 'flow3-automatic', command: check ? this.repairCommand() : undefined, checkpoint: check?.id, identity: check?.identity ?? this.identity(this.integration!.path, [task.node!.verify]),
+      diagnosis, failedChecks, owners: owners.map(t => t.id), prerequisites: task.deps, scope,
+      protectedPaths: this.protectedPaths(), verification: [...new Set([task.node!.verify, ...owners.map(t => t.node!.verify)])],
+      charge: { pool: check ? 'checkpoint' : 'node', used: check ? this.state.flowState!.repairRound : task.nodeState?.repairAttempts ?? 0,
+        limit: check ? this.settings.repairRounds ?? 2 : this.settings.nodeRepairRounds ?? 1 },
+      escalation: 'Hold on exhausted budget, repeated failure, no source change, missing prerequisite, changed authority or protected input; no new recovery allowance.' };
+  }
   private addFix(check: Checkpoint): Task {
-    const completed = [...this.scope].filter(id => this.state.tasks[id].status === 'completed');
-    const errors = check.results.filter(r => !r.passed).map(r => `${r.command}\n${r.output}`).join('\n');
-    const touches = this.fixTouches(check);
-    const goal = `Fix actual ${check.kind} checkpoint errors; preserve completed behavior.\n${tail(errors, 6000)}`;
-    const task = addTask(this.state, { title: `Repair ${check.kind} checkpoint (round ${this.state.flowState!.repairRound})`, spec: goal,
-      cmd: this.repairCommand(), deps: completed,
-      node: { goal, touches, creates: [], relies_on: [], verify: 'git diff --check', repair_of: check.id }, maxAttempts: 2 });
-    task.nodeState = { repairCheckpoint: check.id };
-    (this.state.flowState!.repairFailures ??= []).push(...check.results.filter(r => !r.passed).map(r => r.decision!.fingerprint));
-    this.scope.add(task.id); this.event('task-repair', task.id, `Created from checkpoint ${check.id}`); this.save();
-    return task;
+    const existing = this.state.flowState!.repairIntents?.find(i => i.context.checkpoint === check.id);
+    if (existing) { this.materializeRepair(existing); return this.state.tasks[existing.id]; }
+    const failed = check.results.filter(r => !r.passed).slice(0, 1);
+    const focused = { ...check, results: failed };
+    const prototype = { node: { touches: this.fixTouches(focused), verify: 'git diff --check' }, deps: [...this.scope].filter(id => this.state.tasks[id].status === 'completed') } as Task;
+    this.state.flowState!.repairRound++;
+    const context = this.repairContext(prototype, failed[0].decision!, failed, check);
+    const intent: RepairIntent = { id: `repair-${check.id}`, status: 'pending', context };
+    (this.state.flowState!.repairIntents ??= []).push(intent);
+    (this.state.flowState!.repairFailures ??= []).push(...failed.map(r => r.decision!.fingerprint));
+    this.save(); // finding + authority + charge + stable task ID are durable BEFORE graph mutation
+    this.materializeRepair(intent);
+    return this.state.tasks[intent.id];
+  }
+  private materializeRepair(intent: RepairIntent): void {
+    const c = intent.context;
+    const goal = `Fix only diagnosed checkpoint defects. Current diagnosis and exact failed checks:\n${JSON.stringify(c)}\nRetain negative analytical outcomes; do not alter requirements or acceptance sources.`;
+    const previous = this.state.tasks[intent.id];
+    if (!previous && intent.status === 'scheduled') throw Error(`Repair ${intent.id} was removed; explicit adjudication required`);
+    if (previous && (!previous.node || previous.node.repair_of !== c.checkpoint || previous.cmd !== c.command || previous.node.goal !== goal || JSON.stringify(previous.node.touches) !== JSON.stringify(c.scope) || previous.node.verify !== 'git diff --check' || previous.spec !== goal || JSON.stringify(previous.deps) !== JSON.stringify(c.prerequisites))) throw Error(`Repair ${intent.id} definition changed; persisted authority cannot be transferred`);
+    const task = previous ?? addTask(this.state, { id: intent.id, title: `Repair checkpoint ${c.checkpoint}`, spec: goal,
+      cmd: c.command, deps: c.prerequisites,
+      node: { goal, touches: c.scope, creates: [], relies_on: [], verify: 'git diff --check', repair_of: c.checkpoint }, maxAttempts: 1 });
+    task.nodeState = { ...task.nodeState, repairCheckpoint: c.checkpoint, repairContext: c };
+    this.scope.add(task.id); intent.status = 'scheduled'; this.save();
+  }
+  private resumeRepairIntents(): void {
+    for (const intent of this.state.flowState!.repairIntents ?? []) this.materializeRepair(intent);
+  }
+  private async finalReview(check: Checkpoint): Promise<void> {
+    const flow = this.state.flowState!;
+    if (this.state.settings.finalReview === 'off') { flow.review = { identity: check.identity!.digest, status: 'off' }; return; }
+    const harness = planAttempt(this.state.settings.harnessChain, 1)?.harness;
+    const command = this.state.settings.finalReviewCmd ?? harness?.reviewCmd ?? ['opencode', 'claude', 'codex', 'cursor-agent', 'gemini'].map(name => findHarness(name)?.reviewCmd).find(Boolean);
+    flow.review = { identity: check.identity!.digest, status: 'pending' }; this.save();
+    let reviewing: string | undefined;
+    const changed = () => !!this.sourceDirty(this.integration!.path) ||
+      this.identity(this.integration!.path, check.results.map(result => result.command)).digest !== check.identity!.digest ||
+      check.results.some(result => result.artifacts && JSON.stringify(result.artifacts) !== JSON.stringify(evidenceArtifacts(result.command, this.settings, this.integration!.path)));
+
+    try {
+      if (!command) throw Error('Configured final review has no review command');
+      const tasks = [...this.scope].map(id => this.state.tasks[id]).filter(t => t.status === 'completed' && !t.covers);
+      let output = '';
+      const reviews = this.state.settings.finalReview === 'per-task' ? tasks : [this.control('final run review')];
+      if (!reviews.length) throw Error('No eligible tasks supplied required review evidence');
+      const results: NonNullable<NonNullable<typeof flow.review>['results']> = [];
+      flow.review.results = results;
+      for (const owner of reviews) {
+        reviewing = owner.id;
+        const spec = `Review accepted identity ${JSON.stringify(check.identity)} against requirements ${JSON.stringify(this.state.planning?.manifest ?? this.state.objective)}. ${JSON.stringify(tasks.map(t => ({ id: t.id, goal: t.node?.goal })))}\nReview scope: ${owner.id}. Inspect integrated source and report concrete evidence. Do not modify files. A negative analytical outcome is not inherently a defect. End with VERDICT: PASS or VERDICT: FAIL: reason.`;
+        const base = this.state.settings.finalReview === 'per-task' ? owner.diffBase : flow.integrationBase;
+        const diff = git(this.integration!.path, ['diff', base ?? check.head, check.head]).stdout;
+        const directory = this.opts.file ? join(runPaths(this.opts.file).dir, 'reviews') : join(tmpdir(), `dag-flow3-review-${this.state.id}`);
+        mkdirSync(directory, { recursive: true });
+        const diffFile = join(directory, `flow3-${check.id}-${owner.id}.diff`); writeFileSync(diffFile, diff);
+        const result = await this.phase({ ...owner, spec }, 'review', command, this.integration!.path, undefined, owner,
+          { diffFile, diffBase: base ?? check.head, diffHead: check.head, diffStat: git(this.integration!.path, ['diff', '--stat', base ?? check.head, check.head]).stdout,
+            files: git(this.integration!.path, ['diff', '--name-only', base ?? check.head, check.head]).stdout });
+        output += result.output + '\n'; flow.review.output = output; this.save();
+
+        if (changed()) throw Error('Frozen acceptance inputs or source changed during review');
+        const verdict = parseVerdict(stripAnsi(result.output));
+        results.push({ task: owner.id, verdict: verdict.kind === 'pass' ? 'pass' : 'fail', output: result.output, evidenceRef: result.evidenceRef });
+        flow.review.results = results; this.save();
+        if (verdict.kind !== 'pass') {
+          flow.review = { identity: check.identity!.digest, status: 'fail', output, results };
+          // Reviewer prose supplies evidence, not automatic modification authority.
+          return;
+        }
+      }
+      flow.review = { identity: check.identity!.digest, status: 'pass', output, results };
+    } catch (error) {
+      if (reviewing && !flow.review?.results?.some(result => result.task === reviewing)) {
+        (flow.review!.results ??= []).push({ task: reviewing, verdict: 'error', output: String(error), evidenceRef: (error as { evidenceRef?: string }).evidenceRef });
+      }
+      if (changed()) {
+        check.passed = false; check.outcome = 'failed';
+        const path = this.integration!.path;
+        if (this.opts.file) atomicWriteJson(join(runPaths(this.opts.file).dir, 'flow3', `review-mutation-${check.id}.json`), {
+          identity: check.identity, observedIdentity: this.identity(path, check.results.map(result => result.command)),
+          status: this.sourceDirty(path), patch: git(path, ['diff', '--binary', check.head]).stdout,
+        });
+        if (!this.integrationTainted) {
+          git(path, ['reset', '--hard', check.head]);
+          git(path, ['clean', '-fd', ...((this.settings.cachePaths ?? ['node_modules', '.venv']).flatMap(cache => ['-e', cache]))]);
+        }
+        for (const result of check.results) { result.passed = false; result.outcome = 'invalidated'; result.output += '\nSource or acceptance inputs changed during review'; }
+      }
+      flow.review = { identity: check.identity!.digest, status: 'error', output: [flow.review?.output, String(error)].filter(Boolean).join('\n'), results: flow.review?.results };
+    }
+    finally { (flow.reviewHistory ??= []).push({ ...flow.review! }); this.save(); }
   }
   private startAdvisory(): void {
+    if (this.stopped()) return;
     const command = this.settings.advisoryCommand ?? planAttempt(this.state.settings.harnessChain, 1)?.harness.cmd ??
       Object.values(this.state.tasks).map(task => planAttempt(task.harnessChain, 1)?.harness.cmd ?? inferHarnessForCmd(task.cmd)?.cmd).find(Boolean);
     if (!command || this.state.flowState!.advisory) return;

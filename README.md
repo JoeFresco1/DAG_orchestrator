@@ -121,13 +121,15 @@ flowchart LR
   A[Ready node] --> B[Warm worker session]
   B --> C[Work]
   C --> D{Fast verify passes?}
-  D -->|No; retry remains| C
-  D -->|No; exhausted| F[Fail node; block descendants]
+  D -->|No| F[Diagnose; repair within authority or hold]
+  F -->|Authorized bounded repair| C
   D -->|Yes| E[Land or resolve conflict markers]
   E --> G[Complete node; unlock dependents]
   G --> H[Wave build and typecheck]
-  H --> I[Final integration checks]
-  I -->|Actual errors; max 2 rounds| J[Targeted fix nodes]
+  H --> K{Required implementation complete?}
+  K -->|Yes| I[Freeze identity; final acceptance; configured review]
+  K -->|No| M[Hold acceptance; keep completed tasks]
+  I -->|Defect; authority and shared allowance| J[Durable targeted repair]
   J --> A
 ```
 
@@ -137,11 +139,16 @@ Every Flow 3.0 node moves through `work → verify → land`:
 - **Verify** is one fast deterministic command with its own timeout.
 - **Land** merges the verified commit into `dag/<runId>`. Conflicts go to a
   marker-only resolver and never rerun good implementation.
-- **Checkpoints** run bigger checks on integration and create bounded fixes
-  from actual errors. Each phase has its own clock and idle watchdog.
+- **Checkpoints** bind conclusive checks to source, requirements, check configuration
+  and declared environment/fixture inputs. Diagnosed defects can receive bounded fixes
+  through the existing scheduler. Each phase has its own clock and idle watchdog.
 
 The runner refills concurrency slots as soon as tasks finish. Downstream work
 starts only after its dependencies have completed and landed.
+
+Final acceptance failure retains completed tasks and their commits. Scoped success
+cannot claim whole-product completion; configured review and merge status are
+reported separately. See the [Flow 3 architecture](docs/dag-flow3.0.md).
 
 ## Built for agent work that can be trusted
 

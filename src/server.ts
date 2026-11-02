@@ -243,7 +243,7 @@ async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult
     // The runner releases its lock and persists when it finishes; capture the
     // event count now to detect a synchronous setup refusal below.
     const eventsBefore = run.events.length;
-    void rt.runner.start(new Set(scope)).finally(() => {
+    void rt.runner.start(run.settings.executionProfile === 'flow3' && opts.ids === undefined ? null : new Set(scope)).finally(() => {
       rt.releaseLock?.();
       rt.releaseLock = null;
       saveRun(run, rt.file);

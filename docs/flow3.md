@@ -1,7 +1,7 @@
 # Software DAG Flow 3.0
 
 New `dag init`, `dag new-run`, and `dag plan compile` runs use `flow3`.
-The supplied design is preserved in [dag-flow3.0.md](dag-flow3.0.md).
+The [architecture and lifecycle diagram](dag-flow3.0.md) describe the current design.
 
 ## Author and compile small nodes
 
@@ -100,7 +100,7 @@ checkpoints, rather than silently ignored.
 
 Worker prompts assign wave and final acceptance execution to the runner. Workers
 implement the behavior, tests and evidence files and report unrun checks as pending.
-The final checkpoint waits until every selected node has completed. A missing or
+The final checkpoint waits until every required node has completed. A missing or
 failed producer leaves final acceptance deferred, avoiding failures for artifacts
 that downstream tasks have not created yet. Independent ready branches still run.
 Use per-task or run `timeoutMs` to fit implementation scope; acceptance commands
@@ -137,8 +137,8 @@ Only concrete formatting, syntax, type and behavioral assertion diagnostics are
 eligible. Unknown failures, execution prerequisites, acceptance/control guard
 failures and missing inputs stay held for diagnosis. Unchanged diagnostics after
 repair, a repair with no source changes, an expired repair budget, or an agent
-that does not stop cannot start an unbounded loop. Explicit `dag retry` starts a
-new user-authorized recovery cycle; the runner never silently renews failed nodes.
+that does not stop cannot start an unbounded loop. Explicit `dag retry` preserves lifetime repair usage and authority; it does not
+renew exhausted repair allowances. Implementation retries retain their existing operator policy.
 
 Eligible checkpoint errors become a fix node using `repairCommand` or the
 configured/inferred worker harness. File hints come from completed owners,
@@ -215,6 +215,7 @@ reconciled through the saved source's ancestry before dispatching more coding wo
 | Wave command | 3 minutes |
 | Final integration command | 15 minutes |
 | Advisory review | 30 seconds; configurable up to 60 seconds |
+| Configured final review | 5 minutes |
 
 The default idle cap is 3 minutes. Output or `dag heartbeat --file "$env:DAG_FILE"
 --id "$env:DAG_TASK"` refreshes it. Setup cannot spend the coding phase's time.
@@ -238,7 +239,116 @@ Example settings file for `dag settings --flow-config flow-settings.json`:
 }
 ```
 
-The CLI exits nonzero for failed/blocked/skipped nodes, failed checks, missing
-checkpoint configuration, stop, or budget exhaustion. `summary.flow3` and the
+The CLI exits nonzero when required work is incomplete, acceptance or configured
+review fails, checkpoint configuration is missing, or the run stops/exhausts its
+budget. An explicitly optional task failure does not alone fail a completed required
+scope. `summary.flow3` and the
 persisted `flowState` expose acceptance and remaining issues to the viewer/API.
 Factory/controller-managed runs retain their separate lifecycle.
+
+## Consolidated final acceptance
+
+Flow 3 keeps using the same scheduler, integration branch and persisted `flowState`.
+Implementation completion, deterministic acceptance, configured review and publication
+are separate facts. `summary.flow3` reports `implementationComplete`,
+`acceptanceStatus`, `reviewStatus`, `mergeStatus`, and `productComplete`.
+`mergeStatus: integration-only` means accepted commits remain on the run branch;
+it does not claim a merge into the project's target branch.
+
+Declare `settings.completion` in a v3 plan (or `flow3.completion` in run settings):
+
+```json
+{
+  "completion": {
+    "mode": "whole-product",
+    "required": ["parser", "cli"],
+    "optional": ["demo"]
+  },
+  "acceptanceInputs": ["fixtures/reference.json"],
+  "environmentIdentity": "dataset-v4/runtime-image-sha256:...",
+  "requiredEvidence": { "npm run verify:spec": ["output/spec-evidence.json"] }
+}
+```
+
+Every unclassified task is required for whole-product completion. Required dependency
+closures are required too. A selected subset persists as `scoped`, including its
+required and optional tasks and excluded work. Resuming preserves that scope.
+A scoped pass never sets `productComplete`. Skipped, gated, failed or unfinished
+required tasks block final acceptance. A check that identifies an existing missing
+producer adds it and its prerequisites back to the same dispatch scope before
+acceptance resumes; an unknown producer requires a graph correction.
+
+Each checkpoint freezes source HEAD, declared requirements/node contracts, the actual
+check list and configuration, review policy, fixture/data contents and environment
+identity. Tracked fixtures belong to source identity; declare relevant ignored or
+external data under `acceptanceInputs` and external service/image revisions under
+`environmentIdentity`. Automatically captured environment includes Node version,
+platform, architecture and preparation command. Undeclared external inputs cannot
+be inferred: declare them for reproducible acceptance. All check results reference
+the frozen identity. Changed inputs, committed source changes and dirty source
+invalidate results. Node verification also rejects source mutation.
+
+`finalReview: off` remains optional. Configured `run` or `per-task` reviews execute
+against the accepted integration identity with the existing reviewer command and
+explicit verdict protocol. Fresh verification and review run on subsequent execution;
+an earlier pass is never copied to a changed identity. Review failures retain their
+output and hold completion for adjudication against requirements and evidence.
+Reviewer prose does not itself authorize a source modification. Standalone review
+fix-approval gates are unchanged. An acceptance-gap, fixture problem, disputed review
+or uncertain cause requires explicit diagnosis/appropriate approved work rather than
+a speculative automatic implementation repair. Valid negative analytical results
+remain valid evidence; only demonstrated implementation defects trigger repairs.
+
+### Durable repair accounting
+
+| Action | Allowance | Durable charge / exhaustion |
+| --- | --- | --- |
+| Investigation, check execution, review, infrastructure diagnosis | Existing run wall-clock and phase caps | The run's absolute deadline persists across resumes; exhausted runs hold. |
+| Implementation attempt | Existing per-task implementation limit | Attempt count is saved before dispatch; explicit implementation retry retains its existing operator policy. |
+| In-place node repair | `nodeRepairRounds` per original node | Lifetime ledger and diagnosis saved before agent dispatch; edits/retry do not clear repair usage or fingerprints. |
+| Checkpoint repair (wave or final) | Shared `repairRounds` | Finding, authority, charge and stable task ID saved as one intent before task materialization; one dispatch per intent. |
+| Review repair, acceptance-gap correction, environment/fixture recovery | Applicable existing repair pool and authority | No automatic additional pool exists. Undiagnosed/non-implementation causes hold; restarting/reclassification cannot grant allowances. |
+| Verified candidate landing / marker-only conflict recovery | Existing landing/resolve phase caps and overall deadline | Candidate is retained; no implementation or fresh repair allowance is granted. |
+
+These count limits are nested inside the overall run deadline; phase timeouts do not
+extend it. Restarting, creating another repair task, explicit retry, or changing a
+classification never resets repair allowances. There is no automatic fresh
+infrastructure recovery budget. A charged repair interrupted before its result is
+saved holds for recovery/inspection rather than silently dispatching again. If interrupted edits are saved with their pre-repair scope snapshot, recovery can
+verify them and create a candidate without another coding dispatch. A
+verified candidate can still resume landing without another repair dispatch.
+
+Checkpoint intents retain exact failed check records, source acceptance identity,
+owner scope, prerequisites, protected inputs, focused/sibling verification obligations,
+diagnosis, budget usage and escalation conditions. Recovery materializes the same
+stable task exactly once. Prompts include current diagnosis and prior evidence.
+Failures are separate observations; repair one finding at a time rather than infer
+a shared cause from a list of unrelated diagnostics.
+
+After repair, the runner executes its focused checks and checks of accepted owners
+whose declared file ownership overlaps the repair, plus their already accepted consumers. Unfinished downstream owners are
+excluded from focused verification. Full checks run after required work is present.
+Prior unrelated checkpoint records remain available as history, bound to their
+original identities; they are not rewritten as passes on changed code.
+
+Exit zero cannot override explicit empty test counts, cancelled/interrupted or
+inconclusive output, or missing required evidence files. Recognized test-runner
+commands must report positive executed-test evidence. Custom verification commands
+can declare required evidence files. Missing/empty configuration remains incomplete.
+
+
+Recheck clarifications: an explicit subset selection establishes a new scoped
+target; an ordinary resume retains the saved target. Required producer closures
+are never listed as excluded. A discovered failed/skipped producer becomes
+required but does not gain retry authority.
+
+Required evidence hashes stay bound to each result through subsequent checks and
+review. Passing test descriptions are not execution status lines; custom checks
+can explicitly emit `DAG_CHECK_OUTCOME: inconclusive` when they did not establish
+acceptance. Per-task review retains individual coverage and errors and cannot
+pass an empty required review. Interrupted review output remains in history.
+
+Recovery preserves the original worker HEAD while constructing and checking a
+candidate commit object. A further crash can resume verification of the same
+saved edits without another coding dispatch or repair charge. Focused sibling
+checks are limited to owners that are still accepted at verification time.

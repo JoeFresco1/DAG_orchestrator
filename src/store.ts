@@ -1015,7 +1015,7 @@ export function editTask(run: Run, id: string, patch: EditTaskInput): Task {
     }
     task.deps = [...patch.deps];
   }
-  if (patch.node !== undefined || patch.spec !== undefined || patch.cmd !== undefined || patch.deps !== undefined || patch.harnessChain !== undefined) task.nodeState = undefined;
+  if (patch.node !== undefined || patch.spec !== undefined || patch.cmd !== undefined || patch.deps !== undefined || patch.harnessChain !== undefined) task.nodeState = run.settings.executionProfile === 'flow3' && task.nodeState ? { ...task.nodeState, candidate: undefined, worker: undefined, session: undefined, repairBaseline: undefined } : undefined;
   try {
     assertNoCycle(run);
   } catch (err) {
@@ -1047,7 +1047,7 @@ export function retryTask(run: Run, id: string, cascade = false): string[] {
   const touched: string[] = [];
   const requeue = (t: Task): void => {
     // Landing failures resume verified source; other retries redo implementation.
-    if (!['merge', 'integration', 'interrupted', 'killed'].includes(t.failureKind ?? '')) t.nodeState = undefined;
+    if (!['merge', 'integration', 'interrupted', 'killed'].includes(t.failureKind ?? '')) t.nodeState = run.settings.executionProfile === 'flow3' && t.nodeState ? { ...t.nodeState, candidate: undefined, worker: undefined, session: undefined, repairBaseline: undefined } : undefined;
     t.status = 'pending';
     t.result = null;
     t.failureKind = null;

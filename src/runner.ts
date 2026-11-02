@@ -486,7 +486,7 @@ export interface RunnerOptions {
 
 /** Final buckets for a settled run, plus recovery and end-of-run review facts. */
 export interface RunSummary {
-  flow3?: { passed: boolean; repairRounds: number; issues: string[] };
+  flow3?: { passed: boolean; repairRounds: number; issues: string[]; implementationComplete?: boolean; acceptanceStatus?: string; reviewStatus?: string; mergeStatus?: string; productComplete?: boolean; completion?: import('./flow3/contracts.js').CompletionScope };
   planningError?: string;
   scope: string[];
   completed: string[];

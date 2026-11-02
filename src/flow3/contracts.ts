@@ -1,10 +1,10 @@
 import type { SettingsProblem } from '../types.js';
 
-export const PHASES = ['setup', 'work', 'verify', 'repair', 'land', 'resolve', 'checkpoint', 'integration', 'advisory'] as const;
+export const PHASES = ['setup', 'work', 'verify', 'repair', 'land', 'resolve', 'checkpoint', 'integration', 'advisory', 'review'] as const;
 export type Phase = typeof PHASES[number];
 export const PHASE_TIMEOUTS: Record<Phase, number> = {
   setup: 300_000, work: 900_000, verify: 30_000, repair: 300_000, land: 120_000, resolve: 120_000,
-  checkpoint: 180_000, integration: 900_000, advisory: 30_000,
+  checkpoint: 180_000, integration: 900_000, advisory: 30_000, review: 300_000,
 };
 
 export interface NodeBrief {
@@ -24,7 +24,47 @@ export interface FlowNode extends NodeBrief {
   depends_on: string[];
   cmd?: string;
 }
+export interface CompletionScope {
+  mode: 'scoped' | 'whole-product';
+  required: string[];
+  optional: string[];
+  excluded: string[];
+}
+export interface AcceptanceIdentity {
+  digest: string;
+  source: string;
+  requirements: string;
+  checks: string;
+  inputs: string;
+  environment: string;
+}
+export interface RepairContext {
+  authority: 'flow3-automatic';
+  command?: string;
+  checkpoint?: string;
+  identity?: AcceptanceIdentity;
+  diagnosis: RepairDecision;
+  failedChecks: CheckResult[];
+  owners: string[];
+  prerequisites: string[];
+  scope: string[];
+  protectedPaths: string[];
+  verification: string[];
+  charge: { pool: 'node' | 'checkpoint'; used: number; limit: number };
+  escalation: string;
+}
+export interface RepairIntent {
+  id: string;
+  context: RepairContext;
+  status: 'pending' | 'scheduled';
+}
 export interface FlowSettings {
+  completion?: { mode: 'scoped' | 'whole-product'; required: string[]; optional: string[] };
+  /** Include ignored fixtures/data and external environment revisions explicitly. */
+  acceptanceInputs?: string[];
+  environmentIdentity?: string;
+  /** Required nonempty evidence files, keyed by exact check command. */
+  requiredEvidence?: Record<string, string[]>;
   phaseTimeouts?: Partial<Record<Phase, number>>;
   idleTimeoutMs?: number;
   cachePaths?: string[];
@@ -66,10 +106,14 @@ export interface NodeState {
   decision?: RepairDecision;
   /** Identifies a checkpoint repair whose whole work phase needs scope enforcement. */
   repairCheckpoint?: string;
+  repairContext?: RepairContext;
+  diagnosisHistory?: { decision: RepairDecision; checks: CheckResult[]; at: string }[];
+  latestFailedChecks?: CheckResult[];
+  repairBaseline?: { head: string; files: [string, string][]; protectedPaths: string[] };
 }
 export interface RepairDecision {
   action: 'repair' | 'defer' | 'hold';
-  category: 'implementation' | 'dependency' | 'environment' | 'policy' | 'unknown' | 'no-progress';
+  category: 'implementation' | 'dependency' | 'environment' | 'policy' | 'unknown' | 'no-progress' | 'analytical' | 'review' | 'acceptance-gap';
   reason: string;
   requires?: string[];
   fingerprint: string;
@@ -79,10 +123,19 @@ export interface CheckResult {
   passed: boolean;
   output: string;
   decision?: RepairDecision;
+  outcome?: 'passed' | 'failed' | 'deferred' | 'interrupted' | 'inconclusive' | 'invalidated';
+  identity?: string;
+  evidenceRef?: string;
+  exitCode?: number | null;
+  outputDigest?: string;
+  artifacts?: Record<string, string>;
 }
 export interface Checkpoint {
   id: string;
   kind: 'wave' | 'final';
+  outcome?: 'running' | 'passed' | 'failed' | 'interrupted';
+  identity?: AcceptanceIdentity;
+  repairTask?: string;
   head: string;
   nodes: string[];
   results: CheckResult[];
@@ -95,6 +148,17 @@ export interface FlowState {
   advisory?: { status: 'started' | 'finished' | 'warning'; output?: string };
   issues: string[];
   repairFailures?: string[];
+  completion?: CompletionScope;
+  integrationBase?: string;
+  deadlineAt?: number;
+  nodeRepairs?: Record<string, { used: number; failures: string[]; history: RepairContext[] }>;
+  repairIntents?: RepairIntent[];
+  review?: { identity: string; status: 'off' | 'pending' | 'pass' | 'fail' | 'error'; output?: string; results?: { task: string; verdict: 'pass' | 'fail' | 'error'; output: string; evidenceRef?: string }[] };
+  reviewHistory?: NonNullable<FlowState['review']>[];
+  implementationComplete?: boolean;
+  acceptanceStatus?: 'pending' | 'passed' | 'failed';
+  productComplete?: boolean;
+  mergeStatus?: 'integration-only';
 }
 
 const record = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -106,8 +170,18 @@ export function validateFlowSettings(value: unknown): SettingsProblem[] {
   const problems: SettingsProblem[] = [];
   const fail = (field: string, reason: string) => problems.push({ field: `flow3.${field}`, reason });
   if (!record(value)) return [{ field: 'flow3', reason: 'must be an object' }];
-  const allowed = new Set(['phaseTimeouts', 'idleTimeoutMs', 'cachePaths', 'waveChecks', 'finalChecks', 'additionalFinalChecks', 'advisoryCommand', 'repairCommand', 'conflictCommand', 'repairRounds', 'nodeRepairRounds', 'checkPrerequisites', 'repairProtectedPaths']);
+  const allowed = new Set(['phaseTimeouts', 'idleTimeoutMs', 'cachePaths', 'waveChecks', 'finalChecks', 'additionalFinalChecks', 'advisoryCommand', 'repairCommand', 'conflictCommand', 'repairRounds', 'nodeRepairRounds', 'checkPrerequisites', 'repairProtectedPaths', 'completion', 'acceptanceInputs', 'environmentIdentity', 'requiredEvidence']);
   for (const key of Object.keys(value)) if (!allowed.has(key)) fail(key, 'unknown setting');
+  if (value.completion !== undefined) {
+    const c = value.completion;
+    if (!record(c) || !['scoped', 'whole-product'].includes(String(c.mode)) ||
+      !Array.isArray(c.required) || !Array.isArray(c.optional) ||
+      ![...c.required, ...c.optional].every(id => typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) ||
+      new Set([...c.required, ...c.optional]).size !== c.required.length + c.optional.length) fail('completion', 'must declare mode and disjoint required/optional task IDs');
+  }
+  if (value.acceptanceInputs !== undefined && (!Array.isArray(value.acceptanceInputs) || !value.acceptanceInputs.every(safeRelativePath))) fail('acceptanceInputs', 'must contain relative paths');
+  if (value.environmentIdentity !== undefined && (typeof value.environmentIdentity !== 'string' || !value.environmentIdentity.trim())) fail('environmentIdentity', 'must be nonempty');
+  if (value.requiredEvidence !== undefined && (!record(value.requiredEvidence) || !Object.entries(value.requiredEvidence).every(([cmd, paths]) => cmd.trim() && Array.isArray(paths) && paths.every(safeRelativePath)))) fail('requiredEvidence', 'must map commands to relative evidence paths');
   if (value.phaseTimeouts !== undefined) {
     if (!record(value.phaseTimeouts)) fail('phaseTimeouts', 'must be an object');
     else for (const [phase, ms] of Object.entries(value.phaseTimeouts)) {

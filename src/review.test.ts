@@ -1348,14 +1348,14 @@ describe('reviewer agents and integration repair', () => {
     process.env.DAG_NOTIFY_OUT = out;
     try {
       await runner.start();
-      // Notify children are detached; poll until the run-end alert lands.
-      for (
-        let i = 0;
-        i < 60 && !(existsSync(out) && readFileSync(out, 'utf8').includes('run-end'));
-        i++
-      ) {
-        await sleep(50);
-      }
+      // Detached children may finish in either order. Wait for both required
+      // observations instead of treating run-end as a barrier for task-fail.
+      const notificationsReady = () => {
+        if (!existsSync(out)) return false;
+        const text = readFileSync(out, 'utf8');
+        return text.includes('run-end') && text.includes(`task-fail ${a.id}`);
+      };
+      for (let i = 0; i < 60 && !notificationsReady(); i++) await sleep(50);
       assert.equal(run.tasks[a.id].status, 'failed');
       assert.ok(existsSync(out), 'notify command ran');
       const text = readFileSync(out, 'utf8');

@@ -188,7 +188,7 @@ export async function runCmd(argv: string[]): Promise<void> {
   };
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
-  try { await runner.start(new Set(scope)); }
+  try { await runner.start(run.settings.executionProfile === 'flow3' && only === null ? null : new Set(scope)); }
   finally { process.off('SIGINT', onSignal); process.off('SIGTERM', onSignal); }
   saveRun(run, file);
   const summary = runner.result;
@@ -224,7 +224,7 @@ export async function runCmd(argv: string[]): Promise<void> {
   if (review && review.verdict !== 'pass' && review.verdict !== 'skipped') {
     process.exitCode = 1;
   }
-  if (summary.stopped || summary.budgetReached || summary.failed.length > 0 || summary.unfinished.length > 0) {
+  if (summary.stopped || summary.budgetReached || (!summary.flow3 && (summary.failed.length > 0 || summary.unfinished.length > 0))) {
     process.exitCode = 1;
   }
   if (summary.flow3 && !summary.flow3.passed) process.exitCode = 1;

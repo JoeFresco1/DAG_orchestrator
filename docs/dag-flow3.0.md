@@ -1,103 +1,160 @@
-# Software DAG Flow 3.0
+# Software DAG Flow 3.0 architecture
 
-Built from your original vision: **spec -> small tasks -> ordered nodes -> one worktree per node -> review the order -> integrate as nodes finish.** Version 3.0 keeps the 1.0 structure and its checkpoints, but removes the overhead that caused timeouts and the 10-hour startup.
+Flow 3 turns declared requirements into small tasks, integrates verified tasks as
+they finish, and checks the assembled integration revision. This is the current
+architecture; see [configuration and operation](flow3.md) and the
+[implementation audit and verification evidence](flow3-acceptance-audit.md).
 
-## Principles
+## One scheduler and one persisted authority
 
-1. **Small nodes are preferred.** 150 nodes that work 9/10 times beat 50 that work 4/10. Run straight chains (A -> B -> C, no branching) in one session on one worktree to avoid per-node overhead.
-2. **Only cheap, deterministic checks can block.** Cycles, missing IDs, and undeclared dependencies are checked in code in milliseconds. Anything slower or LLM-based is advisory and never blocks a run from starting.
-3. **A failed node blocks its dependents, not the whole run.** Independent branches keep going. Nothing builds on code that doesn't exist.
-4. **One fast gate per node, bigger checks at checkpoints.** Per node: a single command taking seconds. Per wave: build and typecheck. End of run: everything.
-5. **Never re-run a good task for a merge conflict.** Resolve the conflict markers only.
-6. **Each phase has its own timeout,** plus an idle timeout (no output for N minutes). One shared clock lets setup starve the coding step.
-7. **Measure first.** Log a timestamp at every phase boundary so slow nodes explain themselves.
+`FlowRunner` owns dispatch, checkpoints, final acceptance, configured review, repair
+and recovery. `Run.flowState`, task/node state and the existing store retain the
+authoritative records under the existing run lock. `lifecycle.ts` supplies pure
+completion, identity and evidence helpers, without another scheduler or state store.
 
-## Node Definition
+Warm worker slots reuse dependencies; straight chains can reuse their worktree and
+supported agent conversation. Ready nodes need completed dependencies, open gates
+and available slots. Overlapping file ownership serializes work. Failure blocks
+descendants while independent branches continue.
 
-Every node carries what it needs to start editing on turn 1:
+## Distinct completion gates
 
-| Field | Purpose |
-| :--- | :--- |
-| `id`, `goal` | What to do, in one or two sentences |
-| `depends_on` | Declared dependency edges |
-| `touches` | Files the node will edit (also used as hints so the agent skips exploring) |
-| `creates` | Files or symbols this node introduces (used to catch undeclared dependencies) |
-| `relies_on` | Interfaces or signatures from dependencies it can assume exist |
-| `verify` | One fast command that proves the node worked (compile, typecheck, or its own test) |
+| Fact | Meaning |
+| --- | --- |
+| Task completion | Focused verification passed and the candidate landed on integration; consumers may start immediately. |
+| Implementation completion | Every required task in the persisted completion scope completed. |
+| Acceptance | Conclusive checks passed against a frozen assembled identity. |
+| Review | Configured review is off, pending, passed, failed or errored for that identity. |
+| Merge | Ordinary Flow 3 reports `integration-only`; no target-branch publication policy exists. |
+| Product completion | Whole-product scope satisfied its required work, acceptance and configured review. Scoped success cannot claim this. |
 
-## Flowchart
+Final acceptance or review failure retains completed tasks and integrated commits.
+It holds run/product success and routes findings through diagnosis. Task integration
+continues incrementally rather than waiting until the end.
+
+Persist completion mode, required and optional IDs and excluded work. Unclassified
+whole-product tasks and required producer closures are required. Explicit subset
+selection establishes a scoped target; ordinary resume retains the saved target.
+Skipped, gated, failed, unfinished or excluded required work prevents whole-product
+completion. Discovering a missing producer reopens the implementation gate before
+dependent acceptance. Promotion of a failed producer does not grant retry authority.
+
+## Lifecycle
 
 ```mermaid
 flowchart TD
-    %% ---------- Stage 1: Spec to ordered nodes ----------
-    A["1. Ingest spec<br/>Break into small nodes<br/>(goal, touches, creates, relies_on, verify)"] --> B["2. Deterministic graph check (code, ms)<br/>cycles (50 <-> 150), missing deps,<br/>undeclared deps via creates/touches overlap"]
-    B --> C{"Graph problems?"}
-    C -- Yes --> D["Auto-fix edges or split oversized nodes"]
-    D --> B
-    C -- No --> E["3. One advisory plan review (1 LLM call)<br/>Anything crazy, wrong, or out of order?<br/>Oversized nodes? Suspicious edges?"]
-    E --> F["Apply fixes if any, then build waves<br/>(topological order; never blocks start)"]
-
-    %% ---------- Stage 2: Execution ----------
-    F --> G["4. Init worker pool<br/>N worktrees with shared or warm dependency cache"]
-    G --> H["Scheduler: pick ready nodes<br/>(deps done, no touches conflict, under concurrency cap)"]
-    H --> I["Worker takes node<br/>reset worktree, branch from integration HEAD"]
-    I --> J["Run node task<br/>(file hints, no per-node planning phase)<br/>phase timeout + idle timeout"]
-    J --> K{"Crash or timeout?"}
-    K -- Yes --> L{"Retried once?"}
-    L -- No --> M["Retry with tighter context"]
-    M --> J
-    L -- Yes --> FAIL
-    K -- No --> N["Run node verify command (seconds)"]
-    N --> O{"Verify passes?"}
-    O -- No --> L
-    O -- Yes --> P["Land: merge into integration branch"]
-
-    P --> Q{"Merge conflict?"}
-    Q -- Yes --> R["Conflict-only resolver<br/>(markers only, do NOT re-run node)"]
-    R --> S
-    Q -- No --> S["Mark node done<br/>release worker and unlock dependents"]
-
-    FAIL["Mark node failed<br/>BLOCK its dependents<br/>independent branches keep running"] --> H
-
-    %% ---------- Stage 3: Checkpoints ----------
-    S --> T{"Wave complete?"}
-    T -- No --> H
-    T -- Yes --> U["Wave checkpoint on integration branch<br/>build + typecheck only"]
-    U --> V{"Checkpoint passes?"}
-    V -- No --> W["Create fix node from actual errors"]
-    W --> H
-    V -- Yes --> X{"Runnable nodes left?"}
-    X -- Yes --> H
-
-    %% ---------- Stage 4: Integration and repair ----------
-    X -- No --> Y["5. Full integration checks on integration branch<br/>build, typecheck, tests, spec verification"]
-    Y --> Z{"All pass and no<br/>failed or blocked nodes?"}
-    Z -- Yes --> DONE["Summarize run"]
-    Z -- No --> AA{"Repair rounds left? (max 2)"}
-    AA -- Yes --> AB["Create targeted fix nodes<br/>from real errors + retry failed and blocked nodes"]
-    AB --> H
-    AA -- No --> AC["Stop and report remaining issues<br/>for human review"]
+    A[Declare small nodes and completion scope] --> B[Deterministic graph admission]
+    B --> C[Persist scope; acquire lock and warm pool]
+    C --> S[Existing FlowRunner dispatches ready nodes]
+    S --> W[Work then focused verification]
+    W -->|Conclusive pass| L[Pin candidate; land or resolve conflict markers]
+    L --> T[Complete task; unlock consumers immediately]
+    T --> Q[Wave checkpoint when active units finish]
+    Q -->|Pass; work remains| S
+    Q -->|Finding| D[Persist evidence and diagnose]
+    W -->|Failure or inconclusive| D
+    Q -->|Pass; no ready work| G{All required implementation complete?}
+    G -->|No| H[Hold final acceptance; retain completed work]
+    G -->|Yes| F[Confirm integration HEAD; freeze acceptance identity]
+    F --> V[Full deterministic acceptance]
+    V -->|Finding or changed inputs| D
+    V -->|Conclusive pass| R{Configured final review?}
+    R -->|Off| O[Report separate lifecycle statuses]
+    R -->|Required by configuration| U[Review accepted identity; retain verdicts]
+    U -->|Pass| O
+    U -->|Finding or changed inputs| D
+    D --> P{Diagnosis and applicable authority}
+    P -->|Missing prerequisite| M[Promote producer and closure; reopen completion gate]
+    M --> S
+    P -->|Defect; authority and allowance| J[Save finding, charge and bounded repair intent]
+    J --> S
+    P -->|Uncertain, disputed or exhausted| H
+    H --> O
 ```
 
-## What Changed vs. 1.0
+Admission checks IDs, edges, cycles and declared producers, adding unambiguous
+producer edges. Planning agents author small nodes; the runner does not invent
+requirements or split tasks. Optional advisory plan review cannot gate startup.
 
-| Area | 1.0 | 3.0 | Why |
-| :--- | :--- | :--- | :--- |
-| Pre-flight | Full plan contract: sources, sizing, ownership, acceptance | Code-based graph check plus one advisory LLM review | Startup takes seconds, not hours |
-| Ordering errors | Hoped contracts would catch them | `creates`/`touches` overlap check finds undeclared dependencies | Toposort alone only sees declared edges |
-| Worktrees | Fresh worktree plus setup per attempt | Worker pool with shared or warm dependency cache | Removes cold-start timeouts |
-| Per-node steps | Setup, plan, run, contract guards, LLM reviewers | Run, then one fast `verify` command | Removes ~3 LLM phases per node |
-| Failure of a node | Retry whole task; strict gates | Retry once, then block dependents only | No cascades from missing code |
-| Merge conflict | Landing failure retries whole task | Conflict-only resolver | Keeps good work |
-| Validation | Per-node guards plus separate validation pass | Wave checkpoints plus one end-of-run pass | Catches drift early without per-node cost |
-| Final review | Optional separate review loop | Folded into integration checks and bounded repair rounds | One loop instead of three |
-| Timeouts | One budget per attempt | Per-phase and idle timeouts, with logged timestamps | Shows which phase is slow |
+Each node declares `id`, `goal`, `depends_on`, `touches`, `creates`, `relies_on` and
+one fast `verify` command. `verify_requires` adds producer edges;
+`checkPrerequisites` defers composed checks until producers exist. Worker prompts
+assign wave/final acceptance execution to the runner.
 
-## Rules for Adding New Checks
+## Frozen acceptance identity and conclusive evidence
 
-Before adding any check, it must pass all three tests:
-1. **Deterministic:** no LLM judgment involved, unless it is advisory.
-2. **Fast:** finishes in seconds. Anything slower runs at a checkpoint or the end.
-3. **Actionable:** failure produces a specific fix node, not just a halt.
+Each checkpoint binds results to source revision, requirements/task contracts,
+actual checks and configuration, review policy, relevant fixture/data contents and
+environment identity. Declare ignored/external inputs using `acceptanceInputs` and
+`environmentIdentity`; undeclared external inputs cannot be inferred. Results
+retain output, explicit outcomes and evidence references. Required evidence files
+retain content hashes through later checks and review.
 
-If a check fails these, log it as a warning and let the run continue.
+Source mutation, including commits made during verification or review, invalidates
+results. Changed inputs require renewed affected verification. Configured review
+must cover the accepted identity. Later changes, conflict resolution or target
+updates cannot inherit a stale pass. Any future publication policy must verify and
+review its resulting code as required; this change adds no automatic publication.
+
+Exit zero is insufficient. Zero executed/all-skipped tests, missing evidence,
+interrupted/cancelled checks and inconclusive results retain their actual reason
+and cannot pass. Recognized test commands require positive executed-test evidence.
+Custom checks can declare evidence files and explicit outcome markers.
+
+## Diagnose before authorizing repair
+
+| Diagnosis | Routing |
+| --- | --- |
+| Demonstrated product defect | Repair the owning producer or integration boundary within existing automatic authority. |
+| Missing prerequisite | Reopen the completion gate; complete the producer first. |
+| Acceptance gap | Hold for justified verification of an existing requirement under applicable authority. |
+| Fixture/environment defect | Preserve evidence; hold for bounded authorized correction or recovery. |
+| Disputed review finding | Retain the finding and adjudicate against requirements and evidence. |
+| Valid negative analytical outcome | Retain it; repair only a demonstrated implementation or contract defect. |
+| Unknown cause/conflicting requirements | Investigate or escalate before implementation. |
+
+Failed checks supply evidence, not modification permission. Automatic repairs keep
+their configured bounds. Standalone reviews keep explicit fix-approval gates.
+`finalReview: off` remains optional; configured run/per-task review uses the existing
+verdict protocol. Reviewer assertions do not authorize speculative coding or new
+allowances. Preserve individual findings; group causes only with supporting evidence.
+
+Repairs carry authority, latest diagnosis, exact failed checks, source acceptance
+identity/evidence, owners, prerequisites, permitted scope, protected requirements
+and acceptance sources, verification obligations, budget charges/remaining limits
+and escalation conditions. Retain diagnosis history and earlier evidence; resumed
+prompts receive the latest diagnosis.
+
+After repair, run focused checks, affected already accepted owners and their accepted
+consumers. Shared-file changes include affected accepted siblings. Exclude unfinished
+downstream obligations. Full acceptance waits for required prerequisites. Preserve
+unrelated historical records for their identities without relabeling them as passes
+on changed code.
+
+## Durable budgets and recovery
+
+| Action | Existing limit and durable boundary |
+| --- | --- |
+| Investigation, checks, review, infrastructure diagnosis | Phase caps within the persisted absolute run deadline; resume does not renew it. |
+| Implementation | Task attempt limit saved before dispatch; explicit retries retain existing operator policy. |
+| Node repair | Lifetime per-original-node `nodeRepairRounds`; charge and diagnosis saved before coding dispatch. |
+| Wave/final checkpoint repair | Shared run-wide `repairRounds` (0..2); finding, charge, authority and stable repair ID saved together before task materialization. |
+| Review/fixture/environment correction | Applicable existing authority and pool; no additional automatic repair/recovery pool. |
+| Landing/conflict resolution | Existing phase caps and deadline; preserve verified candidates without granting implementation or repair attempts. |
+
+Exhaustion holds and reports remaining issues. Restart, task creation,
+reclassification, explicit retry and mechanism changes do not replenish repair
+allowances. Timeout, quota, setup and uncertain failures need diagnosis rather than
+an automatic coding retry. Independent phase/idle clocks cannot extend the deadline.
+
+Checkpoint intents materialize one stable task through the same scheduler. Resume
+reconciles findings and durable charges without duplicate repair work. Saved edits
+include a pre-repair scope snapshot. Recovery verifies them and constructs a candidate
+commit object without advancing the original saved worker HEAD. A further crash
+remains recoverable without another coding dispatch or charge. Unsafe recovery holds
+and retains work. Verified candidates resume landing rather than implementation.
+
+Conflict recovery changes only supported marker blocks, preserving other bytes and
+history. Resulting code remains subject to verification and review requirements.
+The architecture adds no second scheduler, competing repair loop or independent
+source of run state.

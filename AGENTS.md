@@ -6,7 +6,7 @@
 ## Current ordinary execution: Software DAG Flow 3.0
 
 The user's Flow 3.0 replaces the historical ordinary execution instructions below.
-See `docs/flow3.md` and the supplied design in `docs/dag-flow3.0.md`.
+See `docs/flow3.md` and the current architecture in `docs/dag-flow3.0.md`.
 
 - Prefer many small nodes. Every node has `id`, `goal`, `depends_on`, `touches`,
   `creates`, `relies_on`, and one fast deterministic `verify` command.
@@ -35,6 +35,14 @@ See `docs/flow3.md` and the supplied design in `docs/dag-flow3.0.md`.
   No-change repairs and repeated identical failures stop. `verify_requires`
   adds safe producer edges; `checkPrerequisites` defers composed checks until
   named producers complete. Deferred checks never count as passing acceptance.
+- Persist completion scope and required/optional tasks. Scoped success cannot claim
+  product completion. Final acceptance failure retains completed tasks and commits.
+- Freeze source, requirements, checks and declared fixtures/environment for final
+  acceptance. Configured final review covers that identity; optional review stays off.
+  Empty, interrupted, missing-evidence or inconclusive checks never pass.
+- Keep repair authority, diagnosis/history and lifetime charges durable. Resume or
+  retry cannot replenish repair limits. Use the existing scheduler/store for repair
+  intents and saved-edit recovery; never add another recovery budget or scheduler.
 - Each phase has a separate timeout and an idle watchdog. Log both boundaries.
 - Keep existing saved runs stopped when editing their definitions. Never reset
   attempts or acceptance by hand. `dag retry` preserves a merge candidate;

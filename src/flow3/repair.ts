@@ -37,12 +37,15 @@ export function repairDecision(run: Run, input: {
       if (candidates.length !== 1) return decide('hold', 'dependency', `Ambiguous producer for ${artifact}`);
       owners.add(task.id);
     }
-    const pending = [...owners].filter(id => !['completed', 'failed', 'skipped'].includes(run.tasks[id].status));
+    const pending = [...owners].filter(id => run.tasks[id].status !== 'completed');
     if (pending.length && (phase === 'checkpoint' || phase === 'integration')) {
       return decide('defer', 'dependency', `Missing artifact has an identified unfinished producer: ${pending.join(', ')}`, pending);
     }
     return decide('hold', 'dependency', 'Missing input needs producer/graph or environment diagnosis; no safe automatic coding repair');
   }
+  if (/valid negative analytical outcome|analytical outcome: negative/i.test(output)) return decide('hold', 'analytical', 'Retain the analytical result; repair requires a demonstrated contract or implementation defect');
+  if (/disputed finding|review defect|reviewer finding rejected/i.test(output)) return decide('hold', 'review', 'Adjudicate against requirements and evidence; reviewer output alone does not authorize implementation');
+  if (/acceptance gap|missing required evidence|inconclusive|no tests? (?:found|collected|ran)|0 tests?/i.test(output)) return decide('hold', 'acceptance-gap', 'Verification did not establish acceptance; justify new verification under the applicable policy');
   if (implementation.test(output)) return decide('repair', 'implementation', 'Concrete formatting, syntax, type or behavioral check failure');
   return decide('hold', 'unknown', 'Failure is not classified as a scoped implementation defect');
 }

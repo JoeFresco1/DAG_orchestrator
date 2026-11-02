@@ -409,12 +409,13 @@ test('checkpoint repair scope enforcement survives an explicit retry and storage
   assert.ok(fix); assert.equal(fix.status, 'failed');
   retryTask(f.run, fix.id); saveRun(f.run, f.file);
   const restored = loadRun(f.file);
-  assert.equal(restored.tasks[fix.id].nodeState, undefined);
+  assert.equal(restored.tasks[fix.id].nodeState?.repairContext?.authority, 'flow3-automatic');
   assert.ok(restored.tasks[fix.id].node?.repair_of);
   const resumed = new DagRunner(restored, { cwd: f.repo, file: f.file, executor: execute, persist: r => saveRun(r, f.file) });
   await resumed.start();
-  assert.equal(repairs, 2); assert.equal(restored.tasks[fix.id].status, 'failed');
-  assert.match(restored.tasks[fix.id].result!, /outside allowed scope/);
+  assert.equal(repairs, 1); assert.equal(restored.tasks[fix.id].status, 'failed');
+  assert.equal(restored.flowState?.repairRound, 1);
+  assert.match(restored.tasks[fix.id].result!, /allowance exhausted/);
   assert.notEqual(git(f.repo, ['cat-file', '-e', `dag/${f.run.id}:unowned.txt`]).code, 0);
 });
 
