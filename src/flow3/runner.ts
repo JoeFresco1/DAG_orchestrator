@@ -1,9 +1,9 @@
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { addTask, acquireLock, attemptLogPath, atomicWriteJson, heartbeatPath, lockHeldBy, logEvent, recoverInterrupted, runPaths } from '../store.js';
-import { commitAll, createTaskWorktree, ensureIntegrationWorktree, git, isGitRepo, removeWorktree, snapshotExcludes } from '../git-worktree.js';
+import { commitAll, createTaskWorktree, ensureIntegrationWorktree, git, isGitRepo, removeWorktree, restorePendingWork, snapshotExcludes } from '../git-worktree.js';
 import { depsMet, describeDeps, gateBlocks } from '../graph.js';
 import { planAttempt } from '../harness-chain.js';
 import { findHarness, inferHarnessForCmd } from '../harnesses.js';
@@ -13,7 +13,7 @@ import { recordPlanningAcceptance } from '../planning/runtime.js';
 import { describeSettingsProblems, validateSettingsPatch, type DagEvent, type FailureKind, type Run, type Task } from '../types.js';
 import { parseVerdict, stripAnsi, type ExecContext, type ExecOutcome, type Executor, type RunnerOptions, type RunSummary } from '../runner.js';
 import type { WorkerSession } from '../agent-session.js';
-import { PHASE_TIMEOUTS, type Candidate, type Checkpoint, type FlowSettings, type Phase, type RepairContext, type RepairIntent } from './contracts.js';
+import { safeRelativePath, PHASE_TIMEOUTS, type Candidate, type Checkpoint, type FlowSettings, type Phase, type RepairContext, type RepairIntent } from './contracts.js';
 import { acceptanceIdentity, completionScope, evidenceFailure, evidenceArtifacts } from './lifecycle.js';
 import { chainWaves, checkGraph, overlaps, promptFor } from './graph.js';
 import { checkScriptCommands, commandMentionsPath, protectedRepairPath, repairDecision } from './repair.js';
@@ -57,6 +57,7 @@ export class FlowRunner {
   private scope = new Set<string>();
   private finalCheckpointId?: string;
   private explicitSelection = false;
+  private dependenciesChanged = false;
   private budgetReached = false;
   private deadline = 0;
   private logBytes = new Map<string, number>();
@@ -155,7 +156,9 @@ export class FlowRunner {
       // One advisory call runs alongside dispatch. Slow/failed review cannot gate startup.
       this.startAdvisory();
       for (;;) {
+        this.dependenciesChanged = false;
         await this.schedule();
+        if (this.dependenciesChanged && !this.stopped()) continue;
         if (this.stopped()) break;
         const unfinished = [...new Set([...this.required(), ...[...this.scope].filter(id => checkpointRepair(this.state.tasks[id]))])].filter(id => this.state.tasks[id]?.status !== 'completed');
         this.state.flowState.implementationComplete = !unfinished.length;
@@ -376,14 +379,28 @@ export class FlowRunner {
           const cmd = checkpointRepair(task) ? task.cmd : this.opts.workCommand?.(task) ?? preset?.cmd ?? task.cmd;
           if (!cmd) throw failure('Node has no work command or harness', 'manual');
           task.harness = selected?.candidate.harness ?? null;
-          const workTask = { ...task, spec: promptFor(task, task.attemptsInCycle > 1),
+          const workTask = { ...task, spec: promptFor(task, task.attemptsInCycle > 1, this.settings.productSpec),
             model: task.model ?? selected?.candidate.model ?? null,
             variant: task.variant ?? selected?.candidate.variant ?? null };
-          const output = checkpointRepair(task)
-            ? await this.guardedRepair(task, worker, cmd, workTask.spec)
-            : await this.phase(workTask, 'work', cmd, worker.path, worker, task);
+          let output: ExecOutcome;
+          const savedWork = task.nodeState?.handoff?.saved;
+          if (savedWork) {
+            if (savedWork.definition !== definition(task)) throw failure('Saved dependency handoff belongs to a different node definition', 'manual');
+            const restored = restorePendingWork(worker.path, savedWork.commit);
+            if (restored.code) throw failure('Cannot restore saved work onto its producer: ' + restored.stderr, 'manual');
+            output = { exitCode: 0, output: 'Restored implementation after its prerequisite landed' };
+          } else {
+            output = checkpointRepair(task)
+              ? await this.guardedRepair(task, worker, cmd, workTask.spec)
+              : await this.phase(workTask, 'work', cmd, worker.path, worker, task);
+            const marker = output.output.trimEnd().split(/\r?\n/).at(-1)?.match(/^DAG_NEEDS: (.+)$/);
+            if (!checkpointRepair(task) && marker && this.deferMissingArtifact(task, marker[1].trim(), output.output, worker, base, false)) return false;
+            if (this.settings.productSpec && task.node?.experience === 'qa' && parseVerdict(stripAnsi(output.output)).kind !== 'pass') {
+              throw failure('Integrated QA is incomplete: ' + tail(output.output));
+            }
+          }
           (task.milestones ??= {}).implementedAt = now();
-          await this.verifyNode(task, worker, cmd);
+          if (!await this.verifyNode(task, worker, cmd, base)) return false;
           if (checkpointRepair(task)) for (const command of this.verificationCommands(task).filter(command => command !== task.node!.verify)) {
             await this.phase(task, 'verify', command, worker.path, worker);
           }
@@ -433,6 +450,44 @@ export class FlowRunner {
       this.event(this.isStopping ? 'task-killed' : 'task-fail', task.id, task.result);
       return false;
     } finally { this.active.delete(task.id); this.save(); }
+  }
+  private deferMissingArtifact(task: Task, artifact: string, output: string, worker: Worker, base: string, saveEdits: boolean): boolean {
+    const owners = Object.values(this.state.tasks).filter(t => t.node?.creates.includes(artifact));
+    const owner = owners[0];
+    if (!safeRelativePath(artifact) || existsSync(join(worker.path, artifact)) || owners.length !== 1 ||
+      owner.id === task.id || !this.scope.has(owner.id) || task.deps.includes(owner.id) ||
+      (!saveEdits && (this.sourceDirty(worker.path) || git(worker.path, ['rev-parse', 'HEAD']).stdout !== base))) {
+      if (saveEdits) return false;
+      throw failure('Cannot confirm a clean dependency handoff: ' + artifact, 'manual');
+    }
+    task.deps.push(owner.id);
+    const report = checkGraph(this.state, false);
+    if (!report.valid) {
+      task.deps.pop();
+      throw failure('Cannot schedule discovered dependency: ' + report.errors.join(', '), 'manual');
+    }
+    let saved;
+    if (saveEdits) {
+      try {
+        commitAll(worker.path, 'dag: preserve ' + task.id + ' awaiting ' + owner.id, this.settings.cachePaths ?? ['node_modules', '.venv']);
+        const commit = git(worker.path, ['rev-parse', 'HEAD']).stdout;
+        const pin = git(this.repo, ['branch', `dag-waiting/${this.state.id}/${task.id}-${task.attempts}`, commit]);
+        if (pin.code) throw Error(pin.stderr);
+        saved = { commit, definition: definition(task) };
+      } catch (error) {
+        task.deps.pop();
+        throw error;
+      }
+    }
+    task.status = 'pending';
+    task.nodeState!.handoff = { producer: owner.id, artifact, evidence: tail(output, 1200), saved };
+    task.result = `Waiting for ${owner.id} to produce ${artifact}`;
+    task.finishedAt = null;
+    task.attemptsInCycle--; // This dispatch is still charged and retained in lifetime attempts.
+    this.dependenciesChanged = true;
+    this.event('note', task.id, task.result + '\n' + tail(output, 1200));
+    this.save();
+    return true;
   }
   /** Resume verification of saved repair edits without another coding dispatch or allowance. */
   private async recoverRepair(task: Task, worker: Worker): Promise<boolean> {
@@ -485,21 +540,26 @@ export class FlowRunner {
     return [...new Set([task.node!.verify, ...(context?.verification ?? []).filter(command =>
       context?.owners.some(id => this.state.tasks[id]?.status === 'completed' && this.state.tasks[id].node?.verify === command))])];
   }
-  private async verifyNode(task: Task, worker: Worker, workCommand: string): Promise<void> {
+  private async verifyNode(task: Task, worker: Worker, workCommand: string, base: string): Promise<boolean> {
     for (;;) {
       let failedCommand = task.node!.verify;
       try {
         await this.phase(task, 'verify', task.node!.verify, worker.path, worker);
         if (!checkpointRepair(task)) for (const command of this.verificationCommands(task)) if (command !== task.node!.verify) { failedCommand = command; await this.phase(task, 'verify', command, worker.path, worker); }
-        delete task.nodeState!.decision; return;
+        delete task.nodeState!.decision; return true;
       }
       catch (error) {
         const output = error instanceof Error ? error.message : String(error);
+        const decision = repairDecision(this.state, { command: failedCommand, output, phase: 'verify',
+          kind: (error as { kind?: string }).kind, requires: task.node!.verify_requires });
+        const missing = output.match(/Cannot find module ['"]([^'"]+)['"]|ENOENT[^\n]*?['"]([^'"]+)['"]/i);
+        if (missing && decision.category === 'dependency' && !worker.tainted && !this.stopped() && !checkpointRepair(task) && !task.nodeState?.repairContext) {
+          const artifact = relative(worker.path, resolve(worker.path, missing[1] ?? missing[2])).replaceAll('\\', '/');
+          if (this.deferMissingArtifact(task, artifact, output, worker, base, true)) return false;
+        }
         const state = task.nodeState!;
         const ledger = (this.state.flowState!.nodeRepairs ??= {})[task.id] ??= { used: state.repairAttempts ?? 0, failures: state.repairFailures ?? [], history: [] };
         state.repairAttempts = ledger.used; state.repairFailures = ledger.failures;
-        const decision = repairDecision(this.state, { command: failedCommand, output, phase: 'verify',
-          kind: (error as { kind?: string }).kind, requires: task.node!.verify_requires });
         // A local check cannot be deferred past its own downstream consumer. Admission must wire its producers.
         if (decision.action === 'defer') { decision.action = 'hold'; decision.reason = 'Local verification requires an unfinished producer; declare verify_requires and repair the graph'; }
         if (state.repairFailures?.includes(decision.fingerprint)) {
@@ -577,6 +637,20 @@ export class FlowRunner {
   }
 
   private async phase(task: Task, phase: Phase, command: string, cwd: string, worker?: Worker, observed = task, tokens: Partial<ExecContext> = {}): Promise<CheckOutcome> {
+    const spend = this.settings.spend;
+    const agentPhase = ['work', 'repair', 'review', 'resolve', 'advisory'].includes(phase);
+    if (spend && !agentPhase && inferHarnessForCmd(command)) throw failure('Budgeted builds require local, unbilled acceptance commands', 'budget');
+    if (spend && agentPhase) {
+      if (![findHarness('claude')!.cmd, findHarness('claude')!.reviewCmd].includes(command)) throw failure('Budget mode requires the configured Claude print command', 'budget');
+      const state = this.state.flowState!;
+      const available = spend.limitCents - (state.reservedCents ?? 0);
+      const qa = phase === 'review' || task.node?.experience === 'qa' || checkpointRepair(task);
+      const cents = Math.min(spend.dispatchCents, available - (qa ? 0 : spend.qaCents));
+      if (cents < 1) throw failure('Agent spend allowance exhausted for ' + phase, 'budget');
+      state.reservedCents = (state.reservedCents ?? 0) + cents;
+      this.save();
+      command = command.replace('claude -p ', `claude -p --max-budget-usd ${(cents / 100).toFixed(2)} `);
+    }
     let evidenceRef: string | undefined;
     const checkedSource = phase === 'verify' ? { head: git(cwd, ['rev-parse', 'HEAD']).stdout, files: hash(JSON.stringify([...snapshot(cwd)])) } : undefined;
     const started = Date.now(); let lastOutput = started, finished = false, settled = false;
@@ -914,7 +988,7 @@ export class FlowRunner {
       flow.review.results = results;
       for (const owner of reviews) {
         reviewing = owner.id;
-        const spec = `Review accepted identity ${JSON.stringify(check.identity)} against requirements ${JSON.stringify(this.state.planning?.manifest ?? this.state.objective)}. ${JSON.stringify(tasks.map(t => ({ id: t.id, goal: t.node?.goal })))}\nReview scope: ${owner.id}. Inspect integrated source and report concrete evidence. Do not modify files. A negative analytical outcome is not inherently a defect. End with VERDICT: PASS or VERDICT: FAIL: reason.`;
+        const spec = `Review accepted identity ${JSON.stringify(check.identity)} against requirements ${JSON.stringify(this.state.planning?.manifest ?? this.settings.productSpec ?? this.state.objective)}. ${JSON.stringify(tasks.map(t => ({ id: t.id, goal: t.node?.goal })))}\nReview scope: ${owner.id}. Inspect integrated source and report concrete evidence. Do not modify files. A negative analytical outcome is not inherently a defect. End with VERDICT: PASS or VERDICT: FAIL: reason.`;
         const base = this.state.settings.finalReview === 'per-task' ? owner.diffBase : flow.integrationBase;
         const diff = git(this.integration!.path, ['diff', base ?? check.head, check.head]).stdout;
         const directory = this.opts.file ? join(runPaths(this.opts.file).dir, 'reviews') : join(tmpdir(), `dag-flow3-review-${this.state.id}`);
@@ -958,6 +1032,7 @@ export class FlowRunner {
     finally { (flow.reviewHistory ??= []).push({ ...flow.review! }); this.save(); }
   }
   private startAdvisory(): void {
+    if (this.settings.spend && !this.settings.advisoryCommand) return;
     if (this.stopped()) return;
     const command = this.settings.advisoryCommand ?? planAttempt(this.state.settings.harnessChain, 1)?.harness.cmd ??
       Object.values(this.state.tasks).map(task => planAttempt(task.harnessChain, 1)?.harness.cmd ?? inferHarnessForCmd(task.cmd)?.cmd).find(Boolean);

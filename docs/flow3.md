@@ -1,5 +1,46 @@
 # Software DAG Flow 3.0
 
+## Build from a spec
+
+From a Git project with Claude Code configured, run:
+
+```sh
+dag build --spec product.md --max-usd 10 --file product.run.json
+```
+
+This command uses a read-only planner and the existing Flow 3 runner. The planner
+reads the repository, assigns user outcomes, names relevant skills and references,
+and selects local wave and final checks. Workers receive the original spec and
+perform focused planning, verification, and refinement. UI plans give one task
+ownership of the first working journey. A final QA task depends on all preceding
+work, exercises the product, and writes preview instructions and findings in
+`docs/build/qa.md` on the integration branch printed by the command. UI builds also deliver
+desktop and mobile screenshots in that directory. Missing or failing QA verdicts keep the build incomplete.
+
+The amount limits the sum of Claude Code API budget flags issued by this build.
+Before starting each agent process (including planning, repair and QA), the
+runner persists its maximum allowance in cents. Concurrent jobs share the
+balance. Interrupted and inexpensive calls retain their full reservations, so
+the reported reservation can exceed actual usage. The runner reserves a share
+for QA and skips the optional advisory call. This applies to runner-issued
+Claude requests. Use local, unbilled test commands and tools. External services,
+plugins, or subprocesses that independently incur charges are outside this limit.
+Other harnesses still work for ordinary Flow 3 plans.
+
+Repeat the command with the same spec, run file, and budget to resume. The runner
+retains accepted work and spent reservations. An invalid planner response gets
+one correction attempt. A clean worker that discovers a missing file may end
+its response with `DAG_NEEDS: path/to/file`. The runner checks that the file is
+absent, exactly one in-scope node declares it, and adding the dependency leaves
+the graph acyclic. It reschedules that branch and continues independent work.
+If the node verifier names an absent file with a unique producer, the runner
+pins the implementation in Git, waits for that producer, restores the edits, and
+reruns the original check. Ambiguous findings or conflicting saved edits remain
+held with evidence. Local checks still
+have to pass. Put checks that require later features in `finalChecks` and use
+`checkPrerequisites` for checks shared with earlier waves.
+
+
 New `dag init`, `dag new-run`, and `dag plan compile` runs use `flow3`.
 The [architecture and lifecycle diagram](dag-flow3.0.md) describe the current design.
 

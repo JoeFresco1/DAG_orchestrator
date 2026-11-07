@@ -1015,7 +1015,7 @@ export function editTask(run: Run, id: string, patch: EditTaskInput): Task {
     }
     task.deps = [...patch.deps];
   }
-  if (patch.node !== undefined || patch.spec !== undefined || patch.cmd !== undefined || patch.deps !== undefined || patch.harnessChain !== undefined) task.nodeState = run.settings.executionProfile === 'flow3' && task.nodeState ? { ...task.nodeState, candidate: undefined, worker: undefined, session: undefined, repairBaseline: undefined } : undefined;
+  if (patch.node !== undefined || patch.spec !== undefined || patch.cmd !== undefined || patch.deps !== undefined || patch.harnessChain !== undefined) task.nodeState = run.settings.executionProfile === 'flow3' && task.nodeState ? { ...task.nodeState, handoff: undefined, candidate: undefined, worker: undefined, session: undefined, repairBaseline: undefined } : undefined;
   try {
     assertNoCycle(run);
   } catch (err) {

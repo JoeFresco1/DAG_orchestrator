@@ -40,7 +40,7 @@ function inputIdentity(root: string, path: string, ancestors = new Set<string>()
 export function acceptanceIdentity(run: Run, settings: FlowSettings, root: string, source: string, commands: string[]): AcceptanceIdentity {
   const value = {
     source,
-    requirements: digest({ objective: run.objective, manifest: run.planning?.manifest, completion: run.flowState?.completion,
+    requirements: digest({ objective: run.objective, productSpec: settings.productSpec, manifest: run.planning?.manifest, completion: run.flowState?.completion,
       nodes: Object.values(run.tasks).filter(t => !t.node?.repair_of).map(t => ({ id: t.id, node: t.node, deps: t.deps, spec: t.spec, cmd: t.cmd, harnessChain: t.harnessChain, reviewers: t.reviewers, reviewCmd: t.reviewCmd })) }),
     checks: digest({ commands, settings, review: [run.settings.finalReview, run.settings.finalReviewCmd, run.settings.finalReviewRounds],
       execution: { harnessChain: run.settings.harnessChain, silenceMs: run.settings.silenceMs, reviewVerdict: run.settings.reviewVerdict } }),

@@ -9,6 +9,8 @@ import { gitRepo } from '../test-helpers.js';
 import { loadRun, recordHeartbeat, retryTask, saveRun } from '../store.js';
 import { compileFlowPlan, checkGraph, chainWaves } from './graph.js';
 import { validateFlowSettings, type FlowNode, type FlowSettings } from './contracts.js';
+import { budgetedPlan } from '../commands/build.js';
+import { findHarness } from '../harnesses.js';
 import { planningCmd } from '../commands/planning.js';
 import { runCmd } from '../commands/run.js';
 import { codexSessionArgs, codexStdin } from '../codex-transport.js';
@@ -266,7 +268,7 @@ test('checkpoint prerequisites defer premature acceptance without executing it o
   const r = runner(f, async (task, ctx, cmd) => {
     if (cmd === 'work') writeFileSync(join(ctx.cwd!, task.id === 'producer' ? 'artifact.ts' : `${task.id}.txt`), 'ready');
     if (cmd === 'composed') {
-      checks++; assert.equal(f.run.tasks.producer.status, 'completed');
+      if (ctx.env?.DAG_PHASE === 'verify') checks++; assert.equal(f.run.tasks.producer.status, 'completed');
       assert.equal(readFileSync(join(ctx.cwd!, 'artifact.ts'), 'utf8'), 'ready');
     }
     if (cmd === 'repair') repairs++;
@@ -557,4 +559,109 @@ test('a second runner cannot mutate a live run, and the original runner can resu
   assert.equal(first.result?.flow3?.passed, true);
   await first.start();
   assert.equal(first.result?.flow3?.passed, true); assert.equal(works, 1);
+});
+
+
+test('worker-discovered artifact schedules its producer and retries with the integrated source', async () => {
+  const f = fixture([node('consumer'), node('producer', [], { creates: ['producer.txt'] })]);
+  f.run.settings.concurrency = 1;
+  const calls: string[] = [];
+  const r = runner(f, async (task, ctx, cmd) => {
+    if (cmd === 'work') {
+      calls.push(task.id);
+      if (task.id === 'consumer' && !existsSync(join(ctx.cwd!, 'producer.txt')))
+        return { exitCode: 0, output: 'Import cannot resolve producer.txt.\nDAG_NEEDS: producer.txt' };
+      if (task.id === 'consumer') assert.match(task.spec, /Prior dependency finding/);
+      writeFileSync(join(ctx.cwd!, task.id + '.txt'), task.id);
+    }
+    return ok;
+  });
+  await r.start();
+  assert.equal(r.result?.flow3?.passed, true, JSON.stringify(r.result));
+  assert.deepEqual(calls, ['consumer', 'producer', 'consumer']);
+  assert.deepEqual(loadRun(f.file).tasks.consumer.deps, ['producer']);
+});
+
+test('parallel Claude dispatches reserve before execution, protect QA and persist charges', async () => {
+  const cmd = 'claude -p --dangerously-skip-permissions --model {model} {spec}';
+  const f = fixture([node('a', [], { cmd }), node('b', [], { cmd }), node('qa', [], { cmd, experience: 'qa' })],
+    { spend: { limitCents: 12, dispatchCents: 5, qaCents: 5 } });
+  const charges: number[] = [];
+  const r = runner(f, async (task, ctx, command) => {
+    if (command?.startsWith('claude')) {
+      const cents = Math.round(Number(command.match(/--max-budget-usd ([\d.]+)/)?.[1]) * 100);
+      assert.ok(loadRun(f.file).flowState!.reservedCents! >= cents);
+      charges.push(cents);
+      writeFileSync(join(ctx.cwd!, task.id + '.txt'), task.id);
+    }
+    return ok;
+  });
+  await r.start();
+  assert.equal(r.result?.flow3?.passed, true, JSON.stringify(r.result));
+  assert.deepEqual(charges.sort(), [2, 5, 5]);
+  assert.equal(loadRun(f.file).flowState?.reservedCents, 12);
+});
+
+
+test('missing file in verifier preserves edits and verifies again without another coding call', async () => {
+  const f = fixture([node('consumer'), node('producer', [], { creates: ['producer.txt'] })]);
+  f.run.settings.concurrency = 1;
+  let builds = 0, checks = 0;
+  const r = runner(f, async (task, ctx, cmd) => {
+    if (cmd === 'work') {
+      if (task.id === 'consumer') builds++;
+      writeFileSync(join(ctx.cwd!, task.id + '.txt'), task.id);
+    }
+    if (cmd === 'verify-consumer') {
+      if (ctx.env?.DAG_PHASE === 'verify') checks++;
+      assert.equal(readFileSync(join(ctx.cwd!, 'consumer.txt'), 'utf8'), 'consumer');
+      if (!existsSync(join(ctx.cwd!, 'producer.txt'))) return { exitCode: 1, output: "ENOENT: missing file 'producer.txt'" };
+    }
+    return ok;
+  });
+  await r.start();
+  assert.equal(r.result?.flow3?.passed, true, JSON.stringify(r.result));
+  assert.equal(builds, 1);
+  assert.equal(checks, 2);
+  assert.equal(f.run.tasks.consumer.nodeState?.repairAttempts ?? 0, 0);
+});
+
+
+test('spec build gives UI consumers a shared reference and integrates QA after every node', () => {
+  const plan = { version: 3 as const, title: 'Account creation', settings: {waveChecks: ['check'], finalChecks: ['journey']}, nodes: [
+    node('profile', [], { experience: 'implement', skills: ['accessibility'] }),
+    node('design', [], { experience: 'design', creates: ['layout.tsx'] }),
+    node('qa', [], { experience: 'qa' }),
+  ] };
+  const run = budgetedPlan(plan, 'Register with email', 1000, 100);
+  assert.deepEqual(run.tasks.profile.deps, ['design']);
+  assert.deepEqual(run.tasks.profile.node?.relies_on, ['layout.tsx']);
+  assert.deepEqual(run.tasks.qa.deps, ['profile', 'design']);
+  assert.ok(run.tasks.qa.node?.creates.includes('docs/build/mobile.png'));
+  assert.ok(run.settings.flow3?.finalChecks?.includes('journey'));
+  assert.equal(run.flowState?.reservedCents, 100);
+  assert.throws(() => budgetedPlan({ ...plan, nodes: plan.nodes.slice(0, 2) }, 'spec', 1000, 0), /QA/);
+});
+
+test('exhausted persisted allowance prevents new agent dispatch', async () => {
+  const f = fixture([node('a', [], {cmd: findHarness('claude')!.cmd})],
+    { spend: { limitCents: 10, dispatchCents: 5, qaCents: 1 } });
+  f.run.flowState = { version: 3, repairRound: 0, checkpoints: [], issues: [], reservedCents: 10 };
+  saveRun(f.run, f.file);
+  f.run = loadRun(f.file);
+  let calls = 0;
+  const r = runner(f, async () => { calls++; return ok; });
+  await r.start();
+  assert.equal(calls, 0);
+  assert.equal(r.result?.flow3?.productComplete, false);
+  assert.equal(loadRun(f.file).flowState?.reservedCents, 10);
+});
+
+
+test('QA that reports unresolved issues cannot complete a spec build', async () => {
+  const f = fixture([node('qa', [], {experience: 'qa'})], {productSpec: 'Complete registration'});
+  const r = runner(f, async () => ({exitCode: 0, output: 'VERDICT: FAIL: submit button obscured on mobile'}));
+  await r.start();
+  assert.equal(r.result?.flow3?.productComplete, false);
+  assert.match(f.run.tasks.qa.result ?? '', /obscured/);
 });

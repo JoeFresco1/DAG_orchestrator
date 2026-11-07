@@ -40,6 +40,8 @@ usage: dag <cmd> [flags]
   schedule list | schedule rm <job> | schedule clear
   scheduler [--poll SEC] [--once] [--drain] [--watch] [--open]
                                run scheduled jobs one at a time
+  build --spec FILE --max-usd AMOUNT [--file F]
+                               plan and execute a budgeted Claude build with integrated QA
   init --objective "..."        new run using the current execution policy
   factory start --goal goal.json [--file F]
                                compile and run a structured software-factory cycle

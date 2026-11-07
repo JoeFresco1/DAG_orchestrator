@@ -9,6 +9,9 @@ export const PHASE_TIMEOUTS: Record<Phase, number> = {
 
 export interface NodeBrief {
   goal: string;
+  skills?: string[];
+  references?: string[];
+  experience?: 'design' | 'implement' | 'qa';
   touches: string[];
   creates: string[];
   /** File names, symbols, or signatures supplied by declared prerequisites. */
@@ -59,6 +62,9 @@ export interface RepairIntent {
   status: 'pending' | 'scheduled';
 }
 export interface FlowSettings {
+  /** Conservative reservations against Claude print-mode dispatches, in whole cents. */
+  spend?: { limitCents: number; dispatchCents: number; qaCents: number };
+  productSpec?: string;
   completion?: { mode: 'scoped' | 'whole-product'; required: string[]; optional: string[] };
   /** Include ignored fixtures/data and external environment revisions explicitly. */
   acceptanceInputs?: string[];
@@ -99,6 +105,7 @@ export interface Candidate {
 }
 export interface NodeState {
   candidate?: Candidate;
+  handoff?: { producer: string; artifact: string; evidence: string; saved?: { commit: string; definition: string } };
   worker?: string;
   session?: string;
   repairAttempts?: number;
@@ -143,6 +150,7 @@ export interface Checkpoint {
 }
 export interface FlowState {
   version: 3;
+  reservedCents?: number;
   repairRound: number;
   checkpoints: Checkpoint[];
   advisory?: { status: 'started' | 'finished' | 'warning'; output?: string };
@@ -170,8 +178,15 @@ export function validateFlowSettings(value: unknown): SettingsProblem[] {
   const problems: SettingsProblem[] = [];
   const fail = (field: string, reason: string) => problems.push({ field: `flow3.${field}`, reason });
   if (!record(value)) return [{ field: 'flow3', reason: 'must be an object' }];
-  const allowed = new Set(['phaseTimeouts', 'idleTimeoutMs', 'cachePaths', 'waveChecks', 'finalChecks', 'additionalFinalChecks', 'advisoryCommand', 'repairCommand', 'conflictCommand', 'repairRounds', 'nodeRepairRounds', 'checkPrerequisites', 'repairProtectedPaths', 'completion', 'acceptanceInputs', 'environmentIdentity', 'requiredEvidence']);
+  const allowed = new Set(['productSpec', 'spend', 'phaseTimeouts', 'idleTimeoutMs', 'cachePaths', 'waveChecks', 'finalChecks', 'additionalFinalChecks', 'advisoryCommand', 'repairCommand', 'conflictCommand', 'repairRounds', 'nodeRepairRounds', 'checkPrerequisites', 'repairProtectedPaths', 'completion', 'acceptanceInputs', 'environmentIdentity', 'requiredEvidence']);
   for (const key of Object.keys(value)) if (!allowed.has(key)) fail(key, 'unknown setting');
+  if (value.productSpec !== undefined && (typeof value.productSpec !== 'string' || !value.productSpec.trim())) fail('productSpec', 'must contain the product requirements');
+  if (value.spend !== undefined) {
+    const b = value.spend;
+    if (!record(b) || ![b.limitCents, b.dispatchCents, b.qaCents].every(n => Number.isSafeInteger(n) && Number(n) >= 0) ||
+      Number(b.dispatchCents) < 1 || Number(b.limitCents) < Number(b.dispatchCents) + Number(b.qaCents))
+      fail('spend', 'requires integer cents for the limit, dispatch ceiling and QA reserve');
+  }
   if (value.completion !== undefined) {
     const c = value.completion;
     if (!record(c) || !['scoped', 'whole-product'].includes(String(c.mode)) ||

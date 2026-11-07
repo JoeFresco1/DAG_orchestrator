@@ -21,6 +21,9 @@ export function validateBrief(value: unknown): string[] {
   if (typeof node.verify !== 'string' || !node.verify.trim() || /[\0\r\n]/.test(node.verify)) errors.push('one verify command is required');
   if (!Array.isArray(node.touches) || !node.touches.every(safeRelativePath)) errors.push('touches must contain repository relative paths');
   for (const field of ['creates', 'relies_on'] as const) if (!Array.isArray(node[field]) || !node[field].every(s => typeof s === 'string' && !!s.trim() && !/[\0\r\n]/.test(s))) errors.push(`${field} must contain file or symbol names`);
+  if (node.references !== undefined && (!Array.isArray(node.references) || !node.references.every(safeRelativePath))) errors.push('references must contain repository paths');
+  if (node.skills !== undefined && (!Array.isArray(node.skills) || !node.skills.every(s => typeof s === 'string' && !!s.trim()))) errors.push('skills must contain skill names');
+  if (node.experience !== undefined && !['design', 'implement', 'qa'].includes(node.experience)) errors.push('invalid experience role');
   if (node.verify_requires !== undefined && (!Array.isArray(node.verify_requires) || !node.verify_requires.every(id => typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)))) errors.push('verify_requires must contain producer IDs');
   if (node.repair_of !== undefined && (typeof node.repair_of !== 'string' || !node.repair_of.trim() || /[\0\r\n]/.test(node.repair_of))) errors.push('repair_of must identify a checkpoint');
   return errors;
@@ -60,7 +63,7 @@ export function checkGraph(run: Run, autoFix = true): GraphReport {
   for (const task of tasks) for (const created of task.node?.creates ?? []) producers.set(key(created), [...(producers.get(key(created)) ?? []), task.id]);
   for (const [created, ids] of producers) if (new Set(ids).size > 1) errors.push(`Ambiguous creator for ${created}: ${ids.join(', ')}`);
   for (const task of tasks) {
-    const needs = [...(task.node?.touches ?? []), ...(task.node?.relies_on ?? [])];
+    const needs = [...(task.node?.touches ?? []), ...(task.node?.relies_on ?? []), ...(task.node?.references ?? [])];
     for (const [created, owners] of producers) {
       if (owners.length !== 1 || owners[0] === task.id || !needs.some(n => overlaps(n.split('#')[0], created.split('#')[0]) || key(n) === created)) continue;
       const owner = owners[0];
@@ -140,14 +143,27 @@ export function compileFlowPlan(value: unknown): { run: Run; report: GraphReport
   return { run, report };
 }
 
-export function promptFor(task: Task, retry: boolean): string {
+const experienceInstructions = {
+  design: 'Own the primary journey. Build a representative working slice with realistic content, inspect the rendered desktop and mobile states and refine it. Leave a reusable implementation and visual reference.',
+  implement: 'Follow the shared reference and components. Use the rendered UI at desktop and mobile sizes and fix interaction or layout defects.',
+  qa: 'Exercise the integrated journeys with realistic data, keyboard navigation and relevant empty and error states. Fix reproducible issues within scope, repeat affected journeys and record observations and preview instructions.',
+};
+export function promptFor(task: Task, retry: boolean, productSpec?: string): string {
   const node = task.node;
   return [
     `Node ${task.id}: ${node?.goal ?? task.spec}`,
     `Edit: ${node?.touches.join(', ') || '(use the task scope)'}.`,
     `Create: ${node?.creates.join(', ') || '(none)'}.`,
     `Available interfaces: ${node?.relies_on.join(', ') || '(none declared)'}.`,
-    'Start editing from these file hints. Implement only this node; no planning or review phase.',
+    ...(task.nodeState?.handoff ? [`Prior dependency finding (verify against this checkout): ${JSON.stringify(task.nodeState.handoff)}`] : []),
+    ...(productSpec ? [`Product requirements: ${productSpec}`] : []),
+    'Inspect the relevant context, plan locally, implement within your edit scope, exercise the real entry point and refine the result. Preserve acceptance criteria.',
+    'Use applicable installed skills. Inspect the real behavior and report any check or observation you could not perform.',
+    ...(node?.skills?.length ? [`Load the applicable skills: ${node.skills.join(', ')}. Report unavailable skills and the fallback used.`] : []),
+    ...(node?.references?.length ? [`Inspect these project references: ${node.references.join(', ')}.`] : []),
+    ...(node?.experience ? [experienceInstructions[node.experience]] : []),
+    ...(productSpec && node?.experience === 'qa' ? ['After cleanup, finish with VERDICT: PASS or VERDICT: FAIL: <specific unresolved issue>. Missing required observations are unresolved issues.'] : []),
+    'If blocked before editing on a missing artifact produced by another task, return a final line DAG_NEEDS: <exact artifact path>. Include the evidence above it.',
     `The runner executes the node verification after you return: ${node?.verify ?? '(configured by the runner)'}.`,
     'The runner owns wave and final acceptance suites and their separate time budgets. Implement the required behavior, tests and evidence files, then return. Do not launch or wait for repository-wide acceptance suites in this implementation phase. Record checks you have not run as pending runner verification; never claim they passed.',
     ...(retry ? [`Previous failure: ${(task.lastRejection ?? '').slice(-2500)}. Fix that specific failure.`] : []),

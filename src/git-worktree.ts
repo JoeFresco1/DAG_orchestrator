@@ -405,6 +405,11 @@ export function commitAll(worktree: string, message: string, excludes: string[] 
   return { commit: git(worktree, ['rev-parse', 'HEAD']).stdout, files };
 }
 
+// Stage a saved implementation on the current integration base for fresh verification.
+export function restorePendingWork(worktree: string, commit: string) {
+  return git(worktree, [...IDENTITY, ...NO_HOOKS, 'merge', '--squash', '--no-commit', commit]);
+}
+
 // Merge a task branch into the run's integration branch. Conflicts abort and
 // surface as a retryable failure: the task is redone on the new base.
 export function mergeIntoIntegration(

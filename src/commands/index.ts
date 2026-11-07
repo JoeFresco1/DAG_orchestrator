@@ -48,11 +48,13 @@ import { factoryCmd } from './factory.js';
 import { neutralRunCmd } from './neutral.js';
 import { diagnoseCmd } from './diagnostics.js';
 import { reliableCmd } from './reliability.js';
+import { buildCmd } from './build.js';
 import { planningCmd } from './planning.js';
 import { followupsCmd } from './followups.js';
 
 /** Maps `dag <name>` to its handler; aliases share one handler on purpose. */
 export const COMMANDS: Record<string, CommandHandler> = {
+  build: buildCmd,
   plan: planningCmd,
   followups: followupsCmd,
   reliable: reliableCmd,
