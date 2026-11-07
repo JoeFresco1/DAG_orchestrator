@@ -17,6 +17,13 @@ work, exercises the product, and writes preview instructions and findings in
 `docs/build/qa.md` on the integration branch printed by the command. UI builds also deliver
 desktop and mobile screenshots in that directory. Missing or failing QA verdicts keep the build incomplete.
 
+Add review specs to the same build with repeatable `--review-spec` flags, for example
+`--review-spec specs/017-ux-review/spec.md --review-spec specs/018-performance-review/spec.md`.
+Each selected review becomes a visible node after implementation and before QA.
+It writes a report under `docs/build/reviews/`. QA reads the reports, repairs
+reproducible findings and repeats the relevant journeys or measurements. The
+review specs and their contents are retained with the run's requirements.
+
 The amount limits the sum of Claude Code API budget flags issued by this build.
 Before starting each agent process (including planning, repair and QA), the
 runner persists its maximum allowance in cents. Concurrent jobs share the

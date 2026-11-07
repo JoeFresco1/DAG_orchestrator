@@ -643,6 +643,33 @@ test('spec build gives UI consumers a shared reference and integrates QA after e
   assert.throws(() => budgetedPlan({ ...plan, nodes: plan.nodes.slice(0, 2) }, 'spec', 1000, 0), /QA/);
 });
 
+test('selected review specs run after implementation and feed the final QA task', () => {
+  const run = budgetedPlan({ version: 3, title: 'Review', settings: { waveChecks: ['check'], finalChecks: ['journey'] },
+    nodes: [node('feature'), node('qa', [], { experience: 'qa' })] }, 'Build feature', 1000, 100,
+    [{ path: 'specs/017-ux-review/spec.md', content: 'Inspect mobile flow' },
+      { path: 'specs/018-performance-review/spec.md', content: 'Measure startup' }]);
+  assert.deepEqual(run.tasks.quality_review_1.deps, ['feature']);
+  assert.deepEqual(run.tasks.quality_review_2.deps, ['feature']);
+  assert.deepEqual(run.tasks.qa.deps, ['feature', 'quality_review_1', 'quality_review_2']);
+  assert.ok(run.tasks.qa.node?.relies_on.includes('docs/build/reviews/quality_review_1.md'));
+  assert.match(run.tasks.qa.node?.goal ?? '', /rerun its applicable checks/);
+  assert.ok(run.settings.flow3?.spend?.dispatchCents);
+});
+
+test('review workers can write reports without changing implementation source', async () => {
+  const f = fixture([node('review', [], { experience: 'review', touches: ['review.md'] })]);
+  const r = runner(f, async (_task, ctx, command) => {
+    if (command === 'work') {
+      writeFileSync(join(ctx.cwd!, 'review.md'), 'Found a mobile layout issue');
+      writeFileSync(join(ctx.cwd!, 'app.ts'), 'unauthorized source change');
+    }
+    return ok;
+  });
+  await r.start();
+  assert.equal(r.result?.flow3?.productComplete, false);
+  assert.match(f.run.tasks.review.result ?? '', /Review changed source/);
+});
+
 test('exhausted persisted allowance prevents new agent dispatch', async () => {
   const f = fixture([node('a', [], {cmd: findHarness('claude')!.cmd})],
     { spend: { limitCents: 10, dispatchCents: 5, qaCents: 1 } });

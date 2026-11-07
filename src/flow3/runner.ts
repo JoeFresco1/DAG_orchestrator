@@ -382,6 +382,7 @@ export class FlowRunner {
           const workTask = { ...task, spec: promptFor(task, task.attemptsInCycle > 1, this.settings.productSpec),
             model: task.model ?? selected?.candidate.model ?? null,
             variant: task.variant ?? selected?.candidate.variant ?? null };
+          const reviewBefore = task.node?.experience === 'review' ? snapshot(worker.path) : undefined;
           let output: ExecOutcome;
           const savedWork = task.nodeState?.handoff?.saved;
           if (savedWork) {
@@ -393,6 +394,16 @@ export class FlowRunner {
             output = checkpointRepair(task)
               ? await this.guardedRepair(task, worker, cmd, workTask.spec)
               : await this.phase(workTask, 'work', cmd, worker.path, worker, task);
+            if (reviewBefore) {
+              const after = snapshot(worker.path);
+              for (const name of new Set([...reviewBefore.keys(), ...after.keys()])) {
+                if (reviewBefore.get(name) !== after.get(name) && !task.node!.touches.includes(name))
+                  throw failure(`Review changed source outside its report: ${name}`, 'manual');
+              }
+              const report = task.node!.touches[0];
+              if (!after.get(report) || after.get(report) === reviewBefore.get(report))
+                throw failure(`Review did not produce fresh evidence in ${report}`, 'manual');
+            }
             const marker = output.output.trimEnd().split(/\r?\n/).at(-1)?.match(/^DAG_NEEDS: (.+)$/);
             if (!checkpointRepair(task) && marker && this.deferMissingArtifact(task, marker[1].trim(), output.output, worker, base, false)) return false;
             if (this.settings.productSpec && task.node?.experience === 'qa' && parseVerdict(stripAnsi(output.output)).kind !== 'pass') {

@@ -11,7 +11,7 @@ export interface NodeBrief {
   goal: string;
   skills?: string[];
   references?: string[];
-  experience?: 'design' | 'implement' | 'qa';
+  experience?: 'design' | 'implement' | 'review' | 'qa';
   touches: string[];
   creates: string[];
   /** File names, symbols, or signatures supplied by declared prerequisites. */

@@ -1,10 +1,10 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { flag, flagRequired } from '../cli-args.js';
 import { acquireLock, atomicWriteJson, loadRun, runPaths, saveRun } from '../store.js';
 import { compileFlowPlan } from '../flow3/graph.js';
-import type { FlowPlan } from '../flow3/contracts.js';
+import { safeRelativePath, type FlowPlan } from '../flow3/contracts.js';
 import { isGitRepo } from '../git-worktree.js';
 import { findHarness } from '../harnesses.js';
 import { runCmd } from './run.js';
@@ -18,13 +18,17 @@ Group by observable user outcomes. Name applicable installed skills in skills, a
 For UI, designate one node experience:"design" to establish a real journey and reusable visual reference.
 Mark remaining UI builders experience:"implement" and reference that artifact. Include exactly one final experience:"qa"
 node to exercise integrated journeys, clean up reproducible problems and write a QA report with preview instructions.
+Review specifications supplied with the build are scheduled separately after implementation and before QA. Do not add review nodes yourself.
 Keep cross-feature checks in finalChecks. Identify tangible evidence and pass conditions, including desktop/mobile for UI.
 Preserve every product requirement. Use the existing stack and make reasonable reversible choices.`;
 
-export function budgetedPlan(input: FlowPlan, spec: string, limit: number, planning: number) {
+export interface ReviewSpec { path: string; content: string }
+
+export function budgetedPlan(input: FlowPlan, spec: string, limit: number, planning: number, reviewSpecs: ReviewSpec[] = []) {
   if (!Array.isArray(input.nodes) || !input.nodes.length || !input.settings?.finalChecks?.length || !input.settings.waveChecks?.length)
     throw Error('Plan must provide nodes, wave checks and final acceptance');
   const nodes = structuredClone(input.nodes);
+  if (nodes.some(node => node.experience === 'review')) throw Error('Review nodes are scheduled from --review-spec files');
   const qa = nodes.filter(node => node.experience === 'qa');
   if (qa.length !== 1) throw Error('Plan needs one integrated QA task');
   const ui = nodes.filter(node => node.experience === 'implement');
@@ -34,6 +38,19 @@ export function budgetedPlan(input: FlowPlan, spec: string, limit: number, plann
     node.depends_on = [...new Set([...node.depends_on, designs[0].id])];
     node.relies_on = [...new Set([...node.relies_on, ...designs[0].creates])];
   }
+  for (const [index, review] of reviewSpecs.entries()) {
+    const id = `quality_review_${index + 1}`;
+    const report = `docs/build/reviews/${id}.md`;
+    nodes.push({ id, experience: 'review',
+      goal: `Review the integrated product against ${review.path}. Record observations, evidence, failed checks and concrete repair requests in ${report}.`,
+      depends_on: nodes.filter(node => node.experience !== 'qa' && node.experience !== 'review').map(node => node.id),
+      touches: [report], creates: [report], relies_on: [], references: [review.path],
+      verify: `node -e "if(!require('fs').readFileSync('${report}','utf8').trim())process.exit(1);console.log('Review report present')"` });
+    qa[0].relies_on.push(report);
+    qa[0].goal += ` Resolve findings in ${report}, rerun its applicable checks and record the result.`;
+  }
+  qa[0].touches = [...new Set([...qa[0].touches,
+    ...nodes.filter(node => node.experience !== 'qa' && node.experience !== 'review').flatMap(node => node.touches)])];
   qa[0].depends_on = nodes.filter(node => node !== qa[0]).map(node => node.id);
   const report = 'docs/build/qa.md';
   qa[0].creates = [...new Set([...qa[0].creates, report])];
@@ -51,7 +68,7 @@ export function budgetedPlan(input: FlowPlan, spec: string, limit: number, plann
     }
   }
   const qaCents = Math.max(1, Math.floor((limit - planning) / 6));
-  const dispatchCents = Math.floor((limit - planning - qaCents) / (input.nodes.length + 1));
+  const dispatchCents = Math.floor((limit - planning - qaCents) / (nodes.length + 1));
   if (dispatchCents < 1) throw Error('Remaining allowance cannot cover this plan');
   const cmd = findHarness('claude')!.cmd;
   const settings = input.settings;
@@ -67,7 +84,17 @@ export function budgetedPlan(input: FlowPlan, spec: string, limit: number, plann
 
 export async function buildCmd(argv: string[]): Promise<void> {
   const file = resolve(flag(argv, 'file') ?? 'dag.run.json');
-  const spec = readFileSync(resolve(flagRequired(argv, 'spec')), 'utf8').trim();
+  const root = dirname(file);
+  const reviewSpecs: ReviewSpec[] = [];
+  for (let i = 0; i < argv.length; i++) if (argv[i] === '--review-spec') {
+    const given = argv[++i];
+    if (!given) throw Error('--review-spec requires a file path');
+    const path = relative(root, resolve(given)).replaceAll('\\', '/');
+    if (!safeRelativePath(path)) throw Error('Review specs must be inside the target repository');
+    reviewSpecs.push({ path, content: readFileSync(resolve(given), 'utf8').trim() });
+  }
+  const mainSpec = readFileSync(resolve(flagRequired(argv, 'spec')), 'utf8').trim();
+  const spec = [mainSpec, ...reviewSpecs.map(review => `Review requirements from ${review.path}:\n${review.content}`)].join('\n\n');
   const amount = flagRequired(argv, 'max-usd');
   if (!spec || !/^\d+(?:\.\d{1,2})?$/.test(amount)) throw Error('Provide a spec and a positive dollar ceiling with at most two decimals');
   const limit = Math.round(Number(amount) * 100);
@@ -108,7 +135,7 @@ export async function buildCmd(argv: string[]): Promise<void> {
           atomicWriteJson(receipt, state);
         }
         if (state.plan) {
-          try { run = budgetedPlan(state.plan, spec, limit, state.reserved); }
+          try { run = budgetedPlan(state.plan, spec, limit, state.reserved, reviewSpecs); }
           catch (error) { state.error = String(error); delete state.plan; atomicWriteJson(receipt, state); }
         }
       }
