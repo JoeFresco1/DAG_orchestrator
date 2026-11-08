@@ -24,6 +24,10 @@ usage: dag <cmd> [flags]
   reliable continue --config F --reason R [--release task_a] [--hours N]
                                renew an authorized window; retain incidents and retries
 
+  crash-certify [--report F] [--campaign-id ID] [--max-boundaries N]
+                               kill a disposable local Flow 3 Git fixture at all six boundaries
+                               resume an interrupted report with the same --report path
+
   neutral-run --file request.json
                                execute a legacy-shaped task graph via neutral v1
 
