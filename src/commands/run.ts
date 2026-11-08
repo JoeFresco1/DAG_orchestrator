@@ -9,6 +9,7 @@ import {
   loadRun,
   orphanedPids,
   recoverInterrupted,
+  resolveAmbiguousAttempt,
   retryFailed,
   retryTask,
   renewTaskExecutionBudget,
@@ -237,19 +238,28 @@ export function resumeCmd(argv: string[]): void {
   guard(file, argv);
   const run = loadRun(file);
   const recovery = recoverInterrupted(run);
+  const resolveId = flag(argv, 'resolve-ambiguous');
+  if (resolveId !== undefined) {
+    const resolution = flag(argv, 'resolution');
+    if (resolution !== 'safe-to-repeat') throw new Error('--resolution must be safe-to-repeat when resolving ambiguous work');
+    resolveAmbiguousAttempt(run, resolveId, flagRequired(argv, 'reason'));
+    recovery.ambiguous = (recovery.ambiguous ?? []).filter(id => id !== resolveId);
+    recovery.resolved = [...(recovery.resolved ?? []), resolveId];
+  }
   saveRun(run, file);
   if (has(argv, 'kill-orphans')) {
     const killed = killOrphans(run);
     saveRun(run, file);
     console.log(`killed ${killed.filter((k) => k.killed).length} orphan process(es)`);
   }
-  if (recovery.requeued.length === 0) {
+  if (recovery.requeued.length === 0 && !(recovery.ambiguous?.length) && !(recovery.resolved?.length)) {
     emit(argv, recovery, () => 'nothing to recover');
   } else {
     emit(argv, recovery, () => {
-      const lines = [
-        `requeued ${recovery.requeued.length} interrupted task(s): ${recovery.requeued.join(', ')}`,
-      ];
+      const lines: string[] = [];
+      if (recovery.requeued.length) lines.push(`requeued ${recovery.requeued.length} pre-dispatch task(s): ${recovery.requeued.join(', ')}`);
+      if (recovery.ambiguous?.length) lines.push(`held ${recovery.ambiguous.length} ambiguous task(s) for explicit resolution: ${recovery.ambiguous.join(', ')}`);
+      if (recovery.resolved?.length) lines.push(`resolved ${recovery.resolved.length} ambiguous task(s) as safe-to-repeat: ${recovery.resolved.join(', ')}`);
       if (recovery.orphanPids.length > 0) {
         lines.push(
           `possible orphan pid(s): ${recovery.orphanPids.join(', ')} — run 'dag kill-orphans' to kill them`,

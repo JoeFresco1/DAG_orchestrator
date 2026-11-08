@@ -637,6 +637,7 @@ function normalizeTask(raw: Partial<Task>, run: Run, index: number): Task {
     integrationQueuedAt: raw.integrationQueuedAt,
     reviewSourceCommit: raw.reviewSourceCommit,
     phaseHistory: raw.phaseHistory,
+    dispatchHistory: raw.dispatchHistory ?? [],
     milestones: raw.milestones,
     lastRejection: raw.lastRejection ?? null,
     model: raw.model ?? null,
@@ -1044,6 +1045,10 @@ export function retryTask(run: Run, id: string, cascade = false): string[] {
   const task = run.tasks[id];
   if (!task) throw new Error(`unknown task ${id}`);
   if (task.status === 'running') throw new Error(`task ${id} is running; stop the run first`);
+  const retryTargets = [task, ...(cascade ? Object.values(run.tasks).filter(other => other.id !== id &&
+    (other.status === 'failed' || other.status === 'skipped') && isDescendant(run, other.id, id, new Set())) : [])];
+  const ambiguous = retryTargets.find(target => unresolvedAmbiguousDispatch(target));
+  if (ambiguous) throw new Error(`task ${ambiguous.id} has ambiguous external work; resolve it with dag resume --resolve-ambiguous ${ambiguous.id} --resolution safe-to-repeat --reason <reason>`);
   const touched: string[] = [];
   const requeue = (t: Task): void => {
     // Landing failures resume verified source; other retries redo implementation.
@@ -1119,6 +1124,8 @@ export function retryFailed(run: Run, cascade = false): string[] {
   const failed = Object.values(run.tasks)
     .filter((t) => t.status === 'failed' || t.status === 'skipped')
     .map((t) => t.id);
+  const ambiguous = failed.map(id => run.tasks[id]).find(task => unresolvedAmbiguousDispatch(task));
+  if (ambiguous) throw new Error(`task ${ambiguous.id} has ambiguous external work; resolve it with dag resume --resolve-ambiguous ${ambiguous.id} --resolution safe-to-repeat --reason <reason>`);
   const touched = new Set<string>();
   for (const id of failed) {
     for (const t of retryTask(run, id, cascade)) touched.add(t);
@@ -1134,26 +1141,94 @@ export function retryFailed(run: Run, cascade = false): string[] {
 export interface RecoveryResult {
   requeued: string[];
   orphanPids: number[];
+  ambiguous?: string[];
+  resolved?: string[];
 }
 
-// Anything still 'running' after a restart cannot be running: our process
-// never started it. Requeue and report pids for orphan cleanup.
+/** Return the latest unresolved ambiguous Flow 3 dispatch, if any. */
+export function unresolvedAmbiguousDispatch(task: Task) {
+  for (let index = (task.dispatchHistory?.length ?? 0) - 1; index >= 0; index--) {
+    const dispatch = task.dispatchHistory![index];
+    if (dispatch.disposition === 'ambiguous') return dispatch;
+  }
+  return undefined;
+}
+
+/** Record the operator's explicit decision to repeat a possibly applied command. */
+export function resolveAmbiguousAttempt(run: Run, id: string, reason: string): void {
+  const task = run.tasks[id];
+  if (!task) throw new Error(`unknown task ${id}`);
+  const dispatch = unresolvedAmbiguousDispatch(task);
+  if (!dispatch) throw new Error(`task ${id} has no unresolved ambiguous work attempt`);
+  if (!reason.trim()) throw new Error('ambiguous recovery requires an explicit --reason');
+  dispatch.disposition = 'resolved';
+  dispatch.resolution = 'safe-to-repeat';
+  dispatch.resolvedAt = new Date().toISOString();
+  dispatch.resolutionReason = reason.trim();
+  task.status = 'pending';
+  task.failureKind = null;
+  task.finishedAt = null;
+  task.result = `Attempt ${dispatch.attempt} explicitly resolved safe-to-repeat: ${reason.trim()}`;
+  task.pid = null;
+  logEvent(run, 'note', id, `ambiguous attempt ${dispatch.attempt} resolved safe-to-repeat: ${reason.trim()}`);
+  touch(run);
+}
+
+// Anything still 'running' after a restart cannot be running. Requeue attempts
+// with no dispatched work; hold dispatched work whose result was not captured.
 export function recoverInterrupted(run: Run): RecoveryResult {
   const requeued: string[] = [];
   const orphanPids: number[] = [];
+  const ambiguous: string[] = [];
   for (const task of Object.values(run.tasks)) {
+    const latestDispatch = task.dispatchHistory?.at(-1);
+    const legacyInterrupted = run.settings.executionProfile === 'flow3' && task.attempts > 0 &&
+      !task.nodeState?.candidate && latestDispatch?.attempt !== task.attempts &&
+      (task.status === 'running' || (task.status === 'pending' && ['interrupted', 'killed'].includes(task.failureKind ?? '')));
+    if (legacyInterrupted) {
+      (task.dispatchHistory ??= []).push({
+        attempt: task.attempts,
+        attemptId: `legacy-recovery-${randomUUID()}`,
+        disposition: 'ambiguous',
+        createdAt: task.startedAt ?? new Date().toISOString(),
+        recoveredAsAmbiguous: 'legacy-missing-dispatch-record',
+      });
+    }
+    const pendingDispatch = unresolvedAmbiguousDispatch(task);
+    if (pendingDispatch && task.status !== 'completed') {
+      if (task.status === 'running') {
+        if (task.pid) orphanPids.push(task.pid);
+        task.pid = null;
+        task.status = 'failed';
+        task.failureKind = 'manual';
+        task.finishedAt = new Date().toISOString();
+        task.result = `Ambiguous external work from attempt ${pendingDispatch.attempt}; result was not captured. Resolve explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.`;
+        const cause = pendingDispatch.recoveredAsAmbiguous ? 'legacy attempt has no dispatch record' : 'dispatched work has no captured result';
+        logEvent(run, 'task-interrupted', task.id, `attempt ${pendingDispatch.attempt}: ${cause}; held for explicit resolution`);
+      } else if (task.status === 'pending') {
+        task.status = 'failed';
+        task.failureKind = 'manual';
+        task.finishedAt = new Date().toISOString();
+        task.result = `Ambiguous external work from attempt ${pendingDispatch.attempt}; result was not captured. Resolve explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.`;
+        logEvent(run, 'task-interrupted', task.id, `attempt ${pendingDispatch.attempt} remains held for explicit resolution`);
+      }
+      ambiguous.push(task.id);
+      continue;
+    }
     if (task.status !== 'running') continue;
     if (task.pid) orphanPids.push(task.pid);
     task.pid = null;
+    task.finishedAt = new Date().toISOString();
     task.status = 'pending';
     task.failureKind = 'interrupted';
-    task.result = 'interrupted (process died); requeued';
-    task.finishedAt = new Date().toISOString();
+    const preDispatch = run.settings.executionProfile === 'flow3' && latestDispatch?.attempt === task.attempts &&
+      latestDispatch.disposition === 'not-dispatched';
+    task.result = preDispatch ? 'interrupted (process died before work dispatch); requeued' : 'interrupted (process died); requeued';
     requeued.push(task.id);
-    logEvent(run, 'task-interrupted', task.id, `was running at startup; requeued`);
+    logEvent(run, 'task-interrupted', task.id, preDispatch ? `was running before work dispatch; requeued` : `was running at startup; requeued`);
   }
-  if (requeued.length > 0) touch(run);
-  return { requeued, orphanPids };
+  if (requeued.length > 0 || ambiguous.length > 0) touch(run);
+  return { requeued, orphanPids, ambiguous };
 }
 
 // Every recorded pid is from a process this run no longer owns: a live runner

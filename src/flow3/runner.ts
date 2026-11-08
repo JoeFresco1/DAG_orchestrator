@@ -2,7 +2,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, symlinkSync, write
 import { dirname, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
-import { addTask, acquireLock, attemptLogPath, atomicWriteJson, heartbeatPath, lockHeldBy, logEvent, recoverInterrupted, runPaths } from '../store.js';
+import { addTask, acquireLock, attemptLogPath, atomicWriteJson, heartbeatPath, lockHeldBy, logEvent, recoverInterrupted, runPaths, unresolvedAmbiguousDispatch } from '../store.js';
 import { commitAll, createTaskWorktree, ensureIntegrationWorktree, git, isGitRepo, removeWorktree, restorePendingWork, snapshotExcludes } from '../git-worktree.js';
 import { depsMet, describeDeps, gateBlocks } from '../graph.js';
 import { planAttempt } from '../harness-chain.js';
@@ -62,7 +62,7 @@ export class FlowRunner {
   private budgetReached = false;
   private deadline = 0;
   private logBytes = new Map<string, number>();
-  private recovery = { requeued: [] as string[], orphanPids: [] as number[] };
+  private recovery = { requeued: [] as string[], orphanPids: [] as number[], ambiguous: [] as string[] };
 
   constructor(readonly state: Run, private opts: Options, private ownedFiles: Set<string>) {
     this.repo = resolve(opts.cwd ?? (opts.file ? dirname(opts.file) : process.cwd()));
@@ -142,7 +142,8 @@ export class FlowRunner {
       if (!graph.valid) throw Error(`Graph check failed: ${graph.errors.join('; ')}`);
       for (const edge of graph.addedEdges) this.event('edit', edge.consumer, `Added producer dependency ${edge.producer}`);
       for (const id of this.scope) if (!this.state.tasks[id].node) throw Error(`${id}: Flow 3.0 needs goal, touches, creates, relies_on and one verify command (dag edit --verify ...)`);
-      this.recovery = recoverInterrupted(this.state);
+      const recovery = recoverInterrupted(this.state);
+      this.recovery = { ...recovery, ambiguous: recovery.ambiguous ?? [] };
       if (!isGitRepo(this.repo)) throw Error('Flow 3.0 requires a Git repository for its worker pool and integration branch');
       this.integration = ensureIntegrationWorktree(this.repo, this.state.id, undefined, file ? snapshotExcludes(file, this.repo) : undefined);
       this.warmCaches(this.integration.path);
@@ -347,6 +348,8 @@ export class FlowRunner {
     this.active.add(task.id);
     const attemptLimit = Math.min(2, Math.max(1, task.maxAttempts));
     try {
+      const ambiguous = unresolvedAmbiguousDispatch(task);
+      if (ambiguous) throw failure(`Ambiguous external work from attempt ${ambiguous.attempt}; resolve it with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>`, 'manual');
       const saved = task.nodeState?.candidate;
       const priorRepair = task.nodeState?.repairContext;
       if (!checkpointRepair(task) && !saved && !task.nodeState?.repairBaseline && priorRepair && task.nodeState?.decision?.action === 'hold' &&
@@ -364,6 +367,7 @@ export class FlowRunner {
       let base = '';
       for (; task.attemptsInCycle < attemptLimit && !this.stopped();) {
         task.status = 'running'; task.attempts++; task.attemptsInCycle++;
+        (task.dispatchHistory ??= []).push({ attempt: task.attempts, attemptId: randomUUID(), phase: 'work', disposition: 'not-dispatched', createdAt: now() });
         task.startedAt = now(); task.finishedAt = null; task.failureKind = null; task.result = null;
         task.nodeState = { ...task.nodeState, worker: worker.path };
         if (!checkpointRepair(task)) delete task.nodeState.decision;
@@ -430,6 +434,8 @@ export class FlowRunner {
           return this.complete(task);
         } catch (error) {
           if (task.nodeState?.candidate) throw error; // landing is never an implementation retry
+          const ambiguous = unresolvedAmbiguousDispatch(task);
+          if (ambiguous) throw failure(`Ambiguous external work from attempt ${ambiguous.attempt}; result was not captured. Resolve it with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>`, 'manual');
           task.lastRejection = error instanceof Error ? error.message : String(error);
           task.failureKind = (error as { kind?: FailureKind }).kind ?? 'exit';
           if (this.isStopping) {
@@ -686,9 +692,19 @@ export class FlowRunner {
       }
       if (Date.now() - lastOutput >= idle) abort(failure(`${phase} stalled for ${idle}ms`, 'stalled'));
     }, Math.max(5, Math.min(1000, idle / 3)));
+    const externalPhase = ['setup', 'work', 'repair', 'resolve'].includes(phase) && !!this.state.tasks[observed.id] && observed.attempts > 0;
+    let dispatch = externalPhase
+      ? [...(observed.dispatchHistory ?? [])].reverse().find(record => record.attempt === observed.attempts && record.phase === phase)
+      : undefined;
+    if (externalPhase && !dispatch) {
+      dispatch = { attempt: observed.attempts, attemptId: randomUUID(), phase: phase as 'setup' | 'work' | 'repair' | 'resolve', disposition: 'not-dispatched', createdAt: now() };
+      (observed.dispatchHistory ??= []).push(dispatch);
+      this.save();
+    }
     const context: ExecContext = {
       ...tokens, cwd, executionProfile: 'lean', readOnly: phase === 'advisory' || phase === 'review', session: phase === 'work' ? worker?.session : undefined,
-      env: { DAG_FILE: this.opts.file ? resolve(this.opts.file) : undefined, DAG_RUN: this.state.id, DAG_TASK: observed.id, DAG_PHASE: phase },
+      env: { DAG_FILE: this.opts.file ? resolve(this.opts.file) : undefined, DAG_RUN: this.state.id, DAG_TASK: observed.id, DAG_PHASE: phase,
+        ...(dispatch ? { DAG_ATTEMPT_ID: dispatch.attemptId } : {}) },
       deps: describeDeps(this.state, observed),
       onOutput: chunk => {
         if (finished) return;
@@ -700,9 +716,22 @@ export class FlowRunner {
       setPid: pid => { if (!finished) { observed.pid = pid; this.save(); } },
     };
     let status = 'pass';
+    if (dispatch && dispatch.attempt === observed.attempts && dispatch.disposition === 'not-dispatched') {
+      dispatch.commandDigest = hash(command);
+      dispatch.disposition = 'ambiguous';
+      dispatch.dispatchedAt = now();
+      this.save();
+    }
     const execution = Promise.resolve().then(() => this.opts.executor(task, context, command)).finally(() => { settled = true; });
     try {
       const outcome = await Promise.race([execution, aborted]);
+      if (dispatch?.disposition === 'ambiguous') {
+        dispatch.disposition = 'captured';
+        dispatch.terminalAt = now();
+        dispatch.exitCode = outcome.exitCode;
+        dispatch.outputDigest = hash(outcome.output);
+        this.save();
+      }
       observed.exitCode = outcome.exitCode;
       if (['verify', 'checkpoint', 'integration', 'review'].includes(phase) && this.opts.file) {
         evidenceRef = join(runPaths(this.opts.file).dir, 'flow3', `check-${randomUUID()}.json`);
@@ -721,6 +750,12 @@ export class FlowRunner {
       }
       return { ...outcome, evidenceRef, artifacts: ['verify', 'checkpoint', 'integration'].includes(phase) ? evidenceArtifacts(command, this.settings, cwd) : undefined };
     } catch (error) {
+      if (dispatch?.disposition === 'ambiguous' && (error as { kind?: string }).kind === 'spawn') {
+        dispatch.disposition = 'captured';
+        dispatch.terminalAt = now();
+        dispatch.exitCode = null;
+        this.save();
+      }
       if (evidenceRef) Object.assign(error as object, { evidenceRef });
       status = (error as Error).message; finished = true;
       if (!settled) killOnce();
