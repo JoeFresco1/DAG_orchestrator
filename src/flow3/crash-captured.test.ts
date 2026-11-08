@@ -42,8 +42,8 @@ function fixture(title: string) {
 }
 
 function cli(file: string, command: 'resume' | 'run', ...args: string[]) {
-  const entry = resolve(process.cwd(), 'src/cli.ts');
-  const result = spawnSync(process.execPath, ['--import', 'tsx', entry, command, '--file', file, ...args, '--json'], {
+  const entry = resolve(process.cwd(), 'dist/cli.js');
+  const result = spawnSync(process.execPath, [entry, command, '--file', file, ...args, '--json'], {
     cwd: process.cwd(),
     encoding: 'utf8',
     timeout: 30_000,
@@ -152,9 +152,39 @@ test('resume safely requeues a pre-dispatch attempt and run executes it', () => 
   assert.equal(recovered.tasks.a.dispatchHistory?.[1].disposition, 'captured');
 });
 
+test('resume requeues captured non-zero work as a known failure, not ambiguous crash success', () => {
+  const f = fixture('captured known failure recovery');
+  const task = f.run.tasks.a;
+  task.status = 'running';
+  task.attempts = 1;
+  task.attemptsInCycle = 1;
+  task.dispatchHistory = [{
+    attempt: 1,
+    attemptId: 'attempt-known-failure',
+    phase: 'work',
+    disposition: 'captured',
+    createdAt: '2026-11-08T00:00:00.000Z',
+    dispatchedAt: '2026-11-08T00:00:01.000Z',
+    terminalAt: '2026-11-08T00:00:02.000Z',
+    exitCode: 23,
+    outputDigest: digest('known failure'),
+  }];
+  saveRun(f.run, f.file);
+
+  const resumed = cli(f.file, 'resume');
+  assert.equal(resumed.status, 0, resumed.stderr || resumed.stdout);
+  assert.deepEqual(JSON.parse(resumed.stdout).requeued, ['a']);
+  assert.deepEqual(JSON.parse(resumed.stdout).ambiguous, []);
+  const recovered = loadRun(f.file).tasks.a;
+  assert.equal(recovered.status, 'pending');
+  assert.equal(recovered.failureKind, 'interrupted');
+  assert.equal(recovered.dispatchHistory?.[0].disposition, 'captured');
+  assert.equal(recovered.dispatchHistory?.[0].exitCode, 23);
+});
+
 test('a live command with a captured failing exit is salvaged and remains retryable', () => {
   const f = fixture('captured known failure salvage');
-  f.run.tasks.a.cmd = `node -e "require('fs').writeFileSync('failed-output.txt','preserved');process.exit(23)"`;
+  f.run.tasks.a.cmd = `node -e "require('fs').writeFileSync('failed-output.txt','preserved');process.stdout.write('preserved');process.exit(23)"`;
   saveRun(f.run, f.file);
 
   const failed = cli(f.file, 'run', '--retries', '0');
@@ -180,6 +210,9 @@ test('a live command with a captured failing exit is salvaged and remains retrya
 
 test('a rejected repair keeps its repair hold instead of becoming captured-work ambiguity', async () => {
   const f = fixture('captured rejected repair');
+  f.run.tasks.a.cmd = 'work';
+  f.run.tasks.a.node!.verify = 'verify-a';
+  saveRun(f.run, f.file);
   f.run.settings.flow3 = { ...f.run.settings.flow3, nodeRepairRounds: 1, repairCommand: 'repair' };
   let works = 0;
   let repairs = 0;

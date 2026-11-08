@@ -1164,6 +1164,9 @@ export function unresolvedAmbiguousDispatch(task: Task, options: { includeCaptur
 
     if (attempt === task.attempts && latest.disposition === 'captured' && latest.phase === 'work' &&
       task.status !== 'completed' && !task.nodeState?.candidate) {
+      // A captured non-zero exit is a known command failure, not an uncertain
+      // successful side effect. Keep its normal failure/retry path available.
+      if (typeof latest.exitCode === 'number' && latest.exitCode !== 0) continue;
       const recoveredHold = task.status === 'failed' && task.failureKind === 'manual' &&
         /^Work result from attempt \d+ was captured, but no verified candidate was saved\./.test(task.result ?? '');
       if (recoveredHold) return latest;

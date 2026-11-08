@@ -554,8 +554,9 @@ export class FlowRunner {
   }
   private hasRecoverableVerifiedWork(task: Task): boolean {
     const state = task.nodeState as RecoverableNodeState | undefined;
+    if (!state || state.candidate) return false;
     const dispatch = task.dispatchHistory?.filter(record => record.attempt === task.attempts).at(-1);
-    return !state?.candidate && dispatch?.phase === 'work' && dispatch.disposition === 'captured' && dispatch.exitCode === 0 &&
+    return dispatch?.phase === 'work' && dispatch.disposition === 'captured' && dispatch.exitCode === 0 &&
       task.phaseHistory?.some(phase => phase.attempt === task.attempts && phase.phase === 'verify' && phase.outcome === 'pass') === true &&
       !!state.verificationEvidenceRef && existsSync(state.verificationEvidenceRef) &&
       !!state.worker && existsSync(state.worker);
