@@ -517,10 +517,15 @@ export class FlowRunner {
           return this.complete(task);
         } catch (error) {
           if (task.nodeState?.candidate) throw error; // landing is never an implementation retry
-          const ambiguous = unresolvedAmbiguousDispatch(task);
-          if (ambiguous) throw failure(`Ambiguous external work from attempt ${ambiguous.attempt}; result was not captured. Resolve it with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>`, 'manual');
           task.lastRejection = error instanceof Error ? error.message : String(error);
           task.failureKind = (error as { kind?: FailureKind }).kind ?? 'exit';
+          const ambiguous = unresolvedAmbiguousDispatch(task);
+          if (ambiguous) {
+            const kind = task.failureKind;
+            const infrastructureFailure: FailureKind = kind === 'timeout' || kind === 'stalled' || kind === 'spawn' ? kind : 'manual';
+            const diagnosis = task.lastRejection ? `; last failure: ${task.lastRejection}` : '';
+            throw failure(`Ambiguous external work from attempt ${ambiguous.attempt}; result was not captured${diagnosis}. Resolve it with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>`, infrastructureFailure);
+          }
           if (this.isStopping) {
             // A stopped, unverified worker is the only copy of its in-progress edits.
             // Leave it registered for explicit recovery rather than removing it in run cleanup.
