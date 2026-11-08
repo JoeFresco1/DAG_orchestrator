@@ -268,7 +268,8 @@ test('checkpoint prerequisites defer premature acceptance without executing it o
   const r = runner(f, async (task, ctx, cmd) => {
     if (cmd === 'work') writeFileSync(join(ctx.cwd!, task.id === 'producer' ? 'artifact.ts' : `${task.id}.txt`), 'ready');
     if (cmd === 'composed') {
-      if (ctx.env?.DAG_PHASE === 'verify') checks++; assert.equal(f.run.tasks.producer.status, 'completed');
+      checks++;
+      assert.equal(f.run.tasks.producer.status, 'completed');
       assert.equal(readFileSync(join(ctx.cwd!, 'artifact.ts'), 'utf8'), 'ready');
     }
     if (cmd === 'repair') repairs++;

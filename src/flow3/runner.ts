@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
@@ -16,6 +16,7 @@ import type { WorkerSession } from '../agent-session.js';
 import { safeRelativePath, PHASE_TIMEOUTS, type Candidate, type Checkpoint, type FlowSettings, type Phase, type RepairContext, type RepairIntent } from './contracts.js';
 import { acceptanceIdentity, completionScope, evidenceFailure, evidenceArtifacts } from './lifecycle.js';
 import { chainWaves, checkGraph, overlaps, promptFor } from './graph.js';
+import { snapshot, assertMarkerOnly } from './source-snapshot.js';
 import { checkScriptCommands, commandMentionsPath, protectedRepairPath, repairDecision } from './repair.js';
 
 interface Worker {
@@ -1061,28 +1062,5 @@ export class FlowRunner {
       result => { this.state.flowState!.advisory = { status: 'finished', output: tail(result.output, 8000) }; this.event('note', null, `Advisory plan review: ${tail(result.output, 2000)}`); },
       error => { this.state.flowState!.advisory = { status: 'warning', output: String(error) }; this.event('note', null, `Advisory plan review warning: ${String(error)}`); },
     );
-  }
-}
-
-/** Snapshot source identities only during conflict resolution, including new files. */
-function snapshot(path: string): Map<string, string> {
-  const names = git(path, ['ls-files', '-z', '--cached', '--others', '--exclude-standard']).stdout.split('\0').filter(Boolean);
-  return new Map([...new Set(names)].map(name => {
-    const file = join(path, name);
-    return [name, existsSync(file) ? lstatSync(file).isSymbolicLink() ? hash(readlinkSync(file)) : hash(readFileSync(file)) : '(deleted)'];
-  }));
-}
-function assertMarkerOnly(path: string, before: Map<string, string>, markers: Map<string, string>): void {
-  const after = snapshot(path);
-  for (const name of new Set([...before.keys(), ...after.keys()])) if (!markers.has(name) && before.get(name) !== after.get(name)) throw Error(`Resolver changed non-conflict file ${name}`);
-  for (const [name, original] of markers) {
-    const blocks = /^<<<<<<<[^\n]*\n[\s\S]*?^=======[^\n]*\n[\s\S]*?^>>>>>>>[^\n]*(?:\n|$)/gm;
-    const segments: string[] = []; let cursor = 0, match: RegExpExecArray | null;
-    while ((match = blocks.exec(original))) { segments.push(original.slice(cursor, match.index)); cursor = match.index + match[0].length; }
-    segments.push(original.slice(cursor));
-    if (segments.length < 2) throw Error(`Cannot resolve ${name}: no text conflict markers`);
-    const escaped = segments.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-    const resolved = readFileSync(join(path, name), 'utf8');
-    if (!new RegExp(`^${escaped.join('[\\s\\S]*?')}$`).test(resolved) || /^(?:<<<<<<<|=======|>>>>>>>)/m.test(resolved)) throw Error(`Resolver changed text outside marker blocks in ${name}`);
   }
 }
