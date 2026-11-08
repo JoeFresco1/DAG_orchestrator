@@ -494,7 +494,8 @@ export class FlowRunner {
             }
           }
           (task.milestones ??= {}).implementedAt = now();
-          if (!await this.verifyNode(task, worker, cmd, base)) return false;
+          const verification = await this.verifyNode(task, worker, cmd, base);
+          if (!verification) return false;
           if (checkpointRepair(task)) for (const command of this.verificationCommands(task).filter(command => command !== task.node!.verify)) {
             await this.phase(task, 'verify', command, worker.path, worker);
           }
@@ -504,10 +505,10 @@ export class FlowRunner {
           const branch = `dag-node/${this.state.id}-${task.id}-${task.attempts}`;
           const pin = git(this.repo, ['branch', branch, commit]);
           if (pin.code) throw failure(`Cannot preserve verified candidate: ${pin.stderr}`, 'integration');
-          if (this.crashProbe) await this.afterDurableBoundary('commit', task, `refs/heads/${branch}`);
           task.branch = branch; task.commit = commit; task.result = tail(output.output);
-          const candidate: Candidate = { commit, base, attempt: task.attempts, definition: definition(task) };
+          const candidate = this.verifiedCandidate(task, commit, base, verification.evidenceRef);
           task.nodeState.candidate = candidate; task.nodeState.session = worker.session.id;
+          if (this.crashProbe) await this.afterDurableBoundary('commit', task, `refs/heads/${branch}`);
           this.save(); // recover this verified source after a crash, without rerunning implementation
           await this.land(task, candidate);
           return this.complete(task);
@@ -615,8 +616,12 @@ export class FlowRunner {
     const reset = git(worker.path, ['reset', '--hard', commit]);
     if (reset.code) throw failure(`Cannot restore recovered source: ${reset.stderr}`, 'integration');
     task.status = 'running'; this.save();
+    let verification: CheckOutcome | undefined;
     for (const command of this.verificationCommands(task)) {
-      try { await this.phase(task, 'verify', command, worker.path, worker); }
+      try {
+        const checked = await this.phase(task, 'verify', command, worker.path, worker);
+        if (command === task.node!.verify) verification = checked;
+      }
       catch (error) {
         saved!.decision = repairDecision(this.state, { command, output: String(error), phase: 'verify' });
         this.save(); throw error;
@@ -626,7 +631,7 @@ export class FlowRunner {
     const pinned = git(this.repo, ['branch', '-f', branch, commit]);
     if (pinned.code) throw failure(`Cannot pin recovered candidate: ${pinned.stderr}`, 'integration');
     task.branch = branch; task.commit = commit;
-    const candidate: Candidate = { commit, base: baseline.head, attempt: task.attempts, definition: definition(task) };
+    const candidate = this.verifiedCandidate(task, commit, baseline.head, verification?.evidenceRef);
     saved!.candidate = candidate; this.save();
     await this.land(task, candidate);
     removeWorktree(this.repo, path);
@@ -637,13 +642,13 @@ export class FlowRunner {
     return [...new Set([task.node!.verify, ...(context?.verification ?? []).filter(command =>
       context?.owners.some(id => this.state.tasks[id]?.status === 'completed' && this.state.tasks[id].node?.verify === command))])];
   }
-  private async verifyNode(task: Task, worker: Worker, workCommand: string, base: string): Promise<boolean> {
+  private async verifyNode(task: Task, worker: Worker, workCommand: string, base: string): Promise<CheckOutcome | false> {
     for (;;) {
       let failedCommand = task.node!.verify;
       try {
-        await this.phase(task, 'verify', task.node!.verify, worker.path, worker);
+        const primary = await this.phase(task, 'verify', task.node!.verify, worker.path, worker);
         if (!checkpointRepair(task)) for (const command of this.verificationCommands(task)) if (command !== task.node!.verify) { failedCommand = command; await this.phase(task, 'verify', command, worker.path, worker); }
-        delete task.nodeState!.decision; return true;
+        delete task.nodeState!.decision; return primary;
       }
       catch (error) {
         const output = error instanceof Error ? error.message : String(error);
@@ -731,6 +736,74 @@ export class FlowRunner {
     (task.milestones ??= {}).integratedAt = now();
     this.event('task-done', task.id, `Verified and integrated ${task.diffHead}`); this.save();
     return true;
+  }
+
+  /** Bind the successful node verifier's actual sidecar record to this saved candidate. */
+  private verifiedCandidate(task: Task, commit: string, base: string, evidenceRef?: string): Candidate {
+    if (!this.opts.file || !evidenceRef) throw failure('Cannot accept a Flow 3 node without durable verification evidence in its run sidecar', 'integration');
+    const evidencePath = resolve(evidenceRef);
+    const evidenceDirectory = resolve(runPaths(this.opts.file).dir, 'flow3');
+    if (resolve(dirname(evidencePath)) !== evidenceDirectory) throw failure('Verification evidence is outside the run sidecar', 'integration');
+    let record: Record<string, unknown>;
+    try { record = JSON.parse(readFileSync(evidencePath, 'utf8')) as Record<string, unknown>; }
+    catch (error) { throw failure(`Cannot read successful verification evidence: ${String(error)}`, 'integration'); }
+    if (record.task !== task.id || record.phase !== 'verify' || record.runId !== this.state.id ||
+        record.command !== task.node?.verify || record.exitCode !== 0) {
+      throw failure('Successful verification evidence does not identify this run, node and verify phase', 'integration');
+    }
+    const attemptId = [...(task.dispatchHistory ?? [])].reverse().find(dispatch =>
+      dispatch.attempt === task.attempts && dispatch.phase === 'work')?.attemptId;
+    if (!attemptId) throw failure('Cannot bind verification evidence to the accepted work attempt', 'integration');
+    const definitionDigest = definition(task);
+    atomicWriteJson(evidencePath, {
+      ...record,
+      runId: this.state.id,
+      task: task.id,
+      phase: 'verify',
+      attempt: task.attempts,
+      attemptId,
+      definitionDigest,
+      sourceCommit: commit,
+      candidateCommit: commit,
+    });
+    const candidate: Candidate = {
+      commit,
+      base,
+      attempt: task.attempts,
+      attemptId,
+      definition: definitionDigest,
+      evidenceRef: evidencePath,
+      evidenceHash: hash(readFileSync(evidencePath)),
+    };
+    this.assertCandidateEvidence(task, candidate);
+    return candidate;
+  }
+
+  /** Fail closed if a saved candidate's evidence bytes or attribution changed during recovery. */
+  private assertCandidateEvidence(task: Task, candidate: Candidate): void {
+    if (!this.opts.file || !candidate.evidenceRef || !candidate.evidenceHash || !candidate.attemptId) {
+      throw failure('Saved candidate has no durable verification evidence attribution', 'integration');
+    }
+    const evidencePath = resolve(candidate.evidenceRef);
+    const evidenceDirectory = resolve(runPaths(this.opts.file).dir, 'flow3');
+    if (resolve(dirname(evidencePath)) !== evidenceDirectory) throw failure('Saved candidate evidence is outside the run sidecar', 'integration');
+    let bytes: Buffer, record: Record<string, unknown>;
+    try {
+      bytes = readFileSync(evidencePath);
+      record = JSON.parse(bytes.toString('utf8')) as Record<string, unknown>;
+    } catch (error) { throw failure(`Saved candidate verification evidence is unavailable: ${String(error)}`, 'integration'); }
+    if (hash(bytes) !== candidate.evidenceHash) throw failure('Saved candidate verification evidence hash does not match', 'integration');
+    const dispatch = task.dispatchHistory?.find(item => item.attemptId === candidate.attemptId);
+    if (!dispatch || dispatch.attempt !== candidate.attempt || dispatch.phase !== 'work') {
+      throw failure('Saved candidate verification evidence references a different work attempt', 'integration');
+    }
+    if (record.runId !== this.state.id || record.task !== task.id || record.phase !== 'verify' ||
+        record.command !== task.node?.verify || record.exitCode !== 0 ||
+        record.attempt !== candidate.attempt || record.attemptId !== candidate.attemptId ||
+        record.definitionDigest !== candidate.definition || record.sourceCommit !== candidate.commit ||
+        record.candidateCommit !== candidate.commit) {
+      throw failure('Saved candidate verification evidence attribution does not match its attempt, definition and source commit', 'integration');
+    }
   }
 
   private async phase(task: Task, phase: Phase, command: string, cwd: string, worker?: Worker, observed = task, tokens: Partial<ExecContext> = {}): Promise<CheckOutcome> {
@@ -821,7 +894,7 @@ export class FlowRunner {
       observed.exitCode = outcome.exitCode;
       if (['verify', 'checkpoint', 'integration', 'review'].includes(phase) && this.opts.file) {
         evidenceRef = join(runPaths(this.opts.file).dir, 'flow3', `check-${randomUUID()}.json`);
-        atomicWriteJson(evidenceRef, { task: task.id, phase, command, startedAt: new Date(started).toISOString(),
+        atomicWriteJson(evidenceRef, { runId: this.state.id, task: task.id, phase, command, startedAt: new Date(started).toISOString(),
           finishedAt: now(), source: checkedSource?.head ?? git(cwd, ['rev-parse', 'HEAD']).stdout,
           exitCode: outcome.exitCode, output: outcome.output, outputDigest: hash(outcome.output) });
       }
@@ -885,8 +958,14 @@ export class FlowRunner {
     const queued = Date.now();
     const land = async () => {
       if (this.stopped()) throw failure('Stopped before landing', 'killed');
+      this.assertCandidateEvidence(task, candidate);
       const path = this.integration!.path;
       task.diffBase = git(path, ['rev-parse', 'HEAD']).stdout;
+      if (candidate.integratedCommit &&
+          (git(path, ['merge-base', '--is-ancestor', candidate.commit, candidate.integratedCommit]).code !== 0 ||
+           git(path, ['merge-base', '--is-ancestor', candidate.integratedCommit, 'HEAD']).code !== 0)) {
+        throw failure('Saved candidate integration commit is no longer present in the integration history', 'integration');
+      }
       // A crash after merge but before completion cannot cost another implementation attempt.
       if (git(path, ['merge-base', '--is-ancestor', candidate.commit, 'HEAD']).code !== 0) {
         const result = git(path, ['-c', 'user.name=DAG Orchestrator', '-c', 'user.email=dag@localhost', '-c', 'core.hooksPath=', 'merge', '--no-ff', '--no-commit', candidate.commit], undefined, this.settings.phaseTimeouts?.land ?? PHASE_TIMEOUTS.land);
@@ -916,7 +995,9 @@ export class FlowRunner {
         }
         catch (error) { git(path, ['merge', '--abort']); throw failure(String(error), 'merge'); }
       }
-      task.diffHead = git(path, ['rev-parse', 'HEAD']).stdout;
+      task.diffHead = candidate.integratedCommit ?? git(path, ['rev-parse', 'HEAD']).stdout;
+      candidate.integratedCommit ??= task.diffHead;
+      task.nodeState!.candidate = candidate;
       this.save();
       if (this.crashProbe) await this.afterDurableBoundary('merge', task, task.diffHead);
     };

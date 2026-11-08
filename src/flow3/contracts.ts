@@ -102,6 +102,13 @@ export interface Candidate {
   base: string;
   attempt: number;
   definition: string;
+  /** The work dispatch whose successful local verification accepted this source. */
+  attemptId: string;
+  /** Durable verifier JSON in the run sidecar and its exact on-disk SHA-256. */
+  evidenceRef: string;
+  evidenceHash: string;
+  /** Integration commit containing this candidate; written before task completion. */
+  integratedCommit?: string;
 }
 export interface NodeState {
   candidate?: Candidate;
