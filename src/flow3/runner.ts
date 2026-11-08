@@ -520,18 +520,23 @@ export class FlowRunner {
           task.lastRejection = error instanceof Error ? error.message : String(error);
           task.failureKind = (error as { kind?: FailureKind }).kind ?? 'exit';
           const ambiguous = unresolvedAmbiguousDispatch(task);
+          if (this.isStopping) {
+            // Keep the only copy of unverified edits available after a stop.
+            // The unresolved dispatch remains held by the store until explicit reconciliation.
+            worker.tainted = true;
+            task.status = 'pending'; task.finishedAt = now(); task.pid = null;
+            task.result = `Stopped; unverified source preserved at ${worker.path}${ambiguous ? `; external work from attempt ${ambiguous.attempt} remains ambiguous pending explicit reconciliation` : ''}`;
+            return false;
+          }
           if (ambiguous) {
+            // An ambiguous external effect may still have produced useful source
+            // edits. Preserve its worker for inspection even when the run itself
+            // did not receive a stop request.
+            worker.tainted = true;
             const kind = task.failureKind;
             const infrastructureFailure: FailureKind = kind === 'timeout' || kind === 'stalled' || kind === 'spawn' ? kind : 'manual';
             const diagnosis = task.lastRejection ? `; last failure: ${task.lastRejection}` : '';
             throw failure(`Ambiguous external work from attempt ${ambiguous.attempt}; result was not captured${diagnosis}. Resolve it with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>`, infrastructureFailure);
-          }
-          if (this.isStopping) {
-            // A stopped, unverified worker is the only copy of its in-progress edits.
-            // Leave it registered for explicit recovery rather than removing it in run cleanup.
-            worker.tainted = true;
-            task.status = 'pending'; task.result = `Stopped; unverified source preserved at ${worker.path}`;
-            return false;
           }
           try {
             const saved = commitAll(worker.path, `dag: failed ${task.id} attempt ${task.attempts}`, this.settings.cachePaths ?? ['node_modules', '.venv']);
