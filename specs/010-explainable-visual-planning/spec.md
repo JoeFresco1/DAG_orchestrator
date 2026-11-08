@@ -84,6 +84,9 @@ A maintainer picks a template for a common coding workflow (for example, spec â†
 - **FR-007**: The system MUST NOT introduce a separate workflow format or a second graph representation that the runner reads directly; templates are an input to the existing manifest path.
 - **FR-008**: Viewer-initiated graph edits MUST be refused while a run is active, with the refusal naming the lock holder, and MUST otherwise follow the existing stopped-amendment rules; edits MUST NOT bypass the run file lock.
 - **FR-009**: Graph editing MUST remain optional: the run is fully operable (inspect, explain, compile, amend) without ever entering an edit mode.
+- **FR-010**: Before launch, show dependency composition and overlapping file ownership between independent tasks, including an explicit result when no overlaps are detected.
+- **FR-011**: For a failed integrated checkpoint, expose the check, its evidence and any supported producer attribution with the producers' acceptance status. Report unknown attribution rather than guessing.
+- **FR-012**: Distinguish per-node verification from wave and final integration checks, and do not present a local pass as proof that the integrated product passes.
 
 ### Key Entities
 
@@ -101,6 +104,8 @@ A maintainer picks a template for a common coding workflow (for example, spec â†
 - **SC-003**: 100% of templates either produce a manifest that passes the CLI's existing validation unchanged or fail with the same validation errors the CLI reports; zero template-specific acceptance paths exist.
 - **SC-004**: 100% of graph edit attempts made while a run is active are refused with the lock holder named, and inspection of the run file afterward shows zero edits applied.
 - **SC-005**: 100% of evidence links and budget figures that lack underlying data are explicitly marked unavailable in the viewer and CLI rather than being omitted or shown as zero.
+- **SC-006**: A pre-launch preview identifies shared paths between independent tasks and explicitly reports when no overlap is detected.
+- **SC-007**: A failed integrated checkpoint displays its check and evidence, distinguishes local results, and either identifies supported producers with their acceptance status or marks attribution unknown.
 
 ## Assumptions
 
