@@ -161,6 +161,39 @@ Suggestions never mutate an executing graph or gate startup. Deterministic
 producer-edge corrections are applied by admission; scope splitting remains a
 planning operation. No additional review is launched after each node.
 
+## Crash recovery and certification
+
+Starting `dag run --file run.json` calls Flow 3 recovery before dispatch. It
+requeues a task known not to have reached work dispatch, resumes saved verified
+candidates, and continues final acceptance. `dag resume --file run.json` records
+recovery state but does not dispatch work; follow it with `dag run` when you want
+the run to continue. If recorded worker PIDs may still be alive, use
+`dag kill-orphans --file run.json` before recovery clears those PIDs.
+
+A dispatched command with no captured terminal result is held as ambiguous. A
+captured work result without a saved verified candidate is also held. Neither is
+silently dispatched again. After inspecting the possible external effect, an
+operator who confirms that repeating the command is safe can record that decision:
+
+```sh
+dag resume --file run.json --resolve-ambiguous node-id \
+  --resolution safe-to-repeat --reason "Why repeating this command is safe"
+dag run --file run.json
+```
+
+The current CLI supports only `safe-to-repeat`; it has no `observed-applied`
+resolution for accepting an external effect that already happened. Keep the task
+held for explicit intervention when repeating it is not known to be safe. This
+protocol records a human decision. It does not provide exactly-once execution for
+arbitrary external commands.
+
+Run the local hard-kill campaign with `dag crash-certify`. It creates disposable
+Git/run fixtures, kills a child Flow 3 process at six durable boundaries, recovers
+through `dag resume` and `dag run`, and writes a coverage report. It does not run
+commands from the current run file. The [crash certification guide](build/crash-certification.md)
+documents prerequisites, report interpretation, the precise boundary seams and
+the campaign's limits.
+
 ## Checkpoints and repairs
 
 `waveChecks` contains build/typecheck commands. `finalChecks` contains full tests,
