@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
@@ -28,7 +28,60 @@ interface Worker {
   session: WorkerSession;
 }
 type CheckOutcome = ExecOutcome & { evidenceRef?: string; artifacts?: Record<string, string> };
-type Options = RunnerOptions & { executor: Executor };
+export const CRASH_BOUNDARIES = ['worker-launch', 'result-capture', 'verdict-persistence', 'commit', 'merge', 'finalization'] as const;
+export type CrashBoundary = typeof CRASH_BOUNDARIES[number];
+export interface CrashBoundaryEvent {
+  runId: string;
+  taskId?: string;
+  attemptId?: string;
+  attempt: number;
+  durableRef?: string;
+  at: string;
+}
+export interface FlowCrashProbe {
+  afterDurableBoundary(boundary: CrashBoundary, event: CrashBoundaryEvent): Promise<void>;
+}
+type Options = RunnerOptions & { executor: Executor; crashProbe?: FlowCrashProbe };
+
+const isCrashBoundary = (value: string | undefined): value is CrashBoundary =>
+  !!value && (CRASH_BOUNDARIES as readonly string[]).includes(value);
+
+/** Explicit local test barrier. No marker path means no hook, even if a boundary is named. */
+function localTestCrashProbe(): FlowCrashProbe | undefined {
+  const selected = process.env.DAG_FLOW3_TEST_CRASH_BOUNDARY;
+  const readyFile = process.env.DAG_FLOW3_TEST_CRASH_READY_FILE;
+  if (!isCrashBoundary(selected) || !readyFile) return undefined;
+  const readyPath = resolve(readyFile);
+  const releasePath = resolve(process.env.DAG_FLOW3_TEST_CRASH_RELEASE_FILE ?? `${readyPath}.release`);
+  let published = false;
+  return {
+    async afterDurableBoundary(boundary, event) {
+      if (published || boundary !== selected) return;
+      published = true;
+      mkdirSync(dirname(readyPath), { recursive: true });
+      if (existsSync(readyPath)) throw Error(`Crash probe ready file already exists: ${readyPath}`);
+      const temporary = `${readyPath}.tmp-${process.pid}-${randomUUID()}`;
+      writeFileSync(temporary, JSON.stringify({ boundary, ...event }), { flag: 'wx' });
+      try {
+        renameSync(temporary, readyPath);
+      } catch (error) {
+        rmSync(temporary, { force: true });
+        throw error;
+      }
+      // The parent observes the atomically published event and either kills this
+      // process or writes the release file to let the run continue.
+      await new Promise<void>(resolveRelease => {
+        const poll = setInterval(() => {
+          if (existsSync(releasePath)) {
+            clearInterval(poll);
+            resolveRelease();
+          }
+        }, 25);
+      });
+    },
+  };
+}
+
 const now = () => new Date().toISOString();
 const tail = (text: string, max = 4000) => text.slice(-max);
 const hash = (text: string | Buffer) => createHash('sha256').update(text).digest('hex');
@@ -55,6 +108,7 @@ export class FlowRunner {
   private cancelAdvisory?: () => void;
   private repo: string;
   private settings: FlowSettings;
+  private crashProbe?: FlowCrashProbe;
   private scope = new Set<string>();
   private finalCheckpointId?: string;
   private explicitSelection = false;
@@ -67,6 +121,7 @@ export class FlowRunner {
   constructor(readonly state: Run, private opts: Options, private ownedFiles: Set<string>) {
     this.repo = resolve(opts.cwd ?? (opts.file ? dirname(opts.file) : process.cwd()));
     this.settings = state.settings.flow3 ?? {};
+    this.crashProbe = opts.crashProbe ?? localTestCrashProbe();
   }
   get current(): string[] { return [...this.active]; }
 
@@ -232,9 +287,32 @@ export class FlowRunner {
       this.isRunning = false;
       this.isStopping = false;
       if (owns || !file) this.event('run-end', null, `Flow 3.0 ${passed ? 'passed' : 'incomplete'}; ${this.result.completed.length} complete, ${this.result.failed.length} failed, ${this.result.unfinished.length} blocked/pending`);
-      try { if (owns || !file) this.save(); }
-      finally { release?.(); if (owns && file) this.ownedFiles.delete(file); }
+      try {
+        if (owns || !file) {
+          this.save();
+          const durableRef = file ? runPaths(file).state : undefined;
+          if (this.crashProbe) await this.afterDurableBoundary('finalization', undefined, durableRef);
+        }
+      } finally {
+        release?.(); if (owns && file) this.ownedFiles.delete(file);
+      }
     }
+  }
+
+  private async afterDurableBoundary(boundary: CrashBoundary, task?: Task, durableRef?: string, attemptId?: string): Promise<void> {
+    const probe = this.crashProbe;
+    if (!probe) return;
+    const dispatch = task?.dispatchHistory?.slice().reverse().find(record =>
+      record.attempt === task.attempts && (!attemptId || record.attemptId === attemptId) && record.phase === 'work');
+    const selectedAttemptId = attemptId ?? dispatch?.attemptId;
+    await probe.afterDurableBoundary(boundary, {
+      runId: this.state.id,
+      ...(task ? { taskId: task.id } : {}),
+      ...(selectedAttemptId ? { attemptId: selectedAttemptId } : {}),
+      attempt: task?.attempts ?? 0,
+      ...(durableRef ? { durableRef } : {}),
+      at: now(),
+    });
   }
 
   /** v2 source contracts remain available, but their expensive gates no longer own dispatch. */
@@ -426,6 +504,7 @@ export class FlowRunner {
           const branch = `dag-node/${this.state.id}-${task.id}-${task.attempts}`;
           const pin = git(this.repo, ['branch', branch, commit]);
           if (pin.code) throw failure(`Cannot preserve verified candidate: ${pin.stderr}`, 'integration');
+          if (this.crashProbe) await this.afterDurableBoundary('commit', task, `refs/heads/${branch}`);
           task.branch = branch; task.commit = commit; task.result = tail(output.output);
           const candidate: Candidate = { commit, base, attempt: task.attempts, definition: definition(task) };
           task.nodeState.candidate = candidate; task.nodeState.session = worker.session.id;
@@ -701,6 +780,9 @@ export class FlowRunner {
       (observed.dispatchHistory ??= []).push(dispatch);
       this.save();
     }
+    if (this.crashProbe && ['work', 'repair'].includes(phase) && dispatch?.disposition === 'not-dispatched') {
+      await this.afterDurableBoundary('worker-launch', observed, this.opts.file ? runPaths(this.opts.file).state : undefined, dispatch.attemptId);
+    }
     const context: ExecContext = {
       ...tokens, cwd, executionProfile: 'lean', readOnly: phase === 'advisory' || phase === 'review', session: phase === 'work' ? worker?.session : undefined,
       env: { DAG_FILE: this.opts.file ? resolve(this.opts.file) : undefined, DAG_RUN: this.state.id, DAG_TASK: observed.id, DAG_PHASE: phase,
@@ -725,6 +807,10 @@ export class FlowRunner {
     const execution = Promise.resolve().then(() => this.opts.executor(task, context, command)).finally(() => { settled = true; });
     try {
       const outcome = await Promise.race([execution, aborted]);
+      if (this.crashProbe && phase === 'work') {
+        const log = this.opts.file ? attemptLogPath(this.opts.file, observed.id, observed.attempts) : undefined;
+        await this.afterDurableBoundary('result-capture', observed, log && existsSync(log) ? log : undefined, dispatch?.attemptId);
+      }
       if (dispatch?.disposition === 'ambiguous') {
         dispatch.disposition = 'captured';
         dispatch.terminalAt = now();
@@ -748,6 +834,7 @@ export class FlowRunner {
         const problem = evidenceFailure(command, outcome, this.settings, cwd, started, expanded);
         if (problem) throw failure(problem);
       }
+      if (this.crashProbe && phase === 'verify') await this.afterDurableBoundary('verdict-persistence', task, evidenceRef);
       return { ...outcome, evidenceRef, artifacts: ['verify', 'checkpoint', 'integration'].includes(phase) ? evidenceArtifacts(command, this.settings, cwd) : undefined };
     } catch (error) {
       if (dispatch?.disposition === 'ambiguous' && (error as { kind?: string }).kind === 'spawn') {
@@ -831,6 +918,7 @@ export class FlowRunner {
       }
       task.diffHead = git(path, ['rev-parse', 'HEAD']).stdout;
       this.save();
+      if (this.crashProbe) await this.afterDurableBoundary('merge', task, task.diffHead);
     };
     task.integrationQueuedAt = new Date(queued).toISOString(); this.save();
     const operation = this.landing.then(async () => {
