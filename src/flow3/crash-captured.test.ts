@@ -4,7 +4,9 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import test from 'node:test';
 import { join, resolve } from 'node:path';
-import { loadRun, saveRun } from '../store.js';
+import { attemptLogPath, loadRun, retryTask, saveRun } from '../store.js';
+import { git } from '../git-worktree.js';
+import { DagRunner, type Executor } from '../runner.js';
 import { gitRepo } from '../test-helpers.js';
 import { compileFlowPlan } from './graph.js';
 import type { DispatchRecord } from '../types.js';
@@ -148,4 +150,60 @@ test('resume safely requeues a pre-dispatch attempt and run executes it', () => 
   assert.equal(recovered.tasks.a.status, 'completed');
   assert.equal(recovered.tasks.a.dispatchHistory?.[0].disposition, 'not-dispatched');
   assert.equal(recovered.tasks.a.dispatchHistory?.[1].disposition, 'captured');
+});
+
+test('a live command with a captured failing exit is salvaged and remains retryable', () => {
+  const f = fixture('captured known failure salvage');
+  f.run.tasks.a.cmd = `node -e "require('fs').writeFileSync('failed-output.txt','preserved');process.exit(23)"`;
+  saveRun(f.run, f.file);
+
+  const failed = cli(f.file, 'run', '--retries', '0');
+  assert.notEqual(failed.status, 0, failed.stderr || failed.stdout);
+
+  const recovered = loadRun(f.file);
+  const task = recovered.tasks.a;
+  const dispatch = task.dispatchHistory?.at(-1);
+  assert.equal(task.status, 'failed');
+  assert.equal(task.failureKind, 'exit');
+  assert.equal(task.exitCode, 23);
+  assert.equal(dispatch?.disposition, 'captured');
+  assert.equal(dispatch?.exitCode, 23);
+  assert.ok(task.branch?.startsWith(`dag-failed/${recovered.id}-a-`));
+  assert.equal(git(f.repo, ['show-ref', '--verify', `refs/heads/${task.branch}`]).code, 0);
+  assert.equal(git(f.repo, ['show', `${task.branch}:failed-output.txt`]).stdout, 'preserved');
+  assert.ok(readFileSync(attemptLogPath(f.file, 'a', task.attempts), 'utf8').includes('preserved'));
+
+  assert.deepEqual(retryTask(recovered, 'a'), ['a']);
+  assert.equal(task.status, 'pending');
+  assert.equal(task.dispatchHistory?.at(-1)?.disposition, 'captured');
+});
+
+test('a rejected repair keeps its repair hold instead of becoming captured-work ambiguity', async () => {
+  const f = fixture('captured rejected repair');
+  f.run.settings.flow3 = { ...f.run.settings.flow3, nodeRepairRounds: 1, repairCommand: 'repair' };
+  let works = 0;
+  let repairs = 0;
+  const execute: Executor = async (_task, ctx, command) => {
+    if (command === 'work') {
+      works++;
+      writeFileSync(join(ctx.cwd!, 'work-ran.txt'), 'before repair');
+    }
+    if (command === 'verify-a') return { exitCode: 1, output: 'AssertionError: contract defect' };
+    if (command === 'repair') repairs++;
+    return { exitCode: 0, output: 'ok' };
+  };
+  const run = () => new DagRunner(f.run, { cwd: f.repo, file: f.file, executor: execute, persist: state => saveRun(state, f.file) });
+
+  await run().start();
+  assert.equal(f.run.tasks.a.status, 'failed');
+  assert.equal(f.run.tasks.a.dispatchHistory?.filter(record => record.disposition === 'captured').length, 2);
+  assert.ok(f.run.tasks.a.nodeState?.repairContext);
+  assert.ok(f.run.tasks.a.nodeState?.decision);
+
+  retryTask(f.run, 'a');
+  await run().start();
+  assert.equal(works, 1);
+  assert.equal(repairs, 1);
+  assert.match(f.run.tasks.a.result ?? '', /cannot switch to implementation/);
+  assert.doesNotMatch(f.run.tasks.a.result ?? '', /ambiguous external work/);
 });

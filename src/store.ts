@@ -1146,16 +1146,38 @@ export interface RecoveryResult {
 }
 
 /** Return the latest Flow 3 dispatch that still requires explicit reconciliation. */
-export function unresolvedAmbiguousDispatch(task: Task) {
-  for (let index = (task.dispatchHistory?.length ?? 0) - 1; index >= 0; index--) {
-    const dispatch = task.dispatchHistory![index];
-    if (dispatch.disposition === 'ambiguous') return dispatch;
-    // Work can finish and durably capture its outcome before verification and
-    // candidate persistence. With no candidate, replaying it after a crash may
-    // repeat external effects, so keep it on the same explicit resolution path
-    // while preserving the captured terminal evidence in dispatchHistory.
-    if (dispatch.disposition === 'captured' && dispatch.phase === 'work' &&
-      dispatch.attempt === task.attempts && task.status !== 'completed' && !task.nodeState?.candidate) return dispatch;
+export function unresolvedAmbiguousDispatch(task: Task, options: { includeCapturedRecovery?: boolean } = {}) {
+  const history = task.dispatchHistory ?? [];
+  const attempts = [...new Set(history.map(dispatch => dispatch.attempt))].sort((a, b) => b - a);
+  for (const attempt of attempts) {
+    const latest = history.filter(dispatch => dispatch.attempt === attempt).at(-1)!;
+    if (latest.disposition === 'resolved') continue;
+
+    // A killed repair can leave authorized edits in its registered worker. The
+    // saved baseline and context let recoverRepair verify those edits without
+    // issuing another coding dispatch; an earlier captured work result from
+    // the same attempt must not hide that recovery path.
+    if (attempt === task.attempts && latest.phase === 'repair' && task.nodeState?.repairBaseline &&
+      task.nodeState.worker && existsSync(task.nodeState.worker)) continue;
+
+    if (latest.disposition === 'ambiguous') return latest;
+
+    if (attempt === task.attempts && latest.disposition === 'captured' && latest.phase === 'work' &&
+      task.status !== 'completed' && !task.nodeState?.candidate) {
+      const recoveredHold = task.status === 'failed' && task.failureKind === 'manual' &&
+        /^Work result from attempt \d+ was captured, but no verified candidate was saved\./.test(task.result ?? '');
+      if (recoveredHold) return latest;
+
+      // Only restart recovery interprets a captured success without a
+      // candidate as potentially repeated external work. A live runner already
+      // knows whether the command or its verification failed and salvages that
+      // failure normally.
+      const state = task.nodeState as (NonNullable<Task['nodeState']> & { verificationEvidenceRef?: string }) | undefined;
+      const verified = task.phaseHistory?.some(phase => phase.attempt === attempt && phase.phase === 'verify' && phase.outcome === 'pass') &&
+        !!state?.verificationEvidenceRef && existsSync(state.verificationEvidenceRef) &&
+        !!state.worker && existsSync(state.worker);
+      if (options.includeCapturedRecovery && task.status === 'running' && !verified) return latest;
+    }
   }
   return undefined;
 }
@@ -1201,7 +1223,7 @@ export function recoverInterrupted(run: Run): RecoveryResult {
         recoveredAsAmbiguous: 'legacy-missing-dispatch-record',
       });
     }
-    const pendingDispatch = unresolvedAmbiguousDispatch(task);
+    const pendingDispatch = unresolvedAmbiguousDispatch(task, { includeCapturedRecovery: true });
     if (pendingDispatch && task.status !== 'completed') {
       if (task.status === 'running') {
         if (task.pid) orphanPids.push(task.pid);

@@ -27,6 +27,7 @@ interface Worker {
   tainted: boolean;
   session: WorkerSession;
 }
+type RecoverableNodeState = NonNullable<Task['nodeState']> & { verificationEvidenceRef?: string };
 type CheckOutcome = ExecOutcome & { evidenceRef?: string; artifacts?: Record<string, string> };
 export const CRASH_BOUNDARIES = ['worker-launch', 'result-capture', 'verdict-persistence', 'commit', 'merge', 'finalization'] as const;
 export type CrashBoundary = typeof CRASH_BOUNDARIES[number];
@@ -442,6 +443,7 @@ export class FlowRunner {
         await this.land(task, saved);
         return this.complete(task);
       }
+      if (this.hasRecoverableVerifiedWork(task)) return await this.recoverVerifiedWork(task);
       let base = '';
       for (; task.attemptsInCycle < attemptLimit && !this.stopped();) {
         task.status = 'running'; task.attempts++; task.attemptsInCycle++;
@@ -508,6 +510,7 @@ export class FlowRunner {
           task.branch = branch; task.commit = commit; task.result = tail(output.output);
           const candidate = this.verifiedCandidate(task, commit, base, verification.evidenceRef);
           task.nodeState.candidate = candidate; task.nodeState.session = worker.session.id;
+          delete (task.nodeState as RecoverableNodeState).verificationEvidenceRef;
           if (this.crashProbe) await this.afterDurableBoundary('commit', task, `refs/heads/${branch}`);
           this.save(); // recover this verified source after a crash, without rerunning implementation
           await this.land(task, candidate);
@@ -549,6 +552,70 @@ export class FlowRunner {
       return false;
     } finally { this.active.delete(task.id); this.save(); }
   }
+  private hasRecoverableVerifiedWork(task: Task): boolean {
+    const state = task.nodeState as RecoverableNodeState | undefined;
+    const dispatch = task.dispatchHistory?.filter(record => record.attempt === task.attempts).at(-1);
+    return !state?.candidate && dispatch?.phase === 'work' && dispatch.disposition === 'captured' && dispatch.exitCode === 0 &&
+      task.phaseHistory?.some(phase => phase.attempt === task.attempts && phase.phase === 'verify' && phase.outcome === 'pass') === true &&
+      !!state.verificationEvidenceRef && existsSync(state.verificationEvidenceRef) &&
+      !!state.worker && existsSync(state.worker);
+  }
+
+  /** Continue a durably verified attempt from its saved worktree, without re-dispatching work. */
+  private async recoverVerifiedWork(task: Task): Promise<boolean> {
+    const file = this.opts.file;
+    const state = task.nodeState as RecoverableNodeState | undefined;
+    const workerPath = state?.worker;
+    const evidencePath = state?.verificationEvidenceRef;
+    const dispatch = task.dispatchHistory?.filter(record => record.attempt === task.attempts).at(-1);
+    if (!file || !state || !workerPath || !evidencePath || dispatch?.phase !== 'work' || !dispatch.attemptId || !this.integration) {
+      throw failure('Verified captured work lacks its durable recovery context; explicit reconciliation is required', 'integration');
+    }
+    const evidenceDirectory = resolve(runPaths(file).dir, 'flow3');
+    if (resolve(dirname(evidencePath)) !== evidenceDirectory) throw failure('Verified captured work evidence is outside the run sidecar', 'integration');
+    let evidence: Record<string, unknown>;
+    try { evidence = JSON.parse(readFileSync(evidencePath, 'utf8')) as Record<string, unknown>; }
+    catch (error) { throw failure(`Cannot read verified captured work evidence: ${String(error)}`, 'integration'); }
+    if (evidence.runId !== this.state.id || evidence.task !== task.id || evidence.phase !== 'verify' ||
+        evidence.command !== task.node?.verify || evidence.exitCode !== 0 || typeof evidence.source !== 'string' ||
+        (evidence.attemptId !== undefined && evidence.attemptId !== dispatch.attemptId) ||
+        (evidence.definitionDigest !== undefined && evidence.definitionDigest !== definition(task))) {
+      throw failure('Verified captured work evidence does not identify this run, node, dispatch and verifier', 'integration');
+    }
+
+    const base = evidence.source;
+    const branch = `dag-node/${this.state.id}-${task.id}-${task.attempts}`;
+    let commit: string;
+    if (typeof evidence.candidateCommit === 'string') {
+      const branchCommit = git(this.repo, ['rev-parse', `refs/heads/${branch}`]);
+      if (branchCommit.code || branchCommit.stdout !== evidence.candidateCommit || git(workerPath, ['rev-parse', 'HEAD']).stdout !== evidence.candidateCommit) {
+        throw failure('Pinned verified candidate does not match its durable verifier evidence', 'integration');
+      }
+      commit = evidence.candidateCommit;
+    } else {
+      if (git(workerPath, ['rev-parse', 'HEAD']).stdout !== base) throw failure('Saved verified worktree moved from its verifier base', 'integration');
+      let saved: ReturnType<typeof commitAll>;
+      try { saved = commitAll(workerPath, `dag: ${task.id} attempt ${task.attempts}`, this.settings.cachePaths ?? ['node_modules', '.venv']); }
+      catch (error) { throw failure(`Cannot preserve verified captured work: ${String(error)}`, 'integration'); }
+      if (!saved.commit) throw failure('Verified captured work has no source changes to preserve', 'integration');
+      const pinned = git(this.repo, ['branch', branch, saved.commit]);
+      if (pinned.code) throw failure(`Cannot pin recovered verified candidate: ${pinned.stderr}`, 'integration');
+      commit = saved.commit;
+    }
+
+    task.status = 'running';
+    task.branch = branch;
+    task.commit = commit;
+    task.result = `Recovered verified work from attempt ${task.attempts}`;
+    const candidate = this.verifiedCandidate(task, commit, base, evidencePath);
+    state.candidate = candidate;
+    delete state.verificationEvidenceRef;
+    this.save();
+    await this.land(task, candidate);
+    removeWorktree(this.repo, workerPath);
+    return this.complete(task);
+  }
+
   private deferMissingArtifact(task: Task, artifact: string, output: string, worker: Worker, base: string, saveEdits: boolean): boolean {
     const owners = Object.values(this.state.tasks).filter(t => t.node?.creates.includes(artifact));
     const owner = owners[0];
@@ -632,7 +699,9 @@ export class FlowRunner {
     if (pinned.code) throw failure(`Cannot pin recovered candidate: ${pinned.stderr}`, 'integration');
     task.branch = branch; task.commit = commit;
     const candidate = this.verifiedCandidate(task, commit, baseline.head, verification?.evidenceRef);
-    saved!.candidate = candidate; this.save();
+    saved!.candidate = candidate;
+    delete (saved as RecoverableNodeState).verificationEvidenceRef;
+    this.save();
     await this.land(task, candidate);
     removeWorktree(this.repo, path);
     return this.complete(task);
@@ -907,7 +976,9 @@ export class FlowRunner {
         const problem = evidenceFailure(command, outcome, this.settings, cwd, started, expanded);
         if (problem) throw failure(problem);
       }
-      if (this.crashProbe && phase === 'verify') await this.afterDurableBoundary('verdict-persistence', task, evidenceRef);
+      if (phase === 'verify' && evidenceRef && outcome.exitCode === 0 && observed.node) {
+        ((observed.nodeState ??= {}) as RecoverableNodeState).verificationEvidenceRef = evidenceRef;
+      }
       return { ...outcome, evidenceRef, artifacts: ['verify', 'checkpoint', 'integration'].includes(phase) ? evidenceArtifacts(command, this.settings, cwd) : undefined };
     } catch (error) {
       if (dispatch?.disposition === 'ambiguous' && (error as { kind?: string }).kind === 'spawn') {
@@ -940,6 +1011,9 @@ export class FlowRunner {
       (observed.phaseHistory ??= []).push({ attempt: observed.attempts, phase, startedAt: new Date(started).toISOString(), finishedAt: new Date(ended).toISOString(), durationMs: ended - started, outcome: status });
       this.event('note', observed.id, `phase ${phase} end ${new Date(ended).toISOString()} duration=${ended - started}ms ${tail(status, 800)}`);
       this.save();
+      if (this.crashProbe && phase === 'verify' && status === 'pass' && evidenceRef) {
+        await this.afterDurableBoundary('verdict-persistence', task, evidenceRef);
+      }
     }
   }
   private append(task: Task, phase: Phase, chunk: string): void {
