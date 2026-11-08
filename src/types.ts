@@ -70,6 +70,24 @@ export type FailureKind =
   | 'setup'
   | 'plan';
 
+/** Durable outcome state for a Flow 3 work-command dispatch. */
+export interface DispatchRecord {
+  attempt: number;
+  attemptId: string;
+  phase?: 'setup' | 'work' | 'repair' | 'resolve';
+  commandDigest?: string;
+  disposition: 'not-dispatched' | 'ambiguous' | 'captured' | 'resolved';
+  createdAt: string;
+  dispatchedAt?: string;
+  terminalAt?: string;
+  exitCode?: number | null;
+  outputDigest?: string;
+  resolution?: 'safe-to-repeat';
+  resolvedAt?: string;
+  resolutionReason?: string;
+  recoveredAsAmbiguous?: 'legacy-missing-dispatch-record';
+}
+
 // Event vocabulary written to events.jsonl and the viewer's live feed.
 export type EventType =
   | 'run-start'
@@ -131,6 +149,8 @@ export interface Task {
   integrationQueuedAt?: string;
   reviewSourceCommit?: string;
   phaseHistory?: Array<{ attempt: number; phase: string; startedAt: string; finishedAt: string; durationMs: number; outcome: string }>;
+  // Lifetime history of Flow 3 work dispatches, including explicit recovery decisions.
+  dispatchHistory?: DispatchRecord[];
   milestones?: { implementedAt?: string; checkedAt?: string; reviewedAt?: string; integratedAt?: string };
   id: string;
   title: string;
@@ -465,7 +485,7 @@ export const DEFINITION_FIELDS = [
 // progresses, which is exactly why they live apart from the definition.
 export const DYNAMIC_FIELDS = [
   'nodeState',
-  'executionBudget', 'integrationReceipt', 'phaseHistory', 'milestones',
+  'executionBudget', 'integrationReceipt', 'phaseHistory', 'dispatchHistory', 'milestones',
   'integrationQueuedAt',
   'reviewSourceCommit',
   'status',
