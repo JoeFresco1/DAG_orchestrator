@@ -51,6 +51,7 @@ import { reliableCmd } from './reliability.js';
 import { buildCmd } from './build.js';
 import { planningCmd } from './planning.js';
 import { followupsCmd } from './followups.js';
+import { crashCertifyCmd } from './crash-certify.js';
 
 /** Maps `dag <name>` to its handler; aliases share one handler on purpose. */
 export const COMMANDS: Record<string, CommandHandler> = {
@@ -58,6 +59,7 @@ export const COMMANDS: Record<string, CommandHandler> = {
   plan: planningCmd,
   followups: followupsCmd,
   reliable: reliableCmd,
+  'crash-certify': crashCertifyCmd,
   // Viewer / server
   serve: serveCmd,
   launch: launchCmd,
