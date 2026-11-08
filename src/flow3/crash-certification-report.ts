@@ -212,7 +212,7 @@ export function createCrashCampaignReport(options: CreateCrashCampaignReportOpti
   requiredString(options.runId, 'Run id');
   const startedAt = options.startedAt ?? new Date().toISOString();
   timestamp(startedAt, 'Campaign start time');
-  const boundaries = Object.fromEntries(CRASH_BOUNDARIES.map(boundary => [boundary, {
+  const boundaries = Object.fromEntries(CRASH_BOUNDARIES.map((boundary): [CrashBoundary, CrashBoundaryCoverage] => [boundary, {
     boundary,
     outcome: 'not-run' as const,
     iterations: [],
