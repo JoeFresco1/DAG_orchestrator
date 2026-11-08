@@ -1234,6 +1234,10 @@ export function recoverInterrupted(run: Run): RecoveryResult {
     }
     const pendingDispatch = unresolvedAmbiguousDispatch(task, { includeCapturedRecovery: true });
     if (pendingDispatch && task.status !== 'completed') {
+      const workerPath = task.nodeState?.worker;
+      const retainedWorker = workerPath && existsSync(workerPath)
+        ? ` Unverified worker files remain available at ${workerPath}.`
+        : '';
       if (task.status === 'running') {
         if (task.pid) orphanPids.push(task.pid);
         task.pid = null;
@@ -1242,8 +1246,8 @@ export function recoverInterrupted(run: Run): RecoveryResult {
         task.finishedAt = new Date().toISOString();
         const captured = pendingDispatch.disposition === 'captured';
         task.result = captured
-          ? `Work result from attempt ${pendingDispatch.attempt} was captured, but no verified candidate was saved. Captured evidence and worker state are retained; reconcile explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.`
-          : `Ambiguous external work from attempt ${pendingDispatch.attempt}; result was not captured. Resolve explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.`;
+          ? `Work result from attempt ${pendingDispatch.attempt} was captured, but no verified candidate was saved. Captured evidence and worker state are retained; reconcile explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.${retainedWorker}`
+          : `Ambiguous external work from attempt ${pendingDispatch.attempt}; result was not captured. Resolve explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.${retainedWorker}`;
         const cause = pendingDispatch.recoveredAsAmbiguous ? 'legacy attempt has no dispatch record'
           : captured ? 'captured work has no saved verified candidate' : 'dispatched work has no captured result';
         logEvent(run, 'task-interrupted', task.id, `attempt ${pendingDispatch.attempt}: ${cause}; held for explicit resolution`);
@@ -1253,8 +1257,8 @@ export function recoverInterrupted(run: Run): RecoveryResult {
         task.finishedAt = new Date().toISOString();
         const captured = pendingDispatch.disposition === 'captured';
         task.result = captured
-          ? `Work result from attempt ${pendingDispatch.attempt} was captured, but no verified candidate was saved. Captured evidence and worker state are retained; reconcile explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.`
-          : `Ambiguous external work from attempt ${pendingDispatch.attempt}; result was not captured. Resolve explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.`;
+          ? `Work result from attempt ${pendingDispatch.attempt} was captured, but no verified candidate was saved. Captured evidence and worker state are retained; reconcile explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.${retainedWorker}`
+          : `Ambiguous external work from attempt ${pendingDispatch.attempt}; result was not captured. Resolve explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.${retainedWorker}`;
         logEvent(run, 'task-interrupted', task.id, `attempt ${pendingDispatch.attempt} remains held for explicit resolution`);
       }
       ambiguous.push(task.id);
