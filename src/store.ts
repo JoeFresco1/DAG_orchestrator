@@ -1145,6 +1145,12 @@ export interface RecoveryResult {
   resolved?: string[];
 }
 
+function ambiguousRecoveryFailureKind(kind: Task['failureKind']): Task['failureKind'] {
+  // The ambiguity hold governs whether work may run again. Preserve an already
+  // recorded infrastructure cause so diagnosis does not lose its classification.
+  return kind === 'timeout' || kind === 'stalled' || kind === 'spawn' ? kind : 'manual';
+}
+
 /** Return the latest Flow 3 dispatch that still requires explicit reconciliation. */
 export function unresolvedAmbiguousDispatch(task: Task, options: { includeCapturedRecovery?: boolean } = {}) {
   const history = task.dispatchHistory ?? [];
@@ -1232,7 +1238,7 @@ export function recoverInterrupted(run: Run): RecoveryResult {
         if (task.pid) orphanPids.push(task.pid);
         task.pid = null;
         task.status = 'failed';
-        task.failureKind = 'manual';
+        task.failureKind = ambiguousRecoveryFailureKind(task.failureKind);
         task.finishedAt = new Date().toISOString();
         const captured = pendingDispatch.disposition === 'captured';
         task.result = captured
@@ -1243,7 +1249,7 @@ export function recoverInterrupted(run: Run): RecoveryResult {
         logEvent(run, 'task-interrupted', task.id, `attempt ${pendingDispatch.attempt}: ${cause}; held for explicit resolution`);
       } else if (task.status === 'pending') {
         task.status = 'failed';
-        task.failureKind = 'manual';
+        task.failureKind = ambiguousRecoveryFailureKind(task.failureKind);
         task.finishedAt = new Date().toISOString();
         const captured = pendingDispatch.disposition === 'captured';
         task.result = captured

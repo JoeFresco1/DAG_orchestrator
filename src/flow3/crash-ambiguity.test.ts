@@ -112,6 +112,64 @@ test('a dispatched work command without a captured outcome is not retried automa
   assert.match(dispatch?.commandDigest ?? '', /^[a-f0-9]{64}$/);
 });
 
+test('a timed out ambiguous dispatch keeps its infrastructure classification and reconciliation hold', async () => {
+  const f = fixture();
+  let workCalls = 0;
+  let kills = 0;
+  const runner = new DagRunner(f.run, {
+    cwd: f.repo,
+    file: f.file,
+    timeoutMs: 20,
+    stopGraceMs: 20,
+    executor: async (_task, ctx, cmd) => {
+      if (cmd !== 'work') return ok;
+      workCalls++;
+      return new Promise((_, reject) => ctx.registerKill(() => { kills++; reject(Error('killed')); }));
+    },
+    persist: run => saveRun(run, f.file),
+  });
+
+  await runner.start();
+  const task = f.run.tasks.a;
+  assert.equal(workCalls, 1);
+  assert.equal(kills, 1);
+  assert.equal(task.status, 'failed');
+  assert.equal(task.failureKind, 'timeout');
+  assert.equal(task.attempts, 1);
+  assert.equal(task.dispatchHistory?.at(-1)?.disposition, 'ambiguous');
+  assert.match(task.result ?? '', /resolve-ambiguous a/);
+  assert.throws(() => retryTask(f.run, 'a'), /resolve it with dag resume/);
+});
+
+test('resume preserves timeout, stalled and spawn classifications on ambiguous attempts', () => {
+  for (const failureKind of ['timeout', 'stalled', 'spawn'] as const) {
+    const f = fixture();
+    const task = f.run.tasks.a;
+    task.status = 'running';
+    task.failureKind = failureKind;
+    task.attempts = 2;
+    task.attemptsInCycle = 1;
+    task.dispatchHistory = [{
+      attempt: 2,
+      attemptId: `attempt-${failureKind}`,
+      phase: 'work',
+      disposition: 'ambiguous',
+      createdAt: '2026-11-08T00:00:00.000Z',
+      dispatchedAt: '2026-11-08T00:00:01.000Z',
+    }];
+    saveRun(f.run, f.file);
+
+    const report = resume(f.file);
+    assert.deepEqual(report.requeued, []);
+    assert.deepEqual(report.ambiguous, ['a']);
+    const recovered = loadRun(f.file);
+    assert.equal(recovered.tasks.a.status, 'failed');
+    assert.equal(recovered.tasks.a.failureKind, failureKind);
+    assert.match(recovered.tasks.a.result ?? '', /resolve-ambiguous a/);
+    assert.throws(() => retryTask(recovered, 'a'), /resolve it with dag resume/);
+  }
+});
+
 test('legacy interrupted Flow 3 attempts without dispatch records fail closed as ambiguous', () => {
   const f = fixture();
   const task = f.run.tasks.a;
