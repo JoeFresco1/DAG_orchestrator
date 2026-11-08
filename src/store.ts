@@ -1145,11 +1145,17 @@ export interface RecoveryResult {
   resolved?: string[];
 }
 
-/** Return the latest unresolved ambiguous Flow 3 dispatch, if any. */
+/** Return the latest Flow 3 dispatch that still requires explicit reconciliation. */
 export function unresolvedAmbiguousDispatch(task: Task) {
   for (let index = (task.dispatchHistory?.length ?? 0) - 1; index >= 0; index--) {
     const dispatch = task.dispatchHistory![index];
     if (dispatch.disposition === 'ambiguous') return dispatch;
+    // Work can finish and durably capture its outcome before verification and
+    // candidate persistence. With no candidate, replaying it after a crash may
+    // repeat external effects, so keep it on the same explicit resolution path
+    // while preserving the captured terminal evidence in dispatchHistory.
+    if (dispatch.disposition === 'captured' && dispatch.phase === 'work' &&
+      dispatch.attempt === task.attempts && task.status !== 'completed' && !task.nodeState?.candidate) return dispatch;
   }
   return undefined;
 }
@@ -1175,7 +1181,8 @@ export function resolveAmbiguousAttempt(run: Run, id: string, reason: string): v
 }
 
 // Anything still 'running' after a restart cannot be running. Requeue attempts
-// with no dispatched work; hold dispatched work whose result was not captured.
+// with no dispatched work; hold dispatched work whose result was not captured
+// and captured work that has no persisted verified candidate.
 export function recoverInterrupted(run: Run): RecoveryResult {
   const requeued: string[] = [];
   const orphanPids: number[] = [];
@@ -1202,14 +1209,21 @@ export function recoverInterrupted(run: Run): RecoveryResult {
         task.status = 'failed';
         task.failureKind = 'manual';
         task.finishedAt = new Date().toISOString();
-        task.result = `Ambiguous external work from attempt ${pendingDispatch.attempt}; result was not captured. Resolve explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.`;
-        const cause = pendingDispatch.recoveredAsAmbiguous ? 'legacy attempt has no dispatch record' : 'dispatched work has no captured result';
+        const captured = pendingDispatch.disposition === 'captured';
+        task.result = captured
+          ? `Work result from attempt ${pendingDispatch.attempt} was captured, but no verified candidate was saved. Captured evidence and worker state are retained; reconcile explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.`
+          : `Ambiguous external work from attempt ${pendingDispatch.attempt}; result was not captured. Resolve explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.`;
+        const cause = pendingDispatch.recoveredAsAmbiguous ? 'legacy attempt has no dispatch record'
+          : captured ? 'captured work has no saved verified candidate' : 'dispatched work has no captured result';
         logEvent(run, 'task-interrupted', task.id, `attempt ${pendingDispatch.attempt}: ${cause}; held for explicit resolution`);
       } else if (task.status === 'pending') {
         task.status = 'failed';
         task.failureKind = 'manual';
         task.finishedAt = new Date().toISOString();
-        task.result = `Ambiguous external work from attempt ${pendingDispatch.attempt}; result was not captured. Resolve explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.`;
+        const captured = pendingDispatch.disposition === 'captured';
+        task.result = captured
+          ? `Work result from attempt ${pendingDispatch.attempt} was captured, but no verified candidate was saved. Captured evidence and worker state are retained; reconcile explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.`
+          : `Ambiguous external work from attempt ${pendingDispatch.attempt}; result was not captured. Resolve explicitly with dag resume --resolve-ambiguous ${task.id} --resolution safe-to-repeat --reason <reason>.`;
         logEvent(run, 'task-interrupted', task.id, `attempt ${pendingDispatch.attempt} remains held for explicit resolution`);
       }
       ambiguous.push(task.id);
