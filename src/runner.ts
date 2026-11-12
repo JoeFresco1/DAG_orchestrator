@@ -445,6 +445,8 @@ function tailOf(output: string): string {
  * All optional: an unset value falls back to the run's settings, then defaults.
  */
 export interface RunnerOptions {
+  /** Optional harness adapter; called only for configured reserves or confirmed quota pauses. */
+  quotaProbe?: import('./flow3/quota.js').QuotaProbe;
   /** Explicit operator recovery: verify saved output without another implementation dispatch. */
   quotaRecovery?: boolean;
   verificationRecovery?: { taskId: string; reason: string; sourceCommit?: string; removeGenerated?: string[]; extendTime?: boolean };
@@ -836,8 +838,8 @@ export class DagRunner {
 
   // Kills the whole tree, waits a bounded grace period, then force-settles
   // anything still "running" so the loop cannot hang.
-  async stop(reason?: 'quota'): Promise<void> {
-    if (this.flowRunner) return this.flowRunner.stop();
+  async stop(reason?: 'quota' | 'shutdown'): Promise<void> {
+    if (this.flowRunner) return this.flowRunner.stop(reason !== 'shutdown');
     if (!this.active || this.stopping) {
       await (this.loopPromise ?? Promise.resolve());
       return;

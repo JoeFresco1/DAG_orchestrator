@@ -31,7 +31,10 @@ test('checks wait only for registered producers; missing input defers only with 
   const output = 'ENOENT: no such file or directory, open artifact.ts';
   assert.equal(repairDecision(run, { command: 'check', output, phase: 'checkpoint' }).action, 'defer');
   assert.equal(repairDecision(run, { command: 'check', output: 'ENOENT: open not-artifact.ts', phase: 'checkpoint' }).action, 'hold');
-  assert.equal(repairDecision(run, { command: 'check', output, phase: 'verify' }).action, 'hold');
+  for (const phase of ['work', 'verify'] as const) {
+    const local = repairDecision(run, { command: 'check', output, phase });
+    assert.equal(local.action, 'defer'); assert.deepEqual(local.requires, ['producer']);
+  }
   run.tasks.producer.status = 'completed';
   assert.equal(repairDecision(run, { command: 'check', output, phase: 'checkpoint' }).action, 'hold');
   run.tasks.producer.status = 'pending';

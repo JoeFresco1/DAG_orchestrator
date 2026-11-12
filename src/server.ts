@@ -1,6 +1,8 @@
 // HTTP hub: serves the viewer pages and a JSON API over one or many runs.
 // This file owns routing, run resolution, locking and the guarded mutations;
 // per-run payload shaping lives in server-view.ts.
+import { foreignLock } from './store.js';
+import { flowProgress } from './flow3/progress.js';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { existsSync, readdirSync, statSync } from 'node:fs';
@@ -154,7 +156,7 @@ function activeRuntimeForFile(file: string): RunRuntime | null {
 // ---------------------------------------------------------------------------
 
 /** Validate, lock, snapshot settings and start a runner for one runtime. */
-async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult> {
+async function startRun(rt: RunRuntime, opts: StartOptions, automatic = false): Promise<StartResult> {
   if (rt.archived) {
     return { started: false, error: 'this run is archived (history) and cannot be started', code: 409 };
   }
@@ -182,6 +184,9 @@ async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult
     } catch (err) {
       lock();
       return { started: false, error: err instanceof Error ? err.message : String(err), code: 400 };
+    }
+    if (automatic && (run.flowState?.userStopped || run.flowState?.quotaWait?.manual)) {
+      lock(); return { started: false, error: 'Run is waiting for an explicit start', code: 409 };
     }
     if (opts.ids != null) {
       const unknown = opts.ids.filter((id) => !run.tasks[id]);
@@ -243,7 +248,7 @@ async function startRun(rt: RunRuntime, opts: StartOptions): Promise<StartResult
     // The runner releases its lock and persists when it finishes; capture the
     // event count now to detect a synchronous setup refusal below.
     const eventsBefore = run.events.length;
-    void rt.runner.start(run.settings.executionProfile === 'flow3' && opts.ids === undefined ? null : new Set(scope)).finally(() => {
+    void rt.runner.start(run.settings.executionProfile === 'flow3' && opts.ids == null ? null : new Set(scope)).finally(() => {
       rt.releaseLock?.();
       rt.releaseLock = null;
       saveRun(run, rt.file);
@@ -671,7 +676,7 @@ export function startServer(opts: ServeOptions): void {
         json(res, 200, { rev: run.rev, unchanged: true, ...meta, job: jobView(rt), staleBuild: staleBuild() });
         return;
       }
-      json(res, 200, { ...summaryPayload(run), ...meta, job: jobView(rt), staleBuild: staleBuild() });
+      json(res, 200, { ...summaryPayload(run), progress: flowProgress(run, !!rt.runner?.isRunning || !!foreignLock(rt.file)), ...meta, job: jobView(rt), staleBuild: staleBuild() });
     };
 
     const getDefinition = (): void => {
@@ -953,7 +958,7 @@ export function startServer(opts: ServeOptions): void {
     void (async () => {
       for (const rt of runtimes.values()) {
         try {
-          if (rt.runner?.isRunning) await rt.runner.stop();
+          if (rt.runner?.isRunning) await rt.runner.stop('shutdown');
         } finally {
           rt.releaseLock?.();
         }
@@ -980,14 +985,16 @@ export function startServer(opts: ServeOptions): void {
         console.log(`auto-resume: ${projectName(dir)}: ${err instanceof Error ? err.message : String(err)}`);
         continue;
       }
+      const saved = loadRun(rt.file);
+      if (saved.flowState?.userStopped || saved.flowState?.quotaWait?.manual) continue;
       if (killOrphansOnResume) {
         const killed = await mutate(rt.file, (run) => killOrphans(run), 'serve auto-resume');
         const n = killed.filter((k) => k.killed).length;
         if (n > 0) console.log(`auto-resume: ${projectName(dir)}: killed ${n} orphan(s)`);
       }
       const run = loadRun(rt.file);
-      if (getReady(run).length === 0) continue;
-      const result = await startRun(rt, { ids: null });
+      if (!run.flowState?.quotaWait && getReady(run).length === 0) continue;
+      const result = await startRun(rt, { ids: null }, true);
       console.log(
         result.started
           ? `auto-resume: ${projectName(dir)}: running ${result.scope?.length ?? 0} task(s)`
@@ -1000,6 +1007,6 @@ export function startServer(opts: ServeOptions): void {
 /** Ask every active runner to stop; used by in-process callers, not the CLI. */
 export function stopServer(): void {
   void (async () => {
-    for (const rt of runtimes.values()) await rt.runner?.stop();
+    for (const rt of runtimes.values()) await rt.runner?.stop('shutdown');
   })();
 }

@@ -38,11 +38,14 @@ function inputIdentity(root: string, path: string, ancestors = new Set<string>()
 }
 
 export function acceptanceIdentity(run: Run, settings: FlowSettings, root: string, source: string, commands: string[]): AcceptanceIdentity {
+  const corrections = Object.values(run.tasks).filter(t => t.nodeState?.verificationCorrection).map(t => ({ task: t.id, ...t.nodeState!.verificationCorrection }));
   const value = {
     source,
     requirements: digest({ objective: run.objective, manifest: run.planning?.manifest, completion: run.flowState?.completion,
       nodes: Object.values(run.tasks).filter(t => !t.node?.repair_of).map(t => ({ id: t.id, node: t.node, deps: t.deps, spec: t.spec, cmd: t.cmd, harnessChain: t.harnessChain, reviewers: t.reviewers, reviewCmd: t.reviewCmd })) }),
-    checks: digest({ commands, settings, review: [run.settings.finalReview, run.settings.finalReviewCmd, run.settings.finalReviewRounds],
+    checks: digest({ commands, settings,
+      ...(corrections.length ? { verificationCorrections: corrections } : {}),
+      review: [run.settings.finalReview, run.settings.finalReviewCmd, run.settings.finalReviewRounds],
       execution: { harnessChain: run.settings.harnessChain, silenceMs: run.settings.silenceMs, reviewVerdict: run.settings.reviewVerdict } }),
     inputs: digest((settings.acceptanceInputs ?? []).map(path => inputIdentity(root, path))),
     environment: digest({ identity: settings.environmentIdentity, platform: process.platform, arch: process.arch, node: process.version,
@@ -52,7 +55,7 @@ export function acceptanceIdentity(run: Run, settings: FlowSettings, root: strin
 }
 
 /** Exit zero alone cannot override missing, empty or inconclusive execution evidence. */
-export function evidenceFailure(command: string, result: ExecOutcome, settings: FlowSettings, root: string, started?: number, expandedCommand = command): string | undefined {
+export function evidenceFailure(command: string, result: ExecOutcome, settings: FlowSettings, root: string, started?: number, expandedCommand = command, priorArtifacts?: Record<string, string>): string | undefined {
   if (result.exitCode !== 0) return `Check exited ${result.exitCode ?? 'without an exit code'}`;
   const output = result.output.replace(/\u001b\[[0-9;]*m/g, '');
   // Test names and captured fixtures describe behavior; they are not execution outcomes.
@@ -72,7 +75,14 @@ export function evidenceFailure(command: string, result: ExecOutcome, settings: 
   for (const path of settings.requiredEvidence?.[command] ?? []) {
     const file = join(root, path);
     if (!existsSync(file) || !lstatSync(file).isFile() || !lstatSync(file).size) return `Missing required evidence: ${path}`;
-    if (started !== undefined && lstatSync(file).mtimeMs < started) return `Missing current required evidence: ${path} predates this check`;
+    if (started !== undefined && lstatSync(file).mtimeMs < started) {
+      // Filesystem and Date.now clocks can differ by a fractional millisecond.
+      // A witnessed creation/content change proves freshness without a tolerance
+      // that could admit unchanged evidence from before this check.
+      const changed = priorArtifacts && Object.hasOwn(priorArtifacts, path) &&
+        priorArtifacts[path] !== createHash('sha256').update(readFileSync(file)).digest('hex');
+      if (!changed) return `Missing current required evidence: ${path} predates this check`;
+    }
   }
   return undefined;
 }

@@ -2,6 +2,7 @@ import { addTask, newRun } from '../store.js';
 import type { Run, Task } from '../types.js';
 import { executionProfilePatch } from '../execution-policy.js';
 import { safeRelativePath, validateFlowSettings, type FlowPlan, type NodeBrief } from './contracts.js';
+import { isKnownTestCommand, validatePlanningCheck } from '../planning/contracts.js';
 
 export interface GraphReport {
   valid: boolean;
@@ -22,6 +23,14 @@ export function validateBrief(value: unknown): string[] {
   if (!Array.isArray(node.touches) || !node.touches.every(safeRelativePath)) errors.push('touches must contain repository relative paths');
   for (const field of ['creates', 'relies_on'] as const) if (!Array.isArray(node[field]) || !node[field].every(s => typeof s === 'string' && !!s.trim() && !/[\0\r\n]/.test(s))) errors.push(`${field} must contain file or symbol names`);
   if (node.verify_requires !== undefined && (!Array.isArray(node.verify_requires) || !node.verify_requires.every(id => typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)))) errors.push('verify_requires must contain producer IDs');
+  if (node.local_check !== undefined) {
+    try {
+      validatePlanningCheck(node.local_check);
+      const check = node.local_check;
+      if (typeof check.behavior !== 'string' || !check.behavior.trim() || /[\0\r\n]/.test(check.behavior) || check.kind !== 'test' || check.selectedTests?.allowEmpty ||
+        !check.files?.length || !check.files.every(safeRelativePath) || !isKnownTestCommand(check.program, check.args)) throw Error('declare local behavior, a known test runner, protected test files and a positive selected-test count');
+    } catch (error) { errors.push(`local_check: ${String(error)}`); }
+  }
   if (node.repair_of !== undefined && (typeof node.repair_of !== 'string' || !node.repair_of.trim() || /[\0\r\n]/.test(node.repair_of))) errors.push('repair_of must identify a checkpoint');
   return errors;
 }
@@ -53,7 +62,8 @@ export function checkGraph(run: Run, autoFix = true): GraphReport {
   for (const task of tasks) for (const owner of task.node?.verify_requires ?? []) {
     if (owner === task.id) { errors.push(`Verification dependency ${task.id} -> ${owner} would create a cycle`); continue; }
     if (reaches(task.id, owner)) continue;
-    if (reaches(owner, task.id)) errors.push(`Verification dependency ${task.id} -> ${owner} would create a cycle`);
+    if (reaches(owner, task.id) && task.node?.local_check) warnings.push(`${task.id}: downstream verification producer ${owner}; local_check permits a runtime staging correction`);
+    else if (reaches(owner, task.id)) errors.push(`Verification dependency ${task.id} -> ${owner} would create a cycle`);
     else if (autoFix) { deps.get(task.id)!.push(owner); addedEdges.push({ consumer: task.id, producer: owner }); }
     else errors.push(`${task.id}: undeclared verification dependency on ${owner}`);
   }

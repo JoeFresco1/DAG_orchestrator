@@ -8,6 +8,12 @@ const environment = /(?:usage|rate|quota) limit|quota (?:exhausted|exceeded)|too
 const policy = /frozen (?:acceptance|source)|continuation control changed|contract (?:hash|revision).*changed|outside (?:the )?(?:owned|allowed) scope|repair policy violation|no .*checks configured|configure .*flow3\.(?:waveChecks|finalChecks)/i;
 const implementation = /trailing whitespace|new blank line at EOF|SyntaxError|syntax error|unexpected token|\berror TS\d+\b|\bTS\d+:|type (?:mismatch|error)|compiler error|not assignable|missing exported API|AssertionError|assertion|\bnot ok \d|\bFAIL\b.*(?:test|expect)|expected .*(?:received|actual)|\b(?:E\s+assert|FAILED\s+\S+)/i;
 
+/** Only worker transport diagnostics authorize an already configured alternate. */
+export function transientProviderFailure(output: string): boolean {
+  if (/authentication|unauthorized|permission denied|invalid api key|\b(?:401|403)\b|context_length_exceeded|maximum context length/i.test(output)) return false;
+  return /\b(?:HTTP|status)\s*(?:429|502|503|504)\b|rate limit (?:exceeded|reached)|too many requests|\bECONNRESET\b|\bETIMEDOUT\b|upstream (?:connection|request).*failed|provider temporarily unavailable/i.test(output);
+}
+
 /** Routing uses runner state and conservative diagnostics; agent prose cannot authorize graph edits. */
 export function repairDecision(run: Run, input: {
   command: string; output: string; phase: Phase; kind?: string; requires?: string[];
@@ -38,11 +44,12 @@ export function repairDecision(run: Run, input: {
       owners.add(task.id);
     }
     const pending = [...owners].filter(id => run.tasks[id].status !== 'completed');
-    if (pending.length && (phase === 'checkpoint' || phase === 'integration')) {
+    if (pending.length && ['work', 'verify', 'checkpoint', 'integration'].includes(phase)) {
       return decide('defer', 'dependency', `Missing artifact has an identified unfinished producer: ${pending.join(', ')}`, pending);
     }
     return decide('hold', 'dependency', 'Missing input needs producer/graph or environment diagnosis; no safe automatic coding repair');
   }
+  if (/context (?:window|length|limit).*(?:exceeded|exhausted)|maximum context length|context_length_exceeded|task too large/i.test(output)) return decide('hold', 'policy', 'Task exceeds worker capacity; saved work requires bounded decomposition, which Flow 3 does not perform during execution');
   if (/valid negative analytical outcome|analytical outcome: negative/i.test(output)) return decide('hold', 'analytical', 'Retain the analytical result; repair requires a demonstrated contract or implementation defect');
   if (/disputed finding|review defect|reviewer finding rejected/i.test(output)) return decide('hold', 'review', 'Adjudicate against requirements and evidence; reviewer output alone does not authorize implementation');
   if (/acceptance gap|missing required evidence|inconclusive|no tests? (?:found|collected|ran)|0 tests?/i.test(output)) return decide('hold', 'acceptance-gap', 'Verification did not establish acceptance; justify new verification under the applicable policy');

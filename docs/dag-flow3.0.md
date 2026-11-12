@@ -81,6 +81,12 @@ one fast `verify` command. `verify_requires` adds producer edges;
 `checkPrerequisites` defers composed checks until producers exist. Worker prompts
 assign wave/final acceptance execution to the runner.
 
+A declared `local_check` can authorize automatic correction when the node's
+composed verifier requires an unfinished downstream consumer. FlowRunner records
+the correction in existing durable node state, verifies named local behavior before
+integration, and retains the original command for frozen final acceptance. Missing
+or ambiguous authority holds. See [verification-plan correction](flow3-verification-plan-correction.md).
+
 ## Frozen acceptance identity and conclusive evidence
 
 Each checkpoint binds results to source revision, requirements/task contracts,

@@ -1,4 +1,5 @@
 import type { SettingsProblem } from '../types.js';
+import type { PlanningCheck } from '../planning/contracts.js';
 
 export const PHASES = ['setup', 'work', 'verify', 'repair', 'land', 'resolve', 'checkpoint', 'integration', 'advisory', 'review'] as const;
 export type Phase = typeof PHASES[number];
@@ -14,6 +15,8 @@ export interface NodeBrief {
   /** File names, symbols, or signatures supplied by declared prerequisites. */
   relies_on: string[];
   verify: string;
+  /** Explicit local test authority; behavior names a passing TAP test case. */
+  local_check?: PlanningCheck & { behavior: string };
   /** Producers needed by this node's check; admission adds acyclic prerequisite edges. */
   verify_requires?: string[];
   /** Runner-authored checkpoint repair identity, retained across explicit retry. */
@@ -59,6 +62,7 @@ export interface RepairIntent {
   status: 'pending' | 'scheduled';
 }
 export interface FlowSettings {
+  quotaReservePercent?: number;
   completion?: { mode: 'scoped' | 'whole-product'; required: string[]; optional: string[] };
   /** Include ignored fixtures/data and external environment revisions explicitly. */
   acceptanceInputs?: string[];
@@ -98,6 +102,19 @@ export interface Candidate {
   definition: string;
 }
 export interface NodeState {
+  /** One frozen staging correction per authored definition, not a new retry allowance. */
+  verificationCorrection?: {
+    definition: string;
+    original: string;
+    local: string;
+    requires: string[];
+    checkSources: Record<string, string>;
+    work: { commit: string; base: string; attempt: number };
+  };
+  /** Unverified edits awaiting a diagnosed producer; never a landing candidate. */
+  dependencyWork?: { commit: string; definition: string; attempt: number };
+  quotaCapture?: { path: string; head: string; definition: string; attempt: number; remainingMs: number; session: import('../agent-session.js').WorkerSession };
+  quotaWork?: { commit: string; definition: string; attempt: number; remainingMs: number; session?: import('../agent-session.js').WorkerSession; dispatching?: boolean };
   candidate?: Candidate;
   worker?: string;
   session?: string;
@@ -143,6 +160,8 @@ export interface Checkpoint {
 }
 export interface FlowState {
   version: 3;
+  userStopped?: boolean;
+  quotaWait?: { provider: string; pendingProviders?: string[]; confirmed?: boolean; since?: number; reason: string; nextProbeAt?: number; manual?: boolean; reading?: import('./quota.js').QuotaReading };
   repairRound: number;
   checkpoints: Checkpoint[];
   advisory?: { status: 'started' | 'finished' | 'warning'; output?: string };
@@ -170,8 +189,9 @@ export function validateFlowSettings(value: unknown): SettingsProblem[] {
   const problems: SettingsProblem[] = [];
   const fail = (field: string, reason: string) => problems.push({ field: `flow3.${field}`, reason });
   if (!record(value)) return [{ field: 'flow3', reason: 'must be an object' }];
-  const allowed = new Set(['phaseTimeouts', 'idleTimeoutMs', 'cachePaths', 'waveChecks', 'finalChecks', 'additionalFinalChecks', 'advisoryCommand', 'repairCommand', 'conflictCommand', 'repairRounds', 'nodeRepairRounds', 'checkPrerequisites', 'repairProtectedPaths', 'completion', 'acceptanceInputs', 'environmentIdentity', 'requiredEvidence']);
+  const allowed = new Set(['quotaReservePercent', 'phaseTimeouts', 'idleTimeoutMs', 'cachePaths', 'waveChecks', 'finalChecks', 'additionalFinalChecks', 'advisoryCommand', 'repairCommand', 'conflictCommand', 'repairRounds', 'nodeRepairRounds', 'checkPrerequisites', 'repairProtectedPaths', 'completion', 'acceptanceInputs', 'environmentIdentity', 'requiredEvidence']);
   for (const key of Object.keys(value)) if (!allowed.has(key)) fail(key, 'unknown setting');
+  if (value.quotaReservePercent !== undefined && (!Number.isFinite(value.quotaReservePercent) || Number(value.quotaReservePercent) < 0 || Number(value.quotaReservePercent) >= 100)) fail('quotaReservePercent', 'must be 0..<100');
   if (value.completion !== undefined) {
     const c = value.completion;
     if (!record(c) || !['scoped', 'whole-product'].includes(String(c.mode)) ||

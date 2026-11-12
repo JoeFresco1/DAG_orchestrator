@@ -254,6 +254,7 @@ aside {
   <a class="crumb" id="crumb" href="/" style="display:none">← project</a>
   <span class="filepath" id="filepath" title=""></span>
   <span class="total"><strong id="total">0</strong>tasks</span>
+  <div id="flow-progress" hidden></div>
   <div class="pills" id="pills"></div>
   <div class="progress" id="progress"><i id="pbar-done" class="pbar-done"></i><i id="pbar-fail" class="pbar-fail"></i><i id="pbar-skip" class="pbar-skip"></i><i id="pbar-run" class="pbar-run"></i></div>
   <div class="actions">
@@ -637,6 +638,8 @@ async function refreshFactory() {
 function titleOf(id) { return titleById.get(id) ?? id; }
 
 function renderHeader(s) {
+  $('flow-progress').hidden = !s.progress;
+  $('flow-progress').textContent = s.progress?.message || '';
   const c = s.counts || {};
   $('total').textContent = s.total;
   const dot = { ready: 'var(--lime)', running: 'var(--amber)', failed: 'var(--magenta)', completed: 'var(--cyan)', blocked: 'var(--magenta)', gated: 'var(--violet)', skipped: 'var(--slate)', pending: 'var(--slate)' };

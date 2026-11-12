@@ -3,6 +3,49 @@
 New `dag init`, `dag new-run`, and `dag plan compile` runs use `flow3`.
 The [architecture and lifecycle diagram](dag-flow3.0.md) describe the current design.
 
+### Verification that needs an unfinished consumer
+
+A node may keep its composed `verify` while declaring authority for a separate
+local behavioral test:
+
+```json
+{
+  "verify": "node checks.mjs checkout-composed",
+  "local_check": {
+    "id": "checkout-integrity",
+    "behavior": "checkout calculates total and remaining stock",
+    "program": "node",
+    "args": ["--test", "--test-reporter=tap", "checkout.local.test.mjs"],
+    "files": ["checkout.local.test.mjs"],
+    "timeoutMs": 10000,
+    "kind": "test",
+    "selectedTests": { "pattern": "^# tests (\\d+)\\s*$" }
+  }
+}
+```
+
+`behavior` names an actual passing TAP test case, not a file-discovery result.
+The declared test must exercise local outputs/rejection behavior independently
+of unfinished consumers. It must already exist as an approved regular file;
+the runner does not invent, rewrite or infer test commands from filenames.
+
+Only a declared unfinished downstream verification prerequisite, or an
+unambiguous missing verification artifact belonging to that consumer, permits
+automatic staging. A check with a declared unavailable consumer is recorded as
+deferred without executing it; a premature zero exit cannot establish readiness.
+The producer then passes its declared local
+test before integration. The original command remains mandatory in final
+acceptance, with its consumer prerequisites retained. A persisted correction pins
+saved source and test hashes; resume can reverify it without another implementation
+dispatch or repair allowance. Changed authority, missing tests, unnamed/skipped or
+empty test execution, mixed prerequisites and actual implementation cycles hold.
+
+`verify_requires` consumer edges can remain verification obligations when this
+local authority is declared; ordinary implementation dependencies stay unchanged.
+Existing plans without a suitable `local_check` retain their blocker and report
+the missing authority explicitly. This is not automatic test generation or general
+runtime decomposition.
+
 ## Author and compile small nodes
 
 ```json
@@ -299,11 +342,34 @@ or uncertain cause requires explicit diagnosis/appropriate approved work rather 
 a speculative automatic implementation repair. Valid negative analytical results
 remain valid evidence; only demonstrated implementation defects trigger repairs.
 
+### Worker quota interruptions
+
+Ordinary runs do not query usage. A confirmed worker quota error stops new node
+dispatch while active units settle. The run preserves interrupted implementation
+source and its remaining work allowance; an interrupted repair with saved edits
+goes through its existing scoped verification. A verified candidate resumes at
+landing. A failed test, authentication failure or plain HTTP 429 does not enter
+quota recovery.
+
+The running owner can read fresh Codex usage through the installed app-server,
+without a model request. During a confirmed wait it keeps its lock and sleeps
+between reads. Only the quiescent quota wait is excluded from the run deadline;
+task attempts and repair charges remain spent. To enforce a reserve before new
+implementation dispatches, optionally set `settings.quotaReservePercent` (for
+example, 5). No reserve or probe configuration is required for existing plans.
+Embedding harnesses can supply a read-only `RunnerOptions.quotaProbe`. A
+harness without a supported probe preserves its work for explicit continuation.
+
+`dag status`, its JSON `progress` field, and the run viewer report the same
+reason and next action. Explicit stop persists across server auto-resume; an
+explicit new start releases that stop. A server shutdown preserves an existing
+quota wait for its configured unattended owner to resume.
+
 ### Durable repair accounting
 
 | Action | Allowance | Durable charge / exhaustion |
 | --- | --- | --- |
-| Investigation, check execution, review, infrastructure diagnosis | Existing run wall-clock and phase caps | The run's absolute deadline persists across resumes; exhausted runs hold. |
+| Investigation, check execution, review, infrastructure diagnosis | Existing run wall-clock and phase caps | The deadline persists across resumes; only confirmed quiescent quota waiting is excluded. Exhausted runs hold. |
 | Implementation attempt | Existing per-task implementation limit | Attempt count is saved before dispatch; explicit implementation retry retains its existing operator policy. |
 | In-place node repair | `nodeRepairRounds` per original node | Lifetime ledger and diagnosis saved before agent dispatch; edits/retry do not clear repair usage or fingerprints. |
 | Checkpoint repair (wave or final) | Shared `repairRounds` | Finding, authority, charge and stable task ID saved as one intent before task materialization; one dispatch per intent. |

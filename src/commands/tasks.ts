@@ -3,6 +3,8 @@
 // (list/status/ready/blocked/show/dot).
 import { readdirSync, rmSync, statSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
+import { flowProgress } from '../flow3/progress.js';
+import { foreignLock, lockHeldBy } from '../store.js';
 import { executionReport } from '../execution-report.js';
 import {
   addTask,
@@ -205,6 +207,7 @@ export function listCmd(argv: string[]): void {
 export function statusCmd(argv: string[]): void {
   const file = flag(argv, 'file') ?? 'dag.run.json';
   const run = loadRun(file);
+  const progress = flowProgress(run, !!foreignLock(file) || lockHeldBy(file));
   const counts: Record<string, number> = {};
   for (const t of Object.values(run.tasks)) {
     const d = deriveStatus(run, t);
@@ -219,10 +222,10 @@ export function statusCmd(argv: string[]): void {
       counts,
       ready: getReady(run).map((t) => t.id),
       blocked: getBlocked(run).map((t) => t.id),
-      stuck: describeStuck(run),
+      stuck: describeStuck(run), progress,
       execution: executionReport(run, { root: dirname(resolve(file)) }),
     },
-    () => summarize(run),
+    () => summarize(run) + (progress ? '\n' + progress.message : ''),
   );
 }
 

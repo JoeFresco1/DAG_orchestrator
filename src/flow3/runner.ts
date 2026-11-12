@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { addTask, acquireLock, attemptLogPath, atomicWriteJson, heartbeatPath, lockHeldBy, logEvent, recoverInterrupted, runPaths } from '../store.js';
 import { commitAll, createTaskWorktree, ensureIntegrationWorktree, git, isGitRepo, removeWorktree, snapshotExcludes } from '../git-worktree.js';
-import { depsMet, describeDeps, gateBlocks } from '../graph.js';
+import { depsMet, describeDeps, gateBlocks, transitiveDepSet } from '../graph.js';
 import { planAttempt } from '../harness-chain.js';
 import { findHarness, inferHarnessForCmd } from '../harnesses.js';
 import { captureExecutionPolicy } from '../execution-policy.js';
@@ -15,8 +15,10 @@ import { parseVerdict, stripAnsi, type ExecContext, type ExecOutcome, type Execu
 import type { WorkerSession } from '../agent-session.js';
 import { PHASE_TIMEOUTS, type Candidate, type Checkpoint, type FlowSettings, type Phase, type RepairContext, type RepairIntent } from './contracts.js';
 import { acceptanceIdentity, completionScope, evidenceFailure, evidenceArtifacts } from './lifecycle.js';
+import { codexQuota, quotaSignal, QuotaUnavailable, type QuotaProbe, type QuotaReading } from './quota.js';
+import { repairBrief } from './progress.js';
 import { chainWaves, checkGraph, overlaps, promptFor } from './graph.js';
-import { checkScriptCommands, commandMentionsPath, protectedRepairPath, repairDecision } from './repair.js';
+import { checkScriptCommands, commandMentionsPath, protectedRepairPath, repairDecision, transientProviderFailure } from './repair.js';
 
 interface Worker {
   path: string;
@@ -57,6 +59,8 @@ export class FlowRunner {
   private scope = new Set<string>();
   private finalCheckpointId?: string;
   private explicitSelection = false;
+  private schedulingChanged = false;
+  private wakeQuota?: () => void;
   private budgetReached = false;
   private deadline = 0;
   private logBytes = new Map<string, number>();
@@ -81,8 +85,10 @@ export class FlowRunner {
     this.running = this.run();
     return this.running;
   }
-  async stop(): Promise<void> {
+  async stop(userRequested = true): Promise<void> {
     this.isStopping = true;
+    if (this.state.flowState && userRequested) { this.finishQuotaClock(); this.state.flowState.userStopped = true; this.save(); }
+    this.wakeQuota?.();
     this.event('run-stop', null, 'Flow 3.0 stop requested');
     for (const cancel of [...this.cancels]) cancel();
     await this.running;
@@ -119,6 +125,8 @@ export class FlowRunner {
         this.ownedFiles.add(file); owns = true;
       }
       this.state.flowState ??= { version: 3, repairRound: 0, checkpoints: [], issues: [] };
+      delete this.state.flowState.userStopped;
+      if (this.state.flowState.quotaWait?.manual) delete this.state.flowState.quotaWait;
       this.state.flowState.issues = [];
       this.state.flowState.implementationComplete = false;
       this.state.flowState.acceptanceStatus = 'pending';
@@ -139,12 +147,16 @@ export class FlowRunner {
       for (const warning of graph.warnings) this.event('note', null, warning);
       if (!graph.valid) throw Error(`Graph check failed: ${graph.errors.join('; ')}`);
       for (const edge of graph.addedEdges) this.event('edit', edge.consumer, `Added producer dependency ${edge.producer}`);
+      // Admission can add edges after completionScope was calculated.
+      this.reopenProducers(this.required());
       for (const id of this.scope) if (!this.state.tasks[id].node) throw Error(`${id}: Flow 3.0 needs goal, touches, creates, relies_on and one verify command (dag edit --verify ...)`);
       this.recovery = recoverInterrupted(this.state);
       if (!isGitRepo(this.repo)) throw Error('Flow 3.0 requires a Git repository for its worker pool and integration branch');
       this.integration = ensureIntegrationWorktree(this.repo, this.state.id, undefined, file ? snapshotExcludes(file, this.repo) : undefined);
       this.warmCaches(this.integration.path);
       this.state.flowState.integrationBase ??= git(this.integration.path, ['rev-parse', 'HEAD']).stdout;
+      for (const task of this.correctedTasks()) this.assertVerificationCorrection(task, this.integration.path);
+      this.reopenProducers(this.correctedTasks().flatMap(t => t.nodeState!.verificationCorrection!.requires));
       this.state.executionPolicy = captureExecutionPolicy(this.state);
       const wall = this.opts.maxWallClockMs ?? this.state.settings.maxWallClockMs;
       if (!this.state.flowState.deadlineAt && wall > 0) this.state.flowState.deadlineAt = Date.now() + wall;
@@ -153,10 +165,15 @@ export class FlowRunner {
       this.event('run-start', null, `Flow 3.0; integration ${this.integration.branch}; ${this.scope.size} nodes`);
       this.save();
       // One advisory call runs alongside dispatch. Slow/failed review cannot gate startup.
-      this.startAdvisory();
+      if (!this.state.flowState.quotaWait) this.startAdvisory();
       for (;;) {
+        if (this.state.flowState.quotaWait && !await this.awaitQuota()) break;
+        this.schedulingChanged = false;
         await this.schedule();
+        if (this.state.flowState.quotaWait && !this.isStopping) continue;
         if (this.stopped()) break;
+        // Local and wave diagnoses may enlarge scope while a wave snapshot runs.
+        if (this.schedulingChanged) continue;
         const unfinished = [...new Set([...this.required(), ...[...this.scope].filter(id => checkpointRepair(this.state.tasks[id]))])].filter(id => this.state.tasks[id]?.status !== 'completed');
         this.state.flowState.implementationComplete = !unfinished.length;
         // Missing producers are a scheduling outcome, not a product test failure.
@@ -167,14 +184,7 @@ export class FlowRunner {
         }
         const final = await this.checkpoint('final', [...this.scope]);
         const producers = final.results.flatMap(r => r.decision?.action === 'defer' ? r.decision.requires ?? [] : []);
-        if (producers.some(id => !this.scope.has(id) || !this.required().includes(id))) {
-          const visited = new Set<string>();
-          const reopen = (id: string) => { if (visited.has(id)) return; visited.add(id); this.scope.add(id); if (!this.required().includes(id)) this.required().push(id); for (const dep of [...this.state.tasks[id].deps, ...(this.state.tasks[id].node?.verify_requires ?? [])]) reopen(dep); };
-          for (const id of producers) reopen(id);
-          this.state.flowState.completion!.optional = this.state.flowState.completion!.optional.filter(id => !this.required().includes(id));
-          this.state.flowState.completion!.excluded = this.state.flowState.completion!.excluded.filter(id => !this.required().includes(id));
-          this.state.flowState.implementationComplete = false; this.save(); continue;
-        }
+        if (this.reopenProducers(producers)) continue;
         if (final.passed) { await this.finalReview(final); break; }
         if (!this.canRepair()) break;
         const errors = final.results.filter(r => !r.passed);
@@ -274,7 +284,92 @@ export class FlowRunner {
     if (clean.code) throw failure(clean.stderr, 'worktree');
   }
 
+  /** This intent is durable before git changes HEAD. update-ref can be repeated after a crash. */
+  private pinInterruptedWork(task: Task): void {
+    const state = task.nodeState!, saved = state.quotaCapture!;
+    const ref = 'refs/dag/quota/' + this.state.id + '/' + task.id;
+    if (saved.attempt !== task.attempts || saved.definition !== definition(task) || this.recovery.orphanPids.length ||
+      saved.path !== state.worker || !existsSync(saved.path)) throw failure('Cannot identify interrupted worktree; source preserved', 'worktree');
+    const current = git(saved.path, ['rev-parse', 'HEAD']).stdout;
+    if (current !== saved.head && (git(saved.path, ['rev-parse', 'HEAD^']).stdout !== saved.head ||
+      git(saved.path, ['log', '-1', '--format=%s']).stdout !== 'dag: interrupted implementation')) throw failure('Interrupted worktree changed; source preserved', 'worktree');
+    const snapshot = commitAll(saved.path, 'dag: interrupted implementation', this.settings.cachePaths ?? ['node_modules', '.venv']);
+    const commit = snapshot.commit ?? current;
+    const pin = git(this.repo, ['update-ref', ref, commit]);
+    if (pin.code) throw failure(pin.stderr, 'worktree');
+    state.quotaWork = { commit, definition: saved.definition, attempt: saved.attempt, remainingMs: saved.remainingMs, session: saved.session };
+    delete state.quotaCapture; this.save();
+  }
+  private finishQuotaClock(): void {
+    const flow = this.state.flowState, wait = flow?.quotaWait;
+    if (!flow || wait?.since === undefined) return;
+    if (flow.deadlineAt) this.deadline = flow.deadlineAt += Math.max(0, Date.now() - wait.since);
+    delete wait.since;
+  }
+  private provider(task: Task, cmd: string): string {
+    return this.opts.quotaProbe ? 'adapter' : (task.harness === 'codex' || inferHarnessForCmd(cmd)?.name === 'codex' ? 'codex' : 'unsupported');
+  }
+  private probe(provider: string) { return this.opts.quotaProbe ?? (provider === 'codex' ? codexQuota : undefined); }
+  private requestQuotaWait(provider: string, reason: string, reading?: QuotaReading, confirmed = true): void {
+    const wait = this.state.flowState!.quotaWait ??= { provider, reason, reading, confirmed };
+    if (confirmed) wait.confirmed = true;
+    if (provider !== wait.provider && !wait.pendingProviders?.includes(provider)) (wait.pendingProviders ??= []).push(provider);
+  }
+  private readQuota(probe: QuotaProbe): Promise<QuotaReading> {
+    return new Promise((resolve, reject) => {
+      const cleanup = () => { clearTimeout(timer); this.cancels.delete(cancel); };
+      const cancel = () => { cleanup(); reject(Error('Quota read interrupted')); };
+      const timer = setTimeout(cancel, 15000);
+      this.cancels.add(cancel);
+      Promise.resolve().then(probe).then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    });
+  }
+  private fresh(r: QuotaReading, requested: number) {
+    return Number.isFinite(r.remainingPercent) && r.remainingPercent >= 0 && r.remainingPercent <= 100 && r.observedAt >= requested && r.observedAt <= Date.now();
+  }
+  private async awaitQuota(): Promise<boolean> {
+    const flow = this.state.flowState!, w = flow.quotaWait!, probe = this.probe(w.provider);
+    if (this.isStopping || this.budgetReached) return false;
+    if (!probe) { this.finishQuotaClock(); w.manual = true; w.reason = 'No quota probe for this harness. Confirm availability and explicitly start the saved run.'; this.save(); return false; }
+    if (w.since === undefined && this.stopped()) return false;
+    if (w.confirmed !== false) w.since ??= Date.now();
+    this.save();
+    while (!this.isStopping) {
+      if (w.since === undefined && this.stopped()) return false;
+      const requested = Date.now();
+      try {
+        const r = await this.readQuota(probe); if (this.isStopping) return false;
+        if (!this.fresh(r, requested)) throw Error('Stale reading');
+        w.reading = r;
+        if (r.remainingPercent > (this.settings.quotaReservePercent ?? 0)) {
+          const next = w.pendingProviders?.shift();
+          if (next) {
+            w.provider = next; delete w.reading; delete w.nextProbeAt; this.save();
+            return this.awaitQuota();
+          }
+          this.finishQuotaClock(); delete flow.quotaWait; this.event('note', null, 'Quota available; resuming saved work'); this.save(); return true;
+        }
+        if (w.since === undefined && this.stopped()) return false;
+        w.confirmed = true; w.since ??= Date.now();
+        w.reason = 'Waiting for quota above reserve';
+        w.nextProbeAt = Math.min(requested + 300000, Math.max(requested + 1000, r.resetAt ?? requested + 30000));
+      } catch (error) {
+        if (this.isStopping) return false;
+        if (error instanceof QuotaUnavailable) { this.finishQuotaClock(); w.manual = true; w.reason = error.message; this.save(); return false; }
+        w.reason = 'Waiting for fresh quota reading'; w.nextProbeAt = Date.now() + 30000;
+      }
+      this.save();
+      await new Promise<void>(resolve => {
+        const wake = () => { clearTimeout(timer); this.wakeQuota = undefined; resolve(); };
+        const timer = setTimeout(wake, Math.max(1, w.nextProbeAt! - Date.now())); this.wakeQuota = wake;
+      });
+    }
+    return false;
+  }
   private async schedule(): Promise<void> {
+    // Known acceptance producers need no deliberately failing final checkpoint.
+    const checks = new Set(this.commands('final'));
+    this.reopenProducers([...checks].flatMap(command => this.checkPrerequisites(command)));
     // Resume a charged checkpoint repair before releasing another downstream wave.
     for (const id of this.scope) {
       const task = this.state.tasks[id];
@@ -286,12 +381,12 @@ export class FlowRunner {
     }
     const concurrency = Math.min(64, Math.max(1, this.opts.concurrency ?? this.state.settings.concurrency));
     for (const wave of chainWaves(this.state, this.scope)) {
-      if (this.stopped()) return;
+      if (this.stopped() || this.state.flowState?.quotaWait) return;
       const previouslyDone = new Set(wave.flat().filter(id => this.state.tasks[id].status === 'completed'));
       const queue = [...wave], running = new Map<Promise<void>, string[]>();
       const touches = (chain: string[]) => chain.flatMap(id => this.state.tasks[id].node?.touches ?? []);
       while (queue.length || running.size) {
-        if (!this.stopped()) for (let i = 0; i < queue.length && running.size < concurrency;) {
+        if (!this.stopped() && !this.state.flowState?.quotaWait) for (let i = 0; i < queue.length && running.size < concurrency;) {
           const chain = queue[i];
           const pending = chain.find(id => ['pending', 'ready'].includes(this.state.tasks[id].status));
           if (!pending || !depsMet(this.state.tasks[pending], this.state.tasks) || gateBlocks(this.state.tasks[pending])) { queue.splice(i, 1); continue; }
@@ -311,8 +406,9 @@ export class FlowRunner {
         }
       }
       // All active workers finish before checking the shared integration branch.
-      if (wave.flat().some(id => !previouslyDone.has(id) && this.state.tasks[id].status === 'completed') && !this.stopped()) {
+      if (wave.flat().some(id => !previouslyDone.has(id) && this.state.tasks[id].status === 'completed') && !this.stopped() && !this.state.flowState?.quotaWait) {
         let check = await this.checkpoint('wave', wave.flat());
+        this.reopenProducers(check.results.flatMap(r => r.decision?.action === 'defer' ? r.decision.requires ?? [] : []));
         while (!check.passed && this.canRepair() && this.repairCommand() && this.repairable(check) && !this.stopped()) {
           const fix = this.addFix(check);
           await this.runChain([fix.id]);
@@ -330,7 +426,7 @@ export class FlowRunner {
       for (const id of chain) {
         const task = this.state.tasks[id];
         if (task.status === 'completed') continue;
-        if (this.stopped() || !['pending', 'ready'].includes(task.status) || !depsMet(task, this.state.tasks) || gateBlocks(task)) break;
+        if (this.stopped() || this.state.flowState?.quotaWait || !['pending', 'ready'].includes(task.status) || !depsMet(task, this.state.tasks) || gateBlocks(task)) break;
         const done = await this.node(task, worker);
         if (!done) break;
         // Keep the same worktree, warm environment and harness session through a straight chain.
@@ -357,9 +453,27 @@ export class FlowRunner {
         await this.land(task, saved);
         return this.complete(task);
       }
+      if (task.nodeState?.verificationCorrection) return await this.resumeCorrectedVerification(task, worker);
+      if (task.nodeState?.quotaCapture) this.pinInterruptedWork(task);
+      let continuation = task.nodeState?.quotaWork;
+      // A quota checkpoint already contains any replayed prerequisite edits.
+      const dependencyWork = continuation ? undefined : task.nodeState?.dependencyWork;
+      if (dependencyWork && (dependencyWork.definition !== definition(task) || dependencyWork.attempt !== task.attempts)) throw failure('Saved prerequisite recovery belongs to changed work; source preserved', 'integration');
+      if (continuation && (continuation.definition !== definition(task) || continuation.attempt !== task.attempts || continuation.remainingMs <= 0 || continuation.dispatching || this.recovery.orphanPids.length)) throw failure('Interrupted work cannot safely resume; inspect saved source', 'budget');
+      if (this.settings.quotaReservePercent !== undefined) {
+        const selected = planAttempt(task.harnessChain ?? this.state.settings.harnessChain, Math.max(1, task.attemptsInCycle + (continuation ? 0 : 1)));
+        const provider = this.provider(task, this.opts.workCommand?.(task) ?? selected?.harness?.cmd ?? task.cmd ?? '');
+        const requested = Date.now(); let reading;
+        try { const probe = this.probe(provider); if (probe) reading = await this.readQuota(probe); } catch { /* retry through wait path */ }
+        if (!reading || !this.fresh(reading, requested) || reading.remainingPercent <= this.settings.quotaReservePercent) {
+          if (this.isStopping) return false;
+          this.requestQuotaWait(provider, 'Checking configured quota reserve', reading, !!reading && this.fresh(reading, requested)); this.save(); return false;
+        }
+      }
+      if (this.state.flowState?.quotaWait || this.isStopping) return false;
       let base = '';
-      for (; task.attemptsInCycle < attemptLimit && !this.stopped();) {
-        task.status = 'running'; task.attempts++; task.attemptsInCycle++;
+      for (; (continuation || task.attemptsInCycle < attemptLimit) && !this.stopped();) {
+        task.status = 'running'; if (!continuation) { task.attempts++; task.attemptsInCycle++; }
         task.startedAt = now(); task.finishedAt = null; task.failureKind = null; task.result = null;
         task.nodeState = { ...task.nodeState, worker: worker.path };
         if (!checkpointRepair(task)) delete task.nodeState.decision;
@@ -370,7 +484,15 @@ export class FlowRunner {
             if (prepare) await this.phase(task, 'setup', prepare, worker.path, worker);
             worker.prepared = true;
           }
-          if (!base) { this.reset(worker); base = git(worker.path, ['rev-parse', 'HEAD']).stdout; }
+          if (!base) {
+            if (continuation) {
+              const restored = git(worker.path, ['reset', '--hard', continuation.commit]);
+              if (restored.code) throw failure('Cannot restore interrupted source: ' + restored.stderr, 'worktree');
+            } else if (dependencyWork) {
+              const restored = git(worker.path, ['cherry-pick', '--no-commit', dependencyWork.commit]);
+              if (restored.code) { git(worker.path, ['cherry-pick', '--abort']); throw failure('Saved prerequisite edits conflict with integrated producers; source preserved', 'integration'); }
+            } else this.reset(worker); base = git(worker.path, ['rev-parse', 'HEAD']).stdout;
+          }
           const selected = planAttempt(task.harnessChain ?? this.state.settings.harnessChain, task.attemptsInCycle);
           const preset = selected?.harness;
           const cmd = checkpointRepair(task) ? task.cmd : this.opts.workCommand?.(task) ?? preset?.cmd ?? task.cmd;
@@ -379,11 +501,17 @@ export class FlowRunner {
           const workTask = { ...task, spec: promptFor(task, task.attemptsInCycle > 1),
             model: task.model ?? selected?.candidate.model ?? null,
             variant: task.variant ?? selected?.candidate.variant ?? null };
+          if (continuation) {
+            worker.session = { ...continuation.session };
+            continuation.dispatching = true; this.save(); // a crash in an unconfirmed dispatch must not replay its effects
+          }
           const output = checkpointRepair(task)
-            ? await this.guardedRepair(task, worker, cmd, workTask.spec)
+            ? await this.guardedRepair(task, worker, cmd)
             : await this.phase(workTask, 'work', cmd, worker.path, worker, task);
+          delete task.nodeState!.quotaWork; continuation = undefined;
+          delete task.nodeState!.dependencyWork;
           (task.milestones ??= {}).implementedAt = now();
-          await this.verifyNode(task, worker, cmd);
+          await this.verifyNode(task, worker, cmd, base);
           if (checkpointRepair(task)) for (const command of this.verificationCommands(task).filter(command => command !== task.node!.verify)) {
             await this.phase(task, 'verify', command, worker.path, worker);
           }
@@ -403,6 +531,19 @@ export class FlowRunner {
           if (task.nodeState?.candidate) throw error; // landing is never an implementation retry
           task.lastRejection = error instanceof Error ? error.message : String(error);
           task.failureKind = (error as { kind?: FailureKind }).kind ?? 'exit';
+          const interrupted = error as { quotaProvider?: string; remainingMs?: number };
+          if (interrupted.quotaProvider && !worker.tainted) {
+            worker.tainted = true;
+            if (!task.nodeState?.repairBaseline) task.nodeState!.quotaCapture = {
+              path: worker.path, head: git(worker.path, ['rev-parse', 'HEAD']).stdout, definition: definition(task),
+              attempt: task.attempts, remainingMs: interrupted.remainingMs!, session: { ...worker.session },
+            };
+            task.status = 'pending'; task.pid = null; task.result = 'Quota interrupted; saved source';
+            this.requestQuotaWait(interrupted.quotaProvider, 'Harness reported quota exhaustion');
+            this.save();
+            if (task.nodeState?.quotaCapture) { this.pinInterruptedWork(task); worker.tainted = false; }
+            return false;
+          }
           if (this.isStopping) {
             // A stopped, unverified worker is the only copy of its in-progress edits.
             // Leave it registered for explicit recovery rather than removing it in run cleanup.
@@ -417,11 +558,21 @@ export class FlowRunner {
               git(this.repo, ['branch', branch, saved.commit]); task.branch = branch; task.commit = saved.commit;
             }
           } catch { /* Preserve the worktree if the executor could not be stopped. */ }
-          if (task.nodeState?.decision || checkpointRepair(task) || worker.tainted || task.attemptsInCycle >= attemptLimit) throw error;
-          const decision = repairDecision(this.state, { command: task.cmd ?? '', output: task.lastRejection,
-            phase: task.phaseHistory?.at(-1)?.phase as Phase ?? 'work', kind: task.failureKind });
-          task.nodeState!.decision = decision;
-          if (decision.action !== 'repair') { this.event('note', task.id, `Automatic retry held: ${decision.reason}`); throw error; }
+          const phase = task.phaseHistory?.at(-1)?.phase as Phase ?? 'work';
+          const priorDecision = task.nodeState?.decision;
+          const diagnosis = task.nodeState?.decision ?? repairDecision(this.state, { command: task.cmd ?? '', output: task.lastRejection, phase, kind: task.failureKind });
+          task.nodeState!.decision = diagnosis; this.save();
+          if (!worker.tainted && !continuation && !checkpointRepair(task) && diagnosis.action === 'defer' && this.deferNode(task, attemptLimit, base, worker)) return false;
+          if (continuation || priorDecision || checkpointRepair(task) || worker.tainted || task.attemptsInCycle >= attemptLimit) throw error;
+          const chain = task.harnessChain ?? this.state.settings.harnessChain;
+          const current = planAttempt(chain, task.attemptsInCycle), next = planAttempt(chain, task.attemptsInCycle + 1);
+          const alternate = phase === 'work' && !this.opts.workCommand && transientProviderFailure(task.lastRejection) && current && next &&
+            JSON.stringify(current.candidate) !== JSON.stringify(next.candidate);
+          if (diagnosis.action !== 'repair' && !alternate) { this.event('note', task.id, `Automatic retry held: ${diagnosis.reason}`); throw error; }
+          // The existing persisted implementation attempt limit bounds fallback.
+          // No node/checkpoint repair allowance is spent or renewed.
+          if (alternate) { worker.session = {}; this.event('note', task.id, `Transient provider failure; using authorized alternate ${next.candidate.harness}`); }
+          delete task.nodeState!.decision;
           this.event('task-retry', task.id, `Retry in saved workspace with actual failure: ${tail(task.lastRejection, 800)}`);
         }
       }
@@ -482,15 +633,116 @@ export class FlowRunner {
   }
   private verificationCommands(task: Task): string[] {
     const context = task.nodeState?.repairContext;
-    return [...new Set([task.node!.verify, ...(context?.verification ?? []).filter(command =>
-      context?.owners.some(id => this.state.tasks[id]?.status === 'completed' && this.state.tasks[id].node?.verify === command))])];
+    return [...new Set([this.localVerification(task), ...(context?.verification ?? []).filter(command =>
+      context?.owners.some(id => this.state.tasks[id]?.status === 'completed' && this.localVerification(this.state.tasks[id]) === command))])];
   }
-  private async verifyNode(task: Task, worker: Worker, workCommand: string): Promise<void> {
+  private correctedTasks(): Task[] { return Object.values(this.state.tasks).filter(t => t.nodeState?.verificationCorrection); }
+  private localVerification(task: Task): string { return task.nodeState?.verificationCorrection?.local ?? task.node!.verify; }
+  private checkPrerequisites(command: string): string[] {
+    return [...new Set([...(this.settings.checkPrerequisites?.[command] ?? []),
+      ...this.correctedTasks().flatMap(t => t.nodeState!.verificationCorrection!.original === command ? t.nodeState!.verificationCorrection!.requires : [])])];
+  }
+  private localCheckCommand(task: Task): string {
+    return checkCommand(task.node!.local_check!, join(runPaths(this.opts.file!).dir, 'flow-local-checks'));
+  }
+  private localCheckSources(task: Task, path: string, files = task.node!.local_check!.files!): Record<string, string> {
+    return Object.fromEntries(files.map(file => {
+      const target = join(path, file);
+      if (!existsSync(target) || !lstatSync(target).isFile()) throw failure(`Local check authority unavailable: protected test file ${file} is missing or not a regular file`, 'integration');
+      return [file, hash(readFileSync(target))];
+    }));
+  }
+  private assertVerificationCorrection(task: Task, path: string): void {
+    const correction = task.nodeState?.verificationCorrection;
+    if (!correction) return;
+    if (!this.opts.file || !task.node?.local_check || correction.definition !== definition(task) || correction.original !== task.node.verify ||
+      correction.local !== this.localCheckCommand(task) || correction.work.attempt !== task.attempts ||
+      !correction.requires.includes(task.id) || correction.requires.some(id => !this.state.tasks[id]) ||
+      task.node.local_check.files!.some(file => !Object.hasOwn(correction.checkSources, file)) ||
+      JSON.stringify(correction.checkSources) !== JSON.stringify(this.localCheckSources(task, path, Object.keys(correction.checkSources)))) {
+      throw failure(`Verification correction authority changed for ${task.id}; retain its original acceptance obligation and saved source`, 'integration');
+    }
+  }
+  /** This is a check-staging correction, never an implementation edge or coding retry. */
+  private correctVerification(task: Task, worker: Worker, base: string): boolean {
+    const state = task.nodeState!, decision = state.decision!;
+    if (state.verificationCorrection || checkpointRepair(task) || decision.action !== 'defer' || !decision.requires?.length) return false;
+    const consumer = (id: string) => id !== task.id && transitiveDepSet(this.state, id).has(task.id);
+    if (!decision.requires.some(consumer)) return false; // ordinary missing producer
+    const refuse = (reason: string) => { decision.action = 'hold'; decision.reason = `Verification dependency cycle: ${reason}`; this.save(); return false; };
+    if (/AssertionError|ERR_ASSERTION|SyntaxError|\berror TS\d+/i.test(state.latestFailedChecks?.[0]?.output ?? '')) return refuse('assertion or compiler diagnostics do not establish an unambiguous missing verification prerequisite');
+    if (decision.requires.some(id => !consumer(id))) return refuse('mixed or ambiguous implementation and downstream verification prerequisites');
+    if (!task.node!.local_check) return refuse('missing local_check authority; declare a meaningful local behavioral test instead of guessing another verifier');
+    if (!this.opts.file || !this.opts.persist) return refuse('a durable run file and persistence adapter are required');
+    if (state.repairContext || state.repairBaseline) return refuse('an existing charged repair authority cannot be restaged automatically');
+    let sources: Record<string, string>;
+    try {
+      const integration = this.integration!.path, pkg = join(integration, 'package.json');
+      const scripts = existsSync(pkg) ? JSON.parse(readFileSync(pkg, 'utf8')).scripts ?? {} : {};
+      const commands = checkScriptCommands([task.node!.verify], scripts);
+      const protectedPaths = this.protectedPaths();
+      const files = [...new Set([...task.node!.local_check!.files!, ...[...snapshot(integration).keys()].filter(file =>
+        file === 'package.json' || protectedPaths.some(path => overlaps(path, file)) || commands.some(command => commandMentionsPath(command, file)))])];
+      sources = this.localCheckSources(task, integration, files);
+      if (JSON.stringify(sources) !== JSON.stringify(this.localCheckSources(task, worker.path, files))) return refuse('protected verification sources differ from integration; no authority to replace tests or requirements');
+    } catch (error) { return refuse((error as Error).message); }
+    const local = this.localCheckCommand(task);
+    const saved = commitAll(worker.path, `dag: verification staging ${task.id}`, this.settings.cachePaths ?? ['node_modules', '.venv']);
+    const commit = saved.commit ?? git(worker.path, ['rev-parse', 'HEAD']).stdout;
+    const pin = git(this.repo, ['update-ref', `refs/dag/verification/${this.state.id}/${task.id}`, commit]);
+    if (pin.code) throw failure(`Cannot pin source for verification correction: ${pin.stderr}`, 'integration');
+    state.verificationCorrection = { definition: definition(task), original: task.node!.verify, local,
+      requires: [...new Set([task.id, ...decision.requires, ...(this.settings.checkPrerequisites?.[task.node!.verify] ?? [])])],
+      checkSources: sources, work: { commit, base, attempt: task.attempts } };
+    // Persist the complete intent before any alternate verification or downstream dispatch.
+    this.save();
+    this.reopenProducers(state.verificationCorrection.requires);
+    this.event('note', task.id, `Verification plan corrected: run declared local behavior; retain ${task.node!.verify} for final acceptance after ${decision.requires.join(', ')}`);
+    this.save();
+    return true;
+  }
+  private async resumeCorrectedVerification(task: Task, worker: Worker): Promise<boolean> {
+    const saved = task.nodeState!.verificationCorrection!;
+    if (this.recovery.orphanPids.length) throw failure('Verification correction recovery held: orphan executors need inspection', 'worktree');
+    const restored = git(worker.path, ['reset', '--hard', saved.work.commit]);
+    if (restored.code) throw failure(`Cannot restore corrected verification source: ${restored.stderr}`, 'worktree');
+    this.assertVerificationCorrection(task, worker.path);
+    task.nodeState!.worker = worker.path; task.status = 'running'; task.finishedAt = null; task.failureKind = null; this.save();
+    if (!worker.prepared) {
+      const prepare = this.opts.prepareCommand?.(task) ?? task.prepareCmd ?? this.state.settings.worktreePrepareCmd;
+      if (prepare) await this.phase(task, 'setup', prepare, worker.path, worker);
+      worker.prepared = true;
+    }
+    await this.verifyNode(task, worker, task.cmd ?? '', saved.work.base);
+    (task.milestones ??= {}).checkedAt = now();
+    commitAll(worker.path, `dag: ${task.id} verified saved implementation`, this.settings.cachePaths ?? ['node_modules', '.venv']);
+    const commit = git(worker.path, ['rev-parse', 'HEAD']).stdout, branch = `dag-node/${this.state.id}-${task.id}-${task.attempts}`;
+    const pin = git(this.repo, ['branch', '-f', branch, commit]);
+    if (pin.code) throw failure(`Cannot pin corrected verified candidate: ${pin.stderr}`, 'integration');
+    task.branch = branch; task.commit = commit; task.result = 'Verified saved implementation; original composed obligation retained';
+    const candidate: Candidate = { commit, base: saved.work.base, attempt: task.attempts, definition: definition(task) };
+    task.nodeState!.candidate = candidate; this.save();
+    await this.land(task, candidate);
+    return this.complete(task);
+  }
+  private async verifyNode(task: Task, worker: Worker, workCommand: string, base?: string): Promise<void> {
+    const waiting = [...new Set([...(task.node!.verify_requires ?? []), ...(this.settings.checkPrerequisites?.[task.node!.verify] ?? [])])]
+      .filter(id => id !== task.id && this.state.tasks[id]?.status !== 'completed');
+    if (base && !task.nodeState?.verificationCorrection && !checkpointRepair(task) && !worker.tainted && !this.stopped() &&
+      waiting.some(id => transitiveDepSet(this.state, id).has(task.id))) {
+      const state = task.nodeState!, output = `Not executed: declared verification prerequisites are unfinished (${waiting.join(', ')})`;
+      state.decision = repairDecision(this.state, { command: task.node!.verify, output, phase: 'verify', requires: waiting });
+      state.latestFailedChecks = [{ command: task.node!.verify, passed: false, outcome: 'deferred', output, decision: state.decision }];
+      (state.diagnosisHistory ??= []).push({ decision: { ...state.decision }, checks: state.latestFailedChecks, at: now() }); this.save();
+      if (!this.correctVerification(task, worker, base)) throw failure(state.decision.reason, 'integration');
+    }
     for (;;) {
-      let failedCommand = task.node!.verify;
+      let failedCommand = this.localVerification(task);
       try {
-        await this.phase(task, 'verify', task.node!.verify, worker.path, worker);
-        if (!checkpointRepair(task)) for (const command of this.verificationCommands(task)) if (command !== task.node!.verify) { failedCommand = command; await this.phase(task, 'verify', command, worker.path, worker); }
+        this.assertVerificationCorrection(task, worker.path);
+        await this.phase(task, 'verify', failedCommand, worker.path, worker);
+        this.assertVerificationCorrection(task, worker.path);
+        if (!checkpointRepair(task)) for (const command of this.verificationCommands(task)) if (command !== this.localVerification(task)) { failedCommand = command; await this.phase(task, 'verify', command, worker.path, worker); }
         delete task.nodeState!.decision; return;
       }
       catch (error) {
@@ -498,10 +750,9 @@ export class FlowRunner {
         const state = task.nodeState!;
         const ledger = (this.state.flowState!.nodeRepairs ??= {})[task.id] ??= { used: state.repairAttempts ?? 0, failures: state.repairFailures ?? [], history: [] };
         state.repairAttempts = ledger.used; state.repairFailures = ledger.failures;
-        const decision = repairDecision(this.state, { command: failedCommand, output, phase: 'verify',
-          kind: (error as { kind?: string }).kind, requires: task.node!.verify_requires });
-        // A local check cannot be deferred past its own downstream consumer. Admission must wire its producers.
-        if (decision.action === 'defer') { decision.action = 'hold'; decision.reason = 'Local verification requires an unfinished producer; declare verify_requires and repair the graph'; }
+        // Diagnose the actual failure: a declared unfinished consumer cannot mask
+        // an assertion, timeout or provider failure as a missing prerequisite.
+        const decision = repairDecision(this.state, { command: failedCommand, output, phase: 'verify', kind: (error as { kind?: string }).kind });
         if (state.repairFailures?.includes(decision.fingerprint)) {
           decision.action = 'hold'; decision.category = 'no-progress'; decision.reason = 'The same verifier failure remained after repair';
         }
@@ -512,6 +763,8 @@ export class FlowRunner {
         state.decision = decision;
         state.latestFailedChecks = [{ command: failedCommand, passed: false, output, decision, evidenceRef: (error as { evidenceRef?: string }).evidenceRef }];
         (state.diagnosisHistory ??= []).push({ decision: { ...decision }, checks: state.latestFailedChecks, at: now() }); this.save();
+        if (!this.stopped() && !worker.tainted && failedCommand === task.node!.verify && base &&
+          this.correctVerification(task, worker, base)) continue;
         if (this.stopped() || worker.tainted || checkpointRepair(task) || decision.action !== 'repair') {
           this.event('note', task.id, `Node repair held: ${decision.reason}; used ${state.repairAttempts ?? 0} repair rounds`);
           throw error;
@@ -522,13 +775,13 @@ export class FlowRunner {
         state.repairContext.command = this.settings.repairCommand ?? workCommand;
         ledger.history.push(state.repairContext);
         this.event('task-repair', task.id, `In-place repair ${state.repairAttempts}: ${decision.reason}`); this.save();
-        await this.guardedRepair(task, worker, this.settings.repairCommand ?? workCommand,
-          `Repair only the concrete failure in the existing implementation. Keep all completed edits.\nNode: ${task.node!.goal}\nFailed check: ${failedCommand}\nActual output:\n${tail(output, 6000)}`);
+        await this.guardedRepair(task, worker, this.settings.repairCommand ?? workCommand);
       }
     }
   }
   private protectedPaths(): string[] {
     return [...new Set([...(this.settings.repairProtectedPaths ?? []), ...(this.settings.acceptanceInputs ?? []),
+      ...Object.values(this.state.tasks).flatMap(t => t.node?.local_check?.files ?? []),
       ...(this.state.planning?.manifest.sources.map(s => s.path) ?? []),
       ...(this.state.planning?.manifest.tasks.flatMap(t => (t.files ?? []).filter(f => ['frozen', 'test'].includes(f.role)).map(f => f.path)) ?? [])])];
   }
@@ -541,7 +794,7 @@ export class FlowRunner {
     const limit = context.charge.pool === 'node' ? this.settings.nodeRepairRounds ?? 1 : this.settings.repairRounds ?? 2;
     if (context.charge.used > Math.min(limit, context.charge.limit)) throw failure('Repair policy violation: durable allowance exhausted', 'budget');
   }
-  private async guardedRepair(task: Task, worker: Worker, command: string, instruction: string): Promise<ExecOutcome> {
+  private async guardedRepair(task: Task, worker: Worker, command: string): Promise<ExecOutcome> {
     this.assertRepairAuthority(task);
     const context = task.nodeState?.repairContext;
     if (context?.command !== command) throw Error('Repair policy violation: changed persisted repair command');
@@ -550,7 +803,7 @@ export class FlowRunner {
     const scripts = existsSync(packageFile) ? JSON.parse(readFileSync(packageFile, 'utf8')).scripts ?? {} : {};
     const checks = checkScriptCommands([task.node!.verify, ...this.commands('wave'), ...this.commands('final')], scripts);
     const protectedPaths = [...this.protectedPaths(), ...[...before.keys()].filter(path => /\.(?:[cm]?[jt]sx?|py|sh|ps1|bat|cmd|rb)$/i.test(path) && checks.some(command => commandMentionsPath(command, path)))];
-    const spec = `${instruction}\nCurrent repair context: ${JSON.stringify(task.nodeState?.repairContext)}\nLatest diagnosis: ${JSON.stringify(task.nodeState?.decision ?? task.nodeState?.repairContext?.diagnosis)}\nLatest failed checks: ${JSON.stringify(task.nodeState?.latestFailedChecks ?? task.nodeState?.repairContext?.failedChecks)}\nDiagnosis history: ${JSON.stringify(task.nodeState?.diagnosisHistory ?? [])}\nEarlier evidence: ${JSON.stringify(this.state.flowState?.nodeRepairs?.[task.id]?.history ?? [])}\nAllowed files: ${task.node!.touches.join(', ')}.\nPreserve acceptance tests, assertions, contracts and check configuration. Additional protected paths: ${protectedPaths.join(', ') || '(none)'}. Do not change Git history, dependencies, task scope or verification commands. Do not run broad acceptance suites. Return the repair for the runner to verify.`;
+    const spec = repairBrief(task, protectedPaths, this.state.flowState?.nodeRepairs?.[task.id]?.history);
     task.nodeState!.repairBaseline = { head, files: [...before], protectedPaths }; this.save();
     try {
       const result = await this.phase({ ...task, spec }, 'repair', command, worker.path, worker, task);
@@ -578,6 +831,7 @@ export class FlowRunner {
 
   private async phase(task: Task, phase: Phase, command: string, cwd: string, worker?: Worker, observed = task, tokens: Partial<ExecContext> = {}): Promise<CheckOutcome> {
     let evidenceRef: string | undefined;
+    const priorArtifacts = ['verify', 'checkpoint', 'integration'].includes(phase) ? evidenceArtifacts(command, this.settings, cwd) : undefined;
     const checkedSource = phase === 'verify' ? { head: git(cwd, ['rev-parse', 'HEAD']).stdout, files: hash(JSON.stringify([...snapshot(cwd)])) } : undefined;
     const started = Date.now(); let lastOutput = started, finished = false, settled = false;
     let kill: (() => void) | undefined, rejectPhase: (error: Error) => void = () => {};
@@ -585,7 +839,7 @@ export class FlowRunner {
     const killOnce = () => { if (!killed && kill) { killed = true; try { kill(); } catch { /* already exited */ } } };
     const requestedTimeout = phase === 'work' ? this.opts.timeoutFor?.(observed) ?? observed.timeoutMs ?? this.opts.timeoutMs ?? this.settings.phaseTimeouts?.work ?? this.state.settings.timeoutMs
       : this.settings.phaseTimeouts?.[phase] ?? PHASE_TIMEOUTS[phase];
-    const timeout = Math.min(requestedTimeout || PHASE_TIMEOUTS[phase], this.deadline ? Math.max(1, this.deadline - Date.now()) : Infinity);
+    const timeout = Math.min(phase === 'work' ? observed.nodeState?.quotaWork?.remainingMs ?? Infinity : Infinity, requestedTimeout || PHASE_TIMEOUTS[phase], this.deadline ? Math.max(1, this.deadline - Date.now()) : Infinity);
     const idle = (observed.silenceMs ?? this.opts.silenceMs ?? this.settings.idleTimeoutMs ?? this.state.settings.silenceMs) || 180_000;
     const abort = (error: Error) => { if (!finished) { finished = true; killOnce(); rejectPhase(error); } };
     const cancel = () => abort(failure('Stopped', 'killed'));
@@ -625,13 +879,20 @@ export class FlowRunner {
           exitCode: outcome.exitCode, output: outcome.output, outputDigest: hash(outcome.output) });
       }
       if (checkedSource && (checkedSource.head !== git(cwd, ['rev-parse', 'HEAD']).stdout || checkedSource.files !== hash(JSON.stringify([...snapshot(cwd)])))) throw failure('Frozen source changed during verification');
+      if (outcome.exitCode !== 0 && (phase === 'work' || phase === 'repair') && quotaSignal(outcome.output))
+        throw Object.assign(failure('Harness reported quota exhaustion', 'interrupted'), { quotaProvider: this.provider(observed, command), remainingMs: Math.max(0, timeout - (Date.now() - started)) });
       if (outcome.exitCode !== 0) throw failure(`${phase} exit ${outcome.exitCode}: ${tail(outcome.output)}`);
       if (['verify', 'checkpoint', 'integration'].includes(phase)) {
         const packageFile = join(cwd, 'package.json');
         const scripts = existsSync(packageFile) ? JSON.parse(readFileSync(packageFile, 'utf8')).scripts ?? {} : {};
         const expanded = checkScriptCommands([command], scripts).join(' ; ');
-        const problem = evidenceFailure(command, outcome, this.settings, cwd, started, expanded);
+        const problem = evidenceFailure(command, outcome, this.settings, cwd, started, expanded, priorArtifacts);
         if (problem) throw failure(problem);
+        for (const corrected of this.correctedTasks()) if (command === this.localVerification(corrected)) {
+          const name = corrected.node!.local_check!.behavior.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const passed = new RegExp(`^\\s*ok\\s+\\d+\\s+(?:-\\s+)?${name}\\s*$`, 'm');
+          if (!passed.test(outcome.output)) throw failure(`Missing required evidence: passing named local behavior ${corrected.node!.local_check!.behavior} (skipped/file-only tests do not qualify)`);
+        }
       }
       return { ...outcome, evidenceRef, artifacts: ['verify', 'checkpoint', 'integration'].includes(phase) ? evidenceArtifacts(command, this.settings, cwd) : undefined };
     } catch (error) {
@@ -735,6 +996,7 @@ export class FlowRunner {
     const detected = (kind === 'wave' ? ['build', 'typecheck'] : ['build', 'typecheck', 'test', 'verify:spec']).filter(name => scripts[name]).map(name => `npm run ${name}`);
     const commands = authored ?? detected;
     return kind === 'wave' ? commands : [...new Set([...this.commands('wave'), ...commands, ...(this.settings.additionalFinalChecks ?? []),
+      ...this.correctedTasks().flatMap(t => [t.nodeState!.verificationCorrection!.original, this.localVerification(t)]),
       ...[...this.scope].filter(id => this.state.tasks[id].status === 'completed' && !checkpointRepair(this.state.tasks[id])).map(id => this.state.tasks[id].node!.verify)])];
   }
   private async checkpoint(kind: 'wave' | 'final', nodes: string[]): Promise<Checkpoint> {
@@ -744,6 +1006,7 @@ export class FlowRunner {
     if (kind === 'final') this.finalCheckpointId = checkpoint.id;
     const task = this.control(`${kind} checkpoint`);
     try {
+      for (const corrected of this.correctedTasks()) this.assertVerificationCorrection(corrected, path);
       if (!this.integrationPrepared && this.state.settings.worktreePrepareCmd) {
         await this.phase(task, 'setup', this.state.settings.worktreePrepareCmd, path);
         this.integrationPrepared = true;
@@ -756,7 +1019,7 @@ export class FlowRunner {
       if (kind === 'final' && !(this.settings.finalChecks?.length ?? this.detectFinalChecks().length) && !this.settings.additionalFinalChecks?.length) checkpoint.results.push({ command: 'finalChecks', passed: false, output: 'Configure full integration/tests/spec checks in flow3.finalChecks' });
       for (const command of commands) {
         if (this.stopped()) { checkpoint.results.push({ command, passed: false, output: 'Interrupted before execution', outcome: 'interrupted' }); break; }
-        const requires = this.settings.checkPrerequisites && Object.hasOwn(this.settings.checkPrerequisites, command) ? this.settings.checkPrerequisites[command] : [];
+        const requires = this.checkPrerequisites(command);
         if (requires.some(id => this.state.tasks[id]?.status !== 'completed')) {
           const decision = repairDecision(this.state, { command, output: '', phase: kind === 'wave' ? 'checkpoint' : 'integration', requires });
           checkpoint.results.push({ command, passed: false, output: decision.reason, decision, outcome: 'deferred', identity: checkpoint.identity.digest });
@@ -845,6 +1108,53 @@ export class FlowRunner {
     return selected ?? Object.values(this.state.tasks).map(task => planAttempt(task.harnessChain, 1)?.harness.cmd ?? inferHarnessForCmd(task.cmd)?.cmd).find(Boolean) ?? undefined;
   }
   private required(): string[] { return this.state.flowState?.completion?.required ?? [...this.scope]; }
+  /** Promote existing producers and their closure, without granting retry authority. */
+  private reopenProducers(ids: string[]): boolean {
+    const visited = new Set<string>(); let changed = false;
+    const visit = (id: string) => {
+      if (visited.has(id)) return;
+      visited.add(id);
+      const task = this.state.tasks[id];
+      if (!task) throw Error(`Cannot reopen unknown producer ${id}; task discovery requires graph correction`);
+      if (!this.scope.has(id)) { this.scope.add(id); changed = true; }
+      if (!this.required().includes(id)) { this.required().push(id); changed = true; }
+      for (const dep of [...task.deps, ...(task.node?.verify_requires ?? [])]) visit(dep);
+    };
+    for (const id of [...ids]) visit(id);
+    if (changed) {
+      this.schedulingChanged = true;
+      const flow = this.state.flowState!;
+      flow.completion!.optional = flow.completion!.optional.filter(id => !this.required().includes(id));
+      flow.completion!.excluded = flow.completion!.excluded.filter(id => !this.required().includes(id));
+      flow.implementationComplete = false;
+      this.event('note', null, `Reopened producer scope: ${[...visited].join(', ')}`); this.save();
+    }
+    return changed;
+  }
+  /** Retain unverified edits while the same scheduler supplies a proven missing producer. */
+  private deferNode(task: Task, attemptLimit: number, base: string, worker: Worker): boolean {
+    const state = task.nodeState!, decision = state.decision!, producers = decision.requires ?? [];
+    if (!producers.length || task.attemptsInCycle >= attemptLimit || state.repairBaseline || !base || this.sourceDirty(worker.path)) return false;
+    const previous = task.deps;
+    task.deps = [...new Set([...previous, ...producers])];
+    const graph = checkGraph(this.state, false);
+    if (!graph.valid) {
+      task.deps = previous;
+      decision.action = 'hold'; decision.reason = `Producer correction rejected: ${graph.errors.join('; ')}`; this.save(); return false;
+    }
+    // Squash only for replay: the original failed branch/history is retained.
+    const tree = git(worker.path, ['rev-parse', 'HEAD^{tree}']).stdout;
+    const saved = git(worker.path, ['-c', 'user.name=DAG Orchestrator', '-c', 'user.email=dag@localhost', 'commit-tree', tree, '-p', base, '-m', `dag: prerequisite recovery ${task.id}`]);
+    if (saved.code || git(this.repo, ['update-ref', `refs/dag/prerequisites/${this.state.id}/${task.id}`, saved.stdout]).code) {
+      task.deps = previous; throw failure('Cannot pin prerequisite recovery source; failed branch preserved', 'integration');
+    }
+    state.dependencyWork = { commit: saved.stdout, definition: definition(task), attempt: task.attempts };
+    task.status = 'pending'; task.result = decision.reason; task.pid = null;
+    this.schedulingChanged = true;
+    this.reopenProducers(producers);
+    this.event('note', task.id, `Deferred unverified implementation: ${decision.reason}`); this.save();
+    return true;
+  }
   private sourceDirty(path: string): string { return git(path, ['status', '--porcelain', '--', '.', ...(this.settings.cachePaths ?? ['node_modules', '.venv']).map(cache => `:(exclude)${cache}`)]).stdout; }
   private identity(path: string, commands: string[]) {
     return acceptanceIdentity(this.state, this.state.settings.flow3 ?? this.settings, path, git(path, ['rev-parse', 'HEAD']).stdout, commands);
@@ -858,7 +1168,7 @@ export class FlowRunner {
     }
     return { authority: 'flow3-automatic', command: check ? this.repairCommand() : undefined, checkpoint: check?.id, identity: check?.identity ?? this.identity(this.integration!.path, [task.node!.verify]),
       diagnosis, failedChecks, owners: owners.map(t => t.id), prerequisites: task.deps, scope,
-      protectedPaths: this.protectedPaths(), verification: [...new Set([task.node!.verify, ...owners.map(t => t.node!.verify)])],
+      protectedPaths: this.protectedPaths(), verification: [...new Set([task.node!.verify, ...owners.map(t => this.localVerification(t))])],
       charge: { pool: check ? 'checkpoint' : 'node', used: check ? this.state.flowState!.repairRound : task.nodeState?.repairAttempts ?? 0,
         limit: check ? this.settings.repairRounds ?? 2 : this.settings.nodeRepairRounds ?? 1 },
       escalation: 'Hold on exhausted budget, repeated failure, no source change, missing prerequisite, changed authority or protected input; no new recovery allowance.' };
